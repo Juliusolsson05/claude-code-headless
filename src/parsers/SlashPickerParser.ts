@@ -24,10 +24,10 @@
 // changes because the rule uses relative distinction rather than
 // hardcoded color values.
 //
-// This parser runs inside the main process (it takes a Terminal
-// instance directly) and its result ships over IPC as part of the
-// screen snapshot payload. Can't live in the renderer because we need
-// cell-level attribute access that only the Node-side Terminal gives us.
+// This parser takes a Terminal instance directly for cell-level
+// attribute access — it must run in a Node context where the headless
+// xterm Terminal is available. Downstream applications typically call
+// it on each screen snapshot and forward the result to their UI layer.
 
 import xtermHeadless from '@xterm/headless'
 const { Terminal } = xtermHeadless

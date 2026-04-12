@@ -9,8 +9,7 @@ import { join } from 'path'
 //   - getProjectDir (line 329)
 // And claude-code-src/utils/envUtils.ts:7 — getClaudeConfigHomeDir
 //
-// Lives under src/core/runtime/ — Node-only (uses fs + os). NOT importable
-// from the renderer; only main and the testbench should reach for this.
+// Node-only (uses fs + os). NOT importable from browser contexts.
 
 const MAX_SANITIZED_LENGTH = 200
 

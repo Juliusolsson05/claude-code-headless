@@ -7,19 +7,18 @@
 // This is a heuristic — CC's TUI layout can change between releases and
 // any chrome we don't recognize will leak through. The fix isn't to make
 // this regex bulletproof; it's to keep this function pure and exercise
-// it from `testbench/replay.ts` against real recorded sessions, then
-// iterate the rules until they hold for every fixture.
+// it against real recorded sessions, then iterate the rules until they
+// hold for every fixture.
 //
-// Pure: no Node, no DOM, no IO. Importable from main, renderer, testbench.
+// Pure: no Node, no DOM, no IO. Importable from any downstream context.
 
 const BOX_CHARS_RE = /[╭╮╰╯─│┌┐└┘├┤┬┴┼━┃═║]/g
 
 /**
  * Markers that appear ONLY in CC's persistent bottom status row.
- * Validated against testbench/scripts/startup-trusted.json fixture
- * (recordings/2026-04-10T15-02-12-788Z). Add new markers when we discover
- * them by replaying fresh fixtures — keep this list specific so we don't
- * false-positive on real assistant content.
+ * Validated against recorded session fixtures. Add new markers when we
+ * discover them by replaying fresh fixtures — keep this list specific so
+ * we don't false-positive on real assistant content.
  */
 const STATUS_LINE_MARKERS = [
   '⏵⏵',
@@ -72,7 +71,7 @@ export function isStatusLine(line: string): boolean {
 /**
  * A line is "chrome" if it's part of CC's persistent UI furniture (input
  * box, dividers, status row) rather than scrollable content. This is a
- * heuristic — exercised against fixtures in `recordings/`. Update when a
+ * heuristic — exercised against recorded session fixtures. Update when a
  * new fixture exposes a chrome pattern we don't yet recognize.
  */
 export function isChromeLine(line: string): boolean {
@@ -222,7 +221,7 @@ export function detectActivity(screen: string): string | null {
  * This is a low-level primitive: it gives you everything CC was rendering
  * EXCEPT the persistent bottom UI furniture. It's still useful on its own
  * for debugging / fixture inspection / parsers that don't care about
- * assistant boundaries. For the streaming card you almost always want
+ * assistant boundaries. For streaming UI you almost always want
  * `extractAssistantInProgress` instead, which composes on top of this.
  */
 export function extractStreamingText(screen: string): string {
@@ -272,14 +271,14 @@ export function extractStreamingText(screen: string): string {
  *   The user wants to see what's CURRENTLY being typed — that's the
  *   most recent block. Earlier blocks land in the JSONL feed and the
  *   structured renderer takes care of them — we don't double-render
- *   them in the streaming card.
+ *   them in a streaming UI.
  *
  * Why this exists separately from extractStreamingText:
  *   `extractStreamingText` is the chrome-stripper primitive — useful on
  *   its own for fixture inspection and other parsers. This function
- *   composes on top of it to give the streaming card exactly what it
+ *   composes on top of it to give the consumer exactly what it
  *   wants: just the current assistant text. Two functions means each
- *   has one job and each is independently testable from `replay.ts`.
+ *   has one job and each is independently testable.
  *
  * Why we return the first matching line and forward, not just the line:
  *   Multi-line assistant responses wrap with continuation lines that
@@ -287,8 +286,8 @@ export function extractStreamingText(screen: string): string {
  *   we find the marker, we keep everything from there to the end of the
  *   stripped content (not just that one line).
  *
- * Returns '' when no assistant marker is on screen yet — the streaming
- * card should fall back to a "thinking…" placeholder in that case.
+ * Returns '' when no assistant marker is on screen yet — the consumer
+ * should fall back to a "thinking…" placeholder in that case.
  */
 export function extractAssistantInProgress(screen: string): string {
   const stripped = extractStreamingText(screen)
@@ -318,7 +317,7 @@ export function extractAssistantInProgress(screen: string): string {
   // would grab every line from the marker to the bottom of the stripped
   // screen — which is WRONG when CC is showing queued user messages.
   //
-  // Reproduction (see testbench/scripts/prompt-three-queued.json):
+  // Reproduction (e.g. a "prompt-three-queued" fixture):
   //   The user submits three prompts in rapid succession. CC enqueues
   //   prompts 2 and 3, then renders its TUI like this:
   //
@@ -329,9 +328,9 @@ export function extractAssistantInProgress(screen: string): string {
   //
   //   `last ⏺` lands on the real response, and the slice from there
   //   to the end slurps the queued `❯` lines INTO the assistant block.
-  //   The StreamingRow then renders those queued lines as if they
-  //   were part of the assistant's answer, which is exactly the
-  //   "queue bleeds into rendering" bug the user reported.
+  //   A downstream streaming renderer would then show those queued
+  //   lines as if they were part of the assistant's answer — the
+  //   "queue bleeds into rendering" bug.
   //
   // Fix: scan forward from the assistant marker and stop at the first
   // line that looks like a queued user prompt. Everything from the
@@ -404,7 +403,7 @@ export function extractAssistantInProgress(screen: string): string {
   // The exact amount of padding can shift between frames depending on
   // layout state, so `extract(screenA) === extract(screenB)` can return
   // false even when the semantic text is identical. This breaks the
-  // multi-turn "stale baseline" comparison in App.tsx — the streaming
+  // multi-turn "stale baseline" comparison in downstream UIs — the streaming
   // card briefly shows the previous turn's response before the new
   // tokens arrive, because one trailing-space difference flips the
   // comparison from stale → fresh. Strip trailing whitespace per line

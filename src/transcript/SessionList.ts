@@ -4,7 +4,7 @@ import { basename, join } from 'path'
 import { getProjectDirForCwd } from './ProjectDir.js'
 
 // Session lister — reimplements the minimal subset of CC's
-// utils/listSessionsImpl.ts needed to power the cc-shell resume UI.
+// utils/listSessionsImpl.ts needed to power a resume UI.
 //
 // We deliberately don't import from claude-code-src. CC's lister pulls
 // in a big transitive dependency graph (bootstrap state, analytics,
@@ -28,8 +28,7 @@ import { getProjectDirForCwd } from './ProjectDir.js'
 //   5. Return structured SessionInfo[] sorted by mtime desc.
 //
 // Everything here is pure Node I/O — no Electron, no React, no xterm.
-// Lives under src/core/runtime/ so main can import it directly. The
-// testbench can too, for future session-list regression tests.
+// Importable from any Node-side downstream context.
 
 /** Public-facing session metadata. Matches CC's SessionInfo shape
  *  closely so if we later import CC's lister it's a drop-in swap. */

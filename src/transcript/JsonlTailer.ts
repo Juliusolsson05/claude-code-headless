@@ -3,9 +3,8 @@ import { createReadStream, statSync, unwatchFile, watchFile } from 'fs'
 import { mkdir, readdir } from 'fs/promises'
 import { basename } from 'path'
 
-// Lives under src/core/runtime/ — Node-only (chokidar + fs). Imported by
-// ClaudeSession (src/core/runtime/claudeSession.ts) and the testbench.
-// NOT importable from the renderer.
+// Node-only (chokidar + fs). Used by downstream applications that need
+// to tail CC's transcript files. NOT importable from browser contexts.
 
 /**
  * Watches a single JSONL file and emits parsed objects line-by-line as the
@@ -19,7 +18,7 @@ import { basename } from 'path'
  *   chokidar on macOS defaults to fs.watch-based change detection for
  *   single files, which is known to silently miss rapid appends from
  *   non-editor writers (append-only files that don't atomic-rename).
- *   Users saw it concretely: submit a prompt in cc-shell, CC writes
+ *   Users saw it concretely: submit a prompt, CC writes
  *   the user entry + a bunch of attachments to the JSONL, and the
  *   feed wouldn't update until some unrelated later write nudged
  *   chokidar into re-reading. "The prompt didn't appear."
@@ -170,7 +169,7 @@ export type JsonlEntry = Record<string, unknown>
  * Watches a CC project directory for the JSONL file CC creates when the
  * session starts, then tails it. Use case:
  *
- *   1. cc-shell spawns `claude` with cwd=X
+ *   1. The consumer spawns `claude` with cwd=X
  *   2. Before/right after spawn, we call `tailNewSessionFile(projectDir, ...)`
  *   3. CC creates ~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl
  *   4. The tailer notices the new .jsonl, opens it, and starts emitting entries

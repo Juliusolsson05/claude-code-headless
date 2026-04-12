@@ -2,19 +2,17 @@
 //
 // Why this is its own parser:
 //   The trust dialog is a modal interactive screen CC shows when you start
-//   a session in a directory it hasn't seen before. We need to handle it
-//   in two completely different contexts:
+//   a session in a directory it hasn't seen before. Downstream consumers
+//   need to handle it in different contexts:
 //
-//     1. The testbench — auto-accept it during scripted recordings so we
-//        can capture the main UI without manual intervention.
-//     2. cc-shell itself — recognize it and render a real React modal
-//        the user can click, instead of leaving it as raw screen text.
+//     1. Automated tooling — auto-accept it during scripted recordings
+//        so it can capture the main UI without manual intervention.
+//     2. GUI applications — recognize it and render a native modal the
+//        user can click, instead of leaving it as raw screen text.
 //
-//   Both use cases share the SAME detection logic. Putting it in
-//   src/core/parsers/ means the React renderer and the Node testbench
-//   both call into the same pure function and any improvements to the
-//   detector benefit both. If this lived in either main/ or testbench/
-//   we'd end up duplicating it the moment cc-shell needs the modal.
+//   Both use cases share the SAME detection logic. Keeping it in this
+//   shared package means every consumer calls into the same pure
+//   function and any improvements to the detector benefit all of them.
 //
 // Why string-match and not regex:
 //   The dialog text is stable and English-only in the version of CC we're
@@ -23,9 +21,9 @@
 //   we add the new strings to the marker arrays — no rewrite.
 //
 // Why the parser returns a structured value rather than just a boolean:
-//   The cc-shell modal will eventually need the option labels to render
-//   buttons. Returning `{ visible, options }` future-proofs that. The
-//   testbench currently only consumes `visible` but ignores `options`
+//   A GUI consumer will eventually need the option labels to render
+//   buttons. Returning `{ visible, options }` future-proofs that.
+//   Simpler consumers that only need `visible` can ignore `options`
 //   harmlessly.
 
 export type TrustDialogState = {
