@@ -15,6 +15,9 @@ export {
   type ScreenEvent,
   type JsonlEntryEvent,
   type TrustDialogEvent,
+  type ResumePromptEvent,
+  type ProcessStateEvent,
+  type CompactionStateEvent,
   type PermissionRequestEvent,
   type SlashPickerEvent,
   type ExitEvent,
@@ -28,6 +31,11 @@ export {
   type ScreenSnapshot,
   terminalToMarkdown,
 } from './terminal/HeadlessTerminal.js'
+
+export {
+  ProcessInspector,
+  type ProcessState,
+} from './terminal/ProcessInspector.js'
 
 // --- Parsers ---
 export {
@@ -52,6 +60,16 @@ export {
 } from './parsers/TrustDialogParser.js'
 
 export {
+  detectCompaction,
+  type CompactionState,
+} from './parsers/CompactionParser.js'
+
+export {
+  detectResumePrompt,
+  type ResumePromptState,
+} from './parsers/ResumePromptParser.js'
+
+export {
   detectSlashPicker,
   type SlashPickerState,
   type PickerItem,
@@ -71,9 +89,13 @@ export {
   type ContentBlock,
   type Message,
   type ConversationEntry,
+  type CompactBoundaryEntry,
+  type CompactSummaryEntry,
   type SystemEntry,
   type Entry,
   isConversationEntry,
+  isCompactBoundaryEntry,
+  isCompactSummaryEntry,
 } from './transcript/TranscriptTypes.js'
 
 export {

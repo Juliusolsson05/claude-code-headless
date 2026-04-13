@@ -10,8 +10,11 @@ import {
   detectActivity,
   extractAssistantInProgress,
 } from './parsers/ScreenParser.js'
+import { detectCompaction, type CompactionState } from './parsers/CompactionParser.js'
+import { detectResumePrompt, type ResumePromptState } from './parsers/ResumePromptParser.js'
 import { detectSlashPicker, type SlashPickerState } from './parsers/SlashPickerParser.js'
 import { detectTrustDialog, type TrustDialogState, TRUST_DIALOG_ACCEPT_KEYS } from './parsers/TrustDialogParser.js'
+import { ProcessInspector, type ProcessState } from './terminal/ProcessInspector.js'
 import {
   tailNewSessionFile,
   tailSessionFile,
@@ -59,6 +62,16 @@ export type TrustDialogEvent = {
   type: 'trust_dialog'; ts: number; workspace: string | undefined
   accept: () => void; reject: () => void
 }
+export type ResumePromptEvent = {
+  type: 'resume_prompt'; ts: number; state: ResumePromptState
+  confirm: () => void; cancel: () => void
+}
+export type ProcessStateEvent = {
+  type: 'process_state'; ts: number; state: ProcessState
+}
+export type CompactionStateEvent = {
+  type: 'compaction_state'; ts: number; state: CompactionState
+}
 export type PermissionRequestEvent = {
   type: 'permission_request'; ts: number
   // Permission detection will be expanded — for now we surface the
@@ -75,6 +88,9 @@ export type HeadlessEvent =
   | ScreenEvent
   | JsonlEntryEvent
   | TrustDialogEvent
+  | ResumePromptEvent
+  | ProcessStateEvent
+  | CompactionStateEvent
   | SlashPickerEvent
   | ExitEvent
 
@@ -87,6 +103,9 @@ export type ClaudeCodeHeadlessEvents = {
   'jsonl-entry': [JsonlEntry, string]
   'jsonl-error': [Error]
   'trust-dialog': [TrustDialogState]
+  'resume-prompt': [ResumePromptState]
+  'process-state': [ProcessState]
+  'compaction-state': [CompactionState]
   'slash-picker': [SlashPickerState]
   exit: [{ exitCode: number; signal?: number }]
 }
@@ -110,10 +129,18 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private readonly terminal: HeadlessTerminal
   private readonly cwd: string
   private readonly resumeSessionId: string | null
+  private readonly inspector: ProcessInspector | null
   private stopJsonlTail: (() => Promise<void>) | null = null
   private lastActivity: string | null = null
-  private lastTrustVisible = false
-  private lastPickerVisible = false
+  private lastProcessActive: boolean | null = null
+  private trustDialogState: TrustDialogState = { visible: false }
+  private lastTrustKey: string | null = null
+  private resumePromptState: ResumePromptState = { visible: false }
+  private lastResumePromptKey: string | null = null
+  private compactionState: CompactionState = { visible: false }
+  private lastCompactionKey: string | null = null
+  private pickerState: SlashPickerState = { visible: false, items: [] }
+  private lastPickerKey: string | null = null
 
   constructor(options: ClaudeCodeHeadlessOptions) {
     super()
@@ -126,11 +153,52 @@ export class ClaudeCodeHeadless extends EventEmitter {
       rows: options.rows ?? 40,
       snapshotIntervalMs: options.snapshotIntervalMs ?? 16,
     })
+    this.inspector =
+      typeof options.pty.pid === 'number' && options.pty.pid > 0
+        ? new ProcessInspector(options.pty.pid, state => {
+            this.lastProcessActive = state.active
+            this.emit('process-state', state)
+            this.emit('event', { type: 'process_state', ts: Date.now(), state })
+          })
+        : null
 
     // --- Wire terminal events ---
 
     // On every screen snapshot, run all parsers and emit structured events.
     this.terminal.on('screen', (snap) => {
+      const trust = detectTrustDialog(snap.plain)
+      const trustKey = trust.visible
+        ? JSON.stringify({
+            workspace: trust.workspace ?? null,
+            options: trust.options ?? [],
+          })
+        : null
+      this.trustDialogState = trust
+
+      const resumePrompt = detectResumePrompt(snap.plain)
+      const resumePromptKey = resumePrompt.visible
+        ? JSON.stringify({
+            age: resumePrompt.sessionAgeText ?? null,
+            tokens: resumePrompt.tokenCountText ?? null,
+            selectedIndex: resumePrompt.selectedIndex ?? 0,
+          })
+        : null
+      this.resumePromptState = resumePrompt
+
+      const compaction = detectCompaction(snap.plain)
+      const compactionKey = compaction.visible
+        ? JSON.stringify({
+            phase: compaction.phase ?? null,
+            statusText: compaction.statusText ?? null,
+            errorText: compaction.errorText ?? null,
+          })
+        : null
+      this.compactionState = compaction
+
+      const picker = detectSlashPicker(this.terminal.getTerminal())
+      const pickerKey = picker.visible ? JSON.stringify(picker) : null
+      this.pickerState = picker
+
       // Forward raw screen
       this.emit('screen', snap)
       this.emit('event', { type: 'screen', ts: Date.now(), ...snap })
@@ -149,11 +217,10 @@ export class ClaudeCodeHeadless extends EventEmitter {
       }
 
       // Trust dialog detection
-      const trust = detectTrustDialog(snap.plain)
-      if (trust.visible !== this.lastTrustVisible) {
-        this.lastTrustVisible = trust.visible
+      if (trustKey !== this.lastTrustKey) {
+        this.lastTrustKey = trustKey
+        this.emit('trust-dialog', trust)
         if (trust.visible) {
-          this.emit('trust-dialog', trust)
           this.emit('event', {
             type: 'trust_dialog',
             ts: Date.now(),
@@ -164,17 +231,41 @@ export class ClaudeCodeHeadless extends EventEmitter {
         }
       }
 
+      // Resume-choice prompt detection
+      if (resumePromptKey !== this.lastResumePromptKey) {
+        this.lastResumePromptKey = resumePromptKey
+        this.emit('resume-prompt', resumePrompt)
+        if (resumePrompt.visible) {
+          this.emit('event', {
+            type: 'resume_prompt',
+            ts: Date.now(),
+            state: resumePrompt,
+            confirm: () => this.write('\r'),
+            cancel: () => this.write('\x1b'),
+          })
+        }
+      }
+
+      if (compactionKey !== this.lastCompactionKey) {
+        this.lastCompactionKey = compactionKey
+        this.emit('compaction-state', compaction)
+        this.emit('event', {
+          type: 'compaction_state',
+          ts: Date.now(),
+          state: compaction,
+        })
+      }
+
       // Slash picker detection
-      const term = this.terminal.getTerminal()
-      const picker = detectSlashPicker(term)
-      if (picker.visible !== this.lastPickerVisible) {
-        this.lastPickerVisible = picker.visible
+      if (pickerKey !== this.lastPickerKey) {
+        this.lastPickerKey = pickerKey
         this.emit('slash-picker', picker)
         this.emit('event', { type: 'slash_picker', ts: Date.now(), state: picker })
       }
     })
 
     this.terminal.on('exit', ({ exitCode, signal }) => {
+      this.inspector?.stop()
       this.emit('exit', { exitCode, signal })
       this.emit('event', { type: 'exit', ts: Date.now(), exitCode, signal })
       void this.cleanup()
@@ -217,6 +308,8 @@ export class ClaudeCodeHeadless extends EventEmitter {
       )
     }
 
+    this.inspector?.start()
+
     return { projectDir }
   }
 
@@ -247,11 +340,13 @@ export class ClaudeCodeHeadless extends EventEmitter {
 
   /** True if CC's spinner is NOT visible on screen (waiting for input). */
   isIdle(): boolean {
+    if (this.lastProcessActive != null) return !this.lastProcessActive
     return this.lastActivity === null
   }
 
   /** True if CC's spinner IS visible (working). */
   isWorking(): boolean {
+    if (this.lastProcessActive != null) return this.lastProcessActive
     return this.lastActivity !== null
   }
 
@@ -275,6 +370,22 @@ export class ClaudeCodeHeadless extends EventEmitter {
     return extractAssistantInProgress(this.terminal.snapshotPlain())
   }
 
+  getSlashPickerState(): SlashPickerState {
+    return this.pickerState
+  }
+
+  getTrustDialogState(): TrustDialogState {
+    return this.trustDialogState
+  }
+
+  getResumePromptState(): ResumePromptState {
+    return this.resumePromptState
+  }
+
+  getCompactionState(): CompactionState {
+    return this.compactionState
+  }
+
   /** List resumable sessions for this cwd. */
   async listResumableSessions(limit?: number): Promise<SessionInfo[]> {
     return listSessionsForCwd(this.cwd, { limit })
@@ -295,6 +406,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
   }
 
   private async cleanup(): Promise<void> {
+    this.inspector?.stop()
     if (this.stopJsonlTail) {
       try {
         await this.stopJsonlTail()

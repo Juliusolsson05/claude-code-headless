@@ -9,6 +9,7 @@
   "scripts": {
     "build": "tsc",
     "test": "tsx src/testing/verify.ts",
+    "record": "tsx src/testing/record.ts",
     "replay": "tsx src/testing/replay.ts"
   },
   "dependencies": {

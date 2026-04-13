@@ -1,0 +1,8 @@
+{
+  "autoAcceptTrust": true,
+  "steps": [
+    { "type": "wait", "ms": 8000 },
+    { "type": "send", "data": "say hi in three words\r" },
+    { "type": "wait", "ms": 18000 }
+  ]
+}
