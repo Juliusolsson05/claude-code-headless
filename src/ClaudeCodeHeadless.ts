@@ -118,13 +118,23 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private readonly resumeSessionId: string | null
   private stopJsonlTail: (() => Promise<void>) | null = null
   private lastActivity: string | null = null
-  // Debounce timer for idle. CC redraws the spinner cell every frame, but
-  // there's a narrow window during a write batch where the spinner line
-  // can momentarily appear empty — if we flipped to idle on that single
-  // snapshot and back to active the next, the UI would flicker. 250ms of
-  // continuous "no spinner" before we declare idle absorbs those
-  // transient gaps without introducing human-perceivable lag (the
-  // previous process-inspector polled at 1000ms and felt fine).
+  // Debounce timer for idle.
+  //
+  // CC redraws the spinner cell every frame, but in practice there are
+  // *long* windows (multi-second) where the spinner row is replaced by
+  // a transient header — tool-call summaries, the "Bash(...)" preview,
+  // a "Tip:" footer line, etc. — and the bottom-up SPINNER_VERB_RE walk
+  // returns null even though CC is clearly still working. With the
+  // previous 250ms threshold the indicator flashed green for a
+  // quarter-second per turn and snapped back to "idle" almost
+  // immediately. The user reports this directly: "it sometimes flashes
+  // green for a quarter of a second, then it goes back to inactive."
+  //
+  // 2500ms is empirically wide enough to bridge the longest spinner
+  // gap CC's TUI shows during a normal turn (tool output animation
+  // cycles ~1.5s), without introducing perceptible lag at the end of a
+  // turn — the user finishes reading the assistant block before the
+  // green pip drops.
   private idleDebounceTimer: ReturnType<typeof setTimeout> | null = null
   private trustDialogState: TrustDialogState = { visible: false }
   private lastTrustKey: string | null = null
@@ -226,7 +236,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
             this.lastActivity = null
             this.emit('idle')
             this.emit('event', { type: 'idle', ts: Date.now() })
-          }, 250)
+          }, 2500)
         }
       }
 
