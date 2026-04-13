@@ -72,13 +72,6 @@ export type ProcessStateEvent = {
 export type CompactionStateEvent = {
   type: 'compaction_state'; ts: number; state: CompactionState
 }
-export type PermissionRequestEvent = {
-  type: 'permission_request'; ts: number
-  // Permission detection will be expanded — for now we surface the
-  // raw screen state so the consumer can parse it themselves.
-  screen: string
-  approve: () => void; deny: () => void
-}
 export type SlashPickerEvent = { type: 'slash_picker'; ts: number; state: SlashPickerState }
 export type ExitEvent = { type: 'exit'; ts: number; exitCode: number; signal?: number }
 
@@ -309,6 +302,13 @@ export class ClaudeCodeHeadless extends EventEmitter {
     }
 
     this.inspector?.start()
+
+    // Now that the JSONL tailer is wired (and any fresh-session file
+    // has been registered with the watcher), let PTY data start flowing
+    // into the headless terminal mirror. Splitting attach() out of the
+    // HeadlessTerminal constructor is what makes the tailer-first
+    // ordering enforceable — see HeadlessTerminal file header for why.
+    this.terminal.attach()
 
     return { projectDir }
   }

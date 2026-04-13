@@ -87,7 +87,14 @@ export function detectSlashPicker(term: TerminalInstance): SlashPickerState {
   }
   const candidates: Candidate[] = []
 
-  for (let y = 0; y < buf.length; y++) {
+  // Scan the visible viewport only — scrollback can contain leftover
+  // picker rows from earlier turns whose colors are still preserved
+  // in the buffer, which would yield a phantom-visible picker. See
+  // HeadlessTerminal file header for the broader viewport-vs-buffer
+  // discussion.
+  const viewportStart = buf.viewportY
+  const viewportEnd = Math.min(buf.length, buf.viewportY + term.rows)
+  for (let y = viewportStart; y < viewportEnd; y++) {
     const line = buf.getLine(y)
     if (!line) continue
 

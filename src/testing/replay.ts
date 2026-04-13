@@ -98,9 +98,11 @@ async function main(): Promise<void> {
     return
   }
 
-  // Final-state replay
-  for (const ev of events) term.write(ev.data)
-  await new Promise<void>(r => setTimeout(r, 50))
+  // Final-state replay. Awaiting writeAndFlush per event makes each
+  // write fully parsed before the next runs — the previous version
+  // fired all writes back-to-back and slept 50ms hoping the parser
+  // had caught up. Use the documented xterm callback instead.
+  for (const ev of events) await writeAndFlush(ev.data)
 
   const screen = snapshot(term)
   const mdScreen = terminalToMarkdown(term)

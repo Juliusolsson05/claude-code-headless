@@ -18,7 +18,6 @@ export {
   type ResumePromptEvent,
   type ProcessStateEvent,
   type CompactionStateEvent,
-  type PermissionRequestEvent,
   type SlashPickerEvent,
   type ExitEvent,
 } from './ClaudeCodeHeadless.js'
