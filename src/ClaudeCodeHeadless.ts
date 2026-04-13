@@ -14,7 +14,6 @@ import { detectCompaction, type CompactionState } from './parsers/CompactionPars
 import { detectResumePrompt, type ResumePromptState } from './parsers/ResumePromptParser.js'
 import { detectSlashPicker, type SlashPickerState } from './parsers/SlashPickerParser.js'
 import { detectTrustDialog, type TrustDialogState, TRUST_DIALOG_ACCEPT_KEYS } from './parsers/TrustDialogParser.js'
-import { ProcessInspector, type ProcessState } from './terminal/ProcessInspector.js'
 import {
   tailNewSessionFile,
   tailSessionFile,
@@ -66,9 +65,6 @@ export type ResumePromptEvent = {
   type: 'resume_prompt'; ts: number; state: ResumePromptState
   confirm: () => void; cancel: () => void
 }
-export type ProcessStateEvent = {
-  type: 'process_state'; ts: number; state: ProcessState
-}
 export type CompactionStateEvent = {
   type: 'compaction_state'; ts: number; state: CompactionState
 }
@@ -82,7 +78,6 @@ export type HeadlessEvent =
   | JsonlEntryEvent
   | TrustDialogEvent
   | ResumePromptEvent
-  | ProcessStateEvent
   | CompactionStateEvent
   | SlashPickerEvent
   | ExitEvent
@@ -97,7 +92,6 @@ export type ClaudeCodeHeadlessEvents = {
   'jsonl-error': [Error]
   'trust-dialog': [TrustDialogState]
   'resume-prompt': [ResumePromptState]
-  'process-state': [ProcessState]
   'compaction-state': [CompactionState]
   'slash-picker': [SlashPickerState]
   exit: [{ exitCode: number; signal?: number }]
@@ -122,10 +116,16 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private readonly terminal: HeadlessTerminal
   private readonly cwd: string
   private readonly resumeSessionId: string | null
-  private readonly inspector: ProcessInspector | null
   private stopJsonlTail: (() => Promise<void>) | null = null
   private lastActivity: string | null = null
-  private lastProcessActive: boolean | null = null
+  // Debounce timer for idle. CC redraws the spinner cell every frame, but
+  // there's a narrow window during a write batch where the spinner line
+  // can momentarily appear empty — if we flipped to idle on that single
+  // snapshot and back to active the next, the UI would flicker. 250ms of
+  // continuous "no spinner" before we declare idle absorbs those
+  // transient gaps without introducing human-perceivable lag (the
+  // previous process-inspector polled at 1000ms and felt fine).
+  private idleDebounceTimer: ReturnType<typeof setTimeout> | null = null
   private trustDialogState: TrustDialogState = { visible: false }
   private lastTrustKey: string | null = null
   private resumePromptState: ResumePromptState = { visible: false }
@@ -146,14 +146,6 @@ export class ClaudeCodeHeadless extends EventEmitter {
       rows: options.rows ?? 40,
       snapshotIntervalMs: options.snapshotIntervalMs ?? 16,
     })
-    this.inspector =
-      typeof options.pty.pid === 'number' && options.pty.pid > 0
-        ? new ProcessInspector(options.pty.pid, state => {
-            this.lastProcessActive = state.active
-            this.emit('process-state', state)
-            this.emit('event', { type: 'process_state', ts: Date.now(), state })
-          })
-        : null
 
     // --- Wire terminal events ---
 
@@ -196,16 +188,45 @@ export class ClaudeCodeHeadless extends EventEmitter {
       this.emit('screen', snap)
       this.emit('event', { type: 'screen', ts: Date.now(), ...snap })
 
-      // Activity detection
+      // Activity detection.
+      //
+      // Source of truth: CC's rotating spinner line (see
+      // parsers/ScreenParser.ts detectActivity). Transitions to
+      // active are emitted immediately — the user wants to see that
+      // CC started working as fast as possible. Transitions to idle
+      // are debounced (see idleDebounceTimer field) so a single
+      // spinner-less snapshot between frames can't flip the UI.
+      //
+      // Previously cc-shell also subscribed to a caffeinate-based
+      // ProcessInspector, which either over-reported (idle sessions
+      // still had caffeinate from parent shells) or under-reported
+      // (CC didn't always spawn one for quick turns). We ripped it
+      // and consolidated on the screen spinner for both providers.
       const activity = detectActivity(snap.plain)
       if (activity !== this.lastActivity) {
-        this.lastActivity = activity
         if (activity) {
+          // Cancel any pending idle transition — we're clearly working.
+          if (this.idleDebounceTimer) {
+            clearTimeout(this.idleDebounceTimer)
+            this.idleDebounceTimer = null
+          }
+          this.lastActivity = activity
           this.emit('activity', activity)
           this.emit('event', { type: 'activity', ts: Date.now(), status: activity })
         } else {
-          this.emit('idle')
-          this.emit('event', { type: 'idle', ts: Date.now() })
+          // Defer the idle emission — give the next snapshot a chance
+          // to reinstate the spinner before we tell consumers we're
+          // idle. If a later snapshot brings activity back, we just
+          // never fire.
+          if (this.idleDebounceTimer) clearTimeout(this.idleDebounceTimer)
+          this.idleDebounceTimer = setTimeout(() => {
+            this.idleDebounceTimer = null
+            // Only flip if still idle by the time the debounce fires.
+            if (detectActivity(this.terminal.snapshotPlain())) return
+            this.lastActivity = null
+            this.emit('idle')
+            this.emit('event', { type: 'idle', ts: Date.now() })
+          }, 250)
         }
       }
 
@@ -258,7 +279,10 @@ export class ClaudeCodeHeadless extends EventEmitter {
     })
 
     this.terminal.on('exit', ({ exitCode, signal }) => {
-      this.inspector?.stop()
+      if (this.idleDebounceTimer) {
+        clearTimeout(this.idleDebounceTimer)
+        this.idleDebounceTimer = null
+      }
       this.emit('exit', { exitCode, signal })
       this.emit('event', { type: 'exit', ts: Date.now(), exitCode, signal })
       void this.cleanup()
@@ -301,8 +325,6 @@ export class ClaudeCodeHeadless extends EventEmitter {
       )
     }
 
-    this.inspector?.start()
-
     // Now that the JSONL tailer is wired (and any fresh-session file
     // has been registered with the watcher), let PTY data start flowing
     // into the headless terminal mirror. Splitting attach() out of the
@@ -340,13 +362,11 @@ export class ClaudeCodeHeadless extends EventEmitter {
 
   /** True if CC's spinner is NOT visible on screen (waiting for input). */
   isIdle(): boolean {
-    if (this.lastProcessActive != null) return !this.lastProcessActive
     return this.lastActivity === null
   }
 
   /** True if CC's spinner IS visible (working). */
   isWorking(): boolean {
-    if (this.lastProcessActive != null) return this.lastProcessActive
     return this.lastActivity !== null
   }
 
@@ -406,7 +426,10 @@ export class ClaudeCodeHeadless extends EventEmitter {
   }
 
   private async cleanup(): Promise<void> {
-    this.inspector?.stop()
+    if (this.idleDebounceTimer) {
+      clearTimeout(this.idleDebounceTimer)
+      this.idleDebounceTimer = null
+    }
     if (this.stopJsonlTail) {
       try {
         await this.stopJsonlTail()

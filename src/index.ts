@@ -16,7 +16,6 @@ export {
   type JsonlEntryEvent,
   type TrustDialogEvent,
   type ResumePromptEvent,
-  type ProcessStateEvent,
   type CompactionStateEvent,
   type SlashPickerEvent,
   type ExitEvent,
@@ -30,11 +29,6 @@ export {
   type ScreenSnapshot,
   terminalToMarkdown,
 } from './terminal/HeadlessTerminal.js'
-
-export {
-  ProcessInspector,
-  type ProcessState,
-} from './terminal/ProcessInspector.js'
 
 // --- Parsers ---
 export {
