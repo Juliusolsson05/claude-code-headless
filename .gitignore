@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.tsbuildinfo
 recordings/
+.proxy-testing/
+__pycache__/

@@ -10,7 +10,9 @@
     "build": "tsc",
     "test": "tsx src/testing/verify.ts",
     "record": "tsx src/testing/record.ts",
-    "replay": "tsx src/testing/replay.ts"
+    "replay": "tsx src/testing/replay.ts",
+    "proxy-test": "tsx src/testing/proxy-testing/run.ts",
+    "proxy-test-bootstrap": "tsx src/testing/proxy-testing/bootstrap.ts"
   },
   "dependencies": {
     "@xterm/headless": "^5.5.0",
