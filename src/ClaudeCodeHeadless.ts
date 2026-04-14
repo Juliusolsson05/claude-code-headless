@@ -113,6 +113,11 @@ export interface ClaudeCodeHeadless {
 }
 
 export class ClaudeCodeHeadless extends EventEmitter {
+  // Resume should open near "where the conversation is now", not
+  // replay every historical turn since the beginning of time. We load
+  // a bounded tail snapshot to rebuild the recent feed context, then
+  // switch to normal append-only tailing for new writes.
+  private static readonly RESUME_BOOTSTRAP_TAIL_LINES = 200
   private readonly terminal: HeadlessTerminal
   private readonly cwd: string
   private readonly resumeSessionId: string | null
@@ -320,6 +325,9 @@ export class ClaudeCodeHeadless extends EventEmitter {
           })
         },
         (err) => this.emit('jsonl-error', err),
+        {
+          bootstrapTailLines: ClaudeCodeHeadless.RESUME_BOOTSTRAP_TAIL_LINES,
+        },
       )
       this.stopJsonlTail = stop
     } else {
