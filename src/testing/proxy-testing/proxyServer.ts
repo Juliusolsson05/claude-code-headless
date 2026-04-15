@@ -1,9 +1,11 @@
 import { EventEmitter } from 'events'
-import { access, mkdir, writeFile } from 'fs/promises'
+import { access, mkdir, readFile, writeFile } from 'fs/promises'
 import { constants as fsConstants } from 'fs'
-import { tmpdir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { dirname, join, resolve } from 'path'
 import { spawn, type ChildProcess } from 'child_process'
+
+import { canonicalizePath, sanitizePath } from '../../transcript/ProjectDir.js'
 
 export type ProxyCapturedEvent = Record<string, unknown>
 
@@ -22,6 +24,17 @@ export type ProxyServerEvents = {
   event: [ProxyCapturedEvent]
   stderr: [string]
   stdout: [string]
+}
+
+export type CreateProxyServerOptions = {
+  /** Explicit root for ad-hoc experiments. When set, createProxyServer
+   *  behaves like the old implementation and writes under this path. */
+  baseDir?: string
+  /** Human-facing project identity for app-owned storage layout. */
+  cwd?: string
+  /** Stable label such as a resumed conversation id or the shell
+   *  session id. Used only for directory naming. */
+  sessionKey?: string
 }
 
 export class ProxyServer extends EventEmitter {
@@ -107,20 +120,42 @@ export class ProxyServer extends EventEmitter {
   private startPollingEvents(): void {
     this.watcherTimer = setInterval(async () => {
       try {
-        const text = await import('fs/promises').then(fs =>
-          fs.readFile(this.info.eventsFile, 'utf8').catch(() => ''),
-        )
-        if (!text) return
+        const text = await readFile(this.info.eventsFile, 'utf8').catch(() => '')
+        if (!text || text.length <= this.lastEventOffset) return
         const unread = text.slice(this.lastEventOffset)
-        if (!unread) return
-        this.lastEventOffset = text.length
-        for (const line of unread.split('\n')) {
+
+        // Only advance the offset past the LAST complete line we see.
+        // Earlier versions advanced to `text.length` up-front, which
+        // silently dropped any in-flight partial line when mitmdump's
+        // write was mid-flush during the poll: the partial failed
+        // JSON.parse, got swallowed by the catch, and the completed
+        // line on the next poll was already past `lastEventOffset`.
+        //
+        // The newline-terminator invariant: mitmAddon.py writes
+        // `json.dumps(payload) + "\n"` per event, so a correctly
+        // flushed record always ends in `\n`. Anything after the
+        // final `\n` in the buffer is a partial write-in-progress and
+        // must be retried on the next tick.
+        const lastNl = unread.lastIndexOf('\n')
+        if (lastNl === -1) {
+          // No complete line yet; leave offset untouched so we re-
+          // read the partial next tick.
+          return
+        }
+        const completeBlock = unread.slice(0, lastNl)
+        this.lastEventOffset += lastNl + 1 // skip past the consumed \n
+
+        for (const line of completeBlock.split('\n')) {
           const trimmed = line.trim()
           if (!trimmed) continue
           try {
             this.emit('event', JSON.parse(trimmed) as ProxyCapturedEvent)
           } catch {
-            // ignore malformed partial lines
+            // A parse error on a line we've committed to (offset
+            // already advanced past `\n`) means mitmdump wrote
+            // garbage, not that the line was partial. Drop silently;
+            // the line was terminated and we can't do anything with
+            // it.
           }
         }
       } catch {
@@ -130,11 +165,14 @@ export class ProxyServer extends EventEmitter {
   }
 }
 
-export async function createProxyServer(baseDir?: string): Promise<ProxyServer> {
-  const workDir = await createWorkDir(baseDir)
+export async function createProxyServer(
+  options?: string | CreateProxyServerOptions,
+): Promise<ProxyServer> {
+  const opts = typeof options === 'string' ? { baseDir: options } : (options ?? {})
+  const workDir = await createWorkDir(opts)
   const confDir = join(workDir, 'mitmproxy-conf')
   await mkdir(confDir, { recursive: true })
-  const mitmDumpPath = await resolveMitmDumpPath(baseDir)
+  const mitmDumpPath = await resolveMitmDumpPath(opts.baseDir)
   const addonPath = await resolveAddonPath()
   const proxyPort = await getFreePort()
   const eventsFile = join(workDir, 'proxy-events.jsonl')
@@ -171,10 +209,58 @@ async function resolveAddonPath(): Promise<string> {
   throw new Error('Unable to locate mitmAddon.py for proxy-testing')
 }
 
-async function createWorkDir(baseDir?: string): Promise<string> {
-  const root = baseDir ?? join(tmpdir(), 'claude-code-headless-proxy-testing')
-  const dir = join(root, new Date().toISOString().replace(/[:.]/g, '-'))
+function sanitizeSegment(value: string): string {
+  const sanitized = sanitizePath(value).replace(/-+/g, '-').replace(/^-|-$/g, '')
+  return sanitized.length > 0 ? sanitized : 'unknown'
+}
+
+async function createWorkDir(options: CreateProxyServerOptions): Promise<string> {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+  let root: string
+  let dir: string
+
+  if (options.baseDir) {
+    root = options.baseDir
+    dir = join(root, timestamp)
+  } else {
+    // WHY default to hidden app state instead of cwd / tmp:
+    //
+    // The proxy runtime writes CA material, decrypted event logs, and other
+    // debugging artifacts that are operationally useful but absolutely not
+    // project files. Letting the caller's cwd become the storage root made
+    // normal app usage spray timestamped folders into the user's repo. The
+    // app-facing default is therefore a conventional hidden state location:
+    //   ~/.config/cc-shell/proxy/<sanitized-cwd>/<session-key>/<timestamp>/
+    //
+    // This mirrors the broader "session artifacts live in hidden state dirs"
+    // convention used by Claude/Codex transcript storage, while keeping the
+    // path readable enough to map back to the originating workspace +
+    // session/conversation.
+    root = join(homedir(), '.config', 'cc-shell', 'proxy')
+    const cwdSegment = options.cwd
+      ? sanitizeSegment(await canonicalizePath(options.cwd))
+      : 'unknown-project'
+    const sessionSegment = options.sessionKey
+      ? sanitizeSegment(options.sessionKey)
+      : `run-${timestamp}`
+    dir = join(root, cwdSegment, sessionSegment, timestamp)
+  }
   await mkdir(dir, { recursive: true })
+  await writeFile(
+    join(dir, 'session-meta.json'),
+    JSON.stringify(
+      {
+        createdAt: new Date().toISOString(),
+        cwd: options.cwd ?? null,
+        sessionKey: options.sessionKey ?? null,
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  ).catch(() => {
+    // best-effort metadata only
+  })
   return dir
 }
 

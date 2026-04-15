@@ -105,3 +105,137 @@ export {
 export {
   getProjectDirForCwd,
 } from './transcript/ProjectDir.js'
+
+// --- Channels (three-channel truth model) ---
+//
+// Subscribe to `claude.semantic`, `claude.screen`, and
+// `claude.committed` on a ClaudeCodeHeadless instance for the new
+// split surface. The old flat `'event' | 'screen' | …` events still
+// fire so existing cc-shell consumers keep working while they migrate.
+export {
+  SemanticChannel,
+  type SemanticChannelEvents,
+} from './channels/SemanticChannel.js'
+export {
+  ScreenChannel,
+  type ScreenChannelEvents,
+} from './channels/ScreenChannel.js'
+export {
+  CommittedChannel,
+  type CommittedChannelEvents,
+} from './channels/CommittedChannel.js'
+// NOTE: the top-level `ScreenEvent` below (from channels/types) is
+// exported under an alias — the legacy flat-surface `ScreenEvent`
+// exported by ClaudeCodeHeadless.ts already occupies that name for
+// existing cc-shell consumers. Alias keeps both surfaces co-existing
+// until the legacy name is deprecated.
+export type {
+  // Turn-level aggregate (backward compatible)
+  SemanticSource,
+  SemanticConfidence,
+  SemanticEvent,
+  SemanticTurnStartedEvent,
+  SemanticTurnDeltaEvent,
+  SemanticTurnCompletedEvent,
+  SemanticSourceChangedEvent,
+  // Block-level semantic stream (proxy-driven)
+  SemanticBlockRef,
+  SemanticBlockKind,
+  SemanticBlockStartedEvent,
+  SemanticTextDeltaEvent,
+  SemanticThinkingDeltaEvent,
+  SemanticSignatureEvent,
+  SemanticToolInputDeltaEvent,
+  SemanticToolInputFinalizedEvent,
+  SemanticBlockCompletedEvent,
+  // Cross-turn + lifecycle
+  SemanticToolResultEvent,
+  SemanticTurnStoppedEvent,
+  SemanticUsageEvent,
+  // Errors + diagnostics
+  SemanticStreamErrorEvent,
+  SemanticApiErrorEvent,
+  SemanticFlowSelectedEvent,
+  SemanticFlowIgnoredEvent,
+  // Screen channel
+  ScreenEvent as ChannelScreenEvent,
+  ScreenSnapshotEvent,
+  ScreenActivityEvent,
+  ScreenTrustDialogEvent as ChannelTrustDialogEvent,
+  ScreenResumePromptEvent as ChannelResumePromptEvent,
+  ScreenCompactionEvent,
+  ScreenSlashPickerEvent,
+  // Committed channel
+  CommittedEvent,
+  CommittedTurnEvent,
+  CommittedEntryEvent,
+  CommittedCompactBoundaryEvent,
+} from './channels/types.js'
+
+// --- Proxy live-streaming adapter (optional) ---
+//
+// The `ClaudeProxyAdapter` takes transport-level events emitted by a
+// mitmproxy-style runtime (request / response-chunk / response-end /
+// response) and drives the SemanticChannel with structured per-block
+// events. Consumers that want proxy-backed live rendering instantiate
+// the adapter, wire their proxy runtime's event stream into
+// `handleTransportEvent`, and subscribe to the SemanticChannel.
+//
+// This surface is optional — ClaudeCodeHeadless stays functional
+// without it. See PROXY_STREAMING.md + EVENT_SPEC.md for protocol
+// details.
+export {
+  ClaudeProxyAdapter,
+  createDefaultAttributionPolicy,
+  defaultAttributionPolicy,
+  type ClaudeProxyAdapterOptions,
+  type ProxyTransportEvent,
+  type AttributionContext,
+  type AttributionPolicy,
+  type FlowAttribution,
+} from './proxy/ClaudeProxyAdapter.js'
+export {
+  IncrementalSseParser,
+  type SseEvent,
+} from './proxy/sseFraming.js'
+// --- Proxy runtime (mitmproxy launcher) ---
+//
+// This is the runtime that spawns `mitmdump` and surfaces its addon
+// events over a JSONL file. Used end-to-end by the proxy-testing
+// harness and by downstream apps (cc-shell) that want a production
+// proxy-driven session. Marked experimental because mitmproxy is an
+// external dependency the caller must have installed; see
+// `bootstrapProxyRuntime` for a convenience installer.
+export {
+  ProxyServer,
+  createProxyServer,
+  type ProxyServerInfo,
+  type ProxyServerEvents,
+  type ProxyCapturedEvent,
+} from './testing/proxy-testing/proxyServer.js'
+export {
+  spawnClaudeWithProxy,
+  type SpawnClaudeWithProxyOptions,
+} from './testing/proxy-testing/spawnClaudeWithProxy.js'
+
+export {
+  parseAnthropicEventsFromSse,
+  type AnthropicStreamEvent,
+  type AnthropicMessageStart,
+  type AnthropicContentBlockStart,
+  type AnthropicTextDelta,
+  type AnthropicInputJsonDelta,
+  type AnthropicThinkingDelta,
+  type AnthropicSignatureDelta,
+  type AnthropicConnectorTextDelta,
+  type AnthropicCitationsDelta,
+  type AnthropicUnknownDelta,
+  type AnthropicContentBlockStop,
+  type AnthropicMessageDelta,
+  type AnthropicMessageStop,
+  type AnthropicPing,
+  type AnthropicErrorEvent,
+  type AnthropicOther,
+  type AnthropicUsage,
+  type ParsedContentBlockStart,
+} from './proxy/anthropicEvents.js'

@@ -19,8 +19,25 @@ import {
   tailSessionFile,
   type JsonlEntry,
 } from './transcript/JsonlTailer.js'
+import { isConversationEntry, type Entry } from './transcript/TranscriptTypes.js'
 import { getProjectDirForCwd } from './transcript/ProjectDir.js'
 import { listSessionsForCwd, type SessionInfo } from './transcript/SessionList.js'
+
+// Three-channel truth model. See src/channels/types.ts for the WHY.
+// Keeping these as separate readonly fields on the class is what makes
+// them usable standalone — consumers can subscribe to just
+// `claude.semantic` if they only want JIT markdown rendering, or just
+// `claude.screen` if they are mirroring the PTY. The old flat
+// `'event' | 'screen' | 'activity' | …` surface still fires for
+// backwards compatibility with existing cc-shell consumers.
+import { CommittedChannel } from './channels/CommittedChannel.js'
+import { ScreenChannel } from './channels/ScreenChannel.js'
+import { SemanticChannel } from './channels/SemanticChannel.js'
+import {
+  ClaudeProxyAdapter,
+  type AttributionPolicy,
+  type ProxyTransportEvent,
+} from './proxy/ClaudeProxyAdapter.js'
 
 // ClaudeCodeHeadless — programmatic control of Claude Code.
 //
@@ -49,6 +66,29 @@ export type ClaudeCodeHeadlessOptions = {
   /** If set, tail the existing session file instead of waiting for
    *  CC to create a new one. Used for --resume flows. */
   resumeSessionId?: string
+  /** Optional proxy integration. When present, a `ClaudeProxyAdapter`
+   *  is created and exposed on `this.proxy`. The consumer owns the
+   *  proxy runtime (mitmproxy or otherwise) and pipes transport
+   *  events in via `handleProxyTransportEvent(event)`. When absent,
+   *  the semantic channel falls back to screen-driven deltas as
+   *  before. Presence of this option is a binding statement that
+   *  proxy is the authoritative semantic source — screen-derived
+   *  semantic deltas are suppressed while it's set, so the two
+   *  sources do not race to own `activeTurnId` on the semantic
+   *  channel. The screen channel continues to fire for terminal
+   *  mirroring and overlays; only semantic publishing is gated.
+   *  Consumers that want dynamic screen-fallback (resurrect screen
+   *  semantic when proxy is silent mid-turn) can layer that on top
+   *  of the two channels themselves. */
+  proxy?: {
+    /** Pluggable policy deciding which /v1/messages flow is the
+     *  visible assistant turn. Default accepts any flow to
+     *  anthropic.com/v1/messages. See PROXY_STREAMING.md for
+     *  planned smarter policies (session header + prompt ordering). */
+    attributionPolicy?: AttributionPolicy
+    /** Optional diagnostic sink for adapter decisions. */
+    onDiagnostic?: (message: string) => void
+  }
 }
 
 // --- Event types ---
@@ -150,6 +190,38 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private pickerState: SlashPickerState = { visible: false, items: [] }
   private lastPickerKey: string | null = null
 
+  // --- Three-channel truth surface ---------------------------------------
+  //
+  // These channels are the new public contract (see docs/channels).
+  // They run IN ADDITION TO the existing flat event surface so we
+  // don't break cc-shell today. The split lets consumers treat live
+  // semantic text, visible terminal state, and committed transcript
+  // history as three independent streams instead of reverse-engineering
+  // which is which from a blended event list.
+  readonly semantic = new SemanticChannel()
+  readonly screen = new ScreenChannel()
+  readonly committed = new CommittedChannel()
+  /** Proxy adapter when `options.proxy` was set, else null. Exposed
+   *  so consumers can inspect flow decisions (flow_selected /
+   *  flow_ignored events on the semantic channel) and call
+   *  `handleTransportEvent` directly if they need to bypass the
+   *  convenience forwarder on this class. */
+  readonly proxy: ClaudeProxyAdapter | null
+
+  /** Internal id for the current screen-driven live turn. Claude's
+   *  JSONL only appends finished assistant turns (one line per commit),
+   *  so the live turn does not have a real provider-assigned uuid while
+   *  it is still streaming. We synthesise a "live-<start-ts>" id so
+   *  semantic deltas have something stable to attach to, then emit the
+   *  provider-assigned uuid on the committed channel once the JSONL
+   *  entry lands. Consumers reconciling across channels should match
+   *  on text + timing, not id equality — see README. */
+  private liveSemanticTurnId: string | null = null
+  /** Last screen-derived assistant text we published as a semantic
+   *  delta. Used to suppress duplicate deltas when the screen
+   *  snapshotter fires but the assistant block hasn't actually changed. */
+  private lastScreenSemanticText = ''
+
   constructor(options: ClaudeCodeHeadlessOptions) {
     super()
     this.cwd = options.cwd
@@ -161,6 +233,20 @@ export class ClaudeCodeHeadless extends EventEmitter {
       rows: options.rows ?? 40,
       snapshotIntervalMs: options.snapshotIntervalMs ?? 16,
     })
+
+    // Proxy adapter is created lazily — only when the consumer opted
+    // in. Creating it unconditionally would allocate empty per-flow
+    // Maps and TextDecoders for sessions that never see proxy
+    // traffic, and more importantly would blur the semantic-source
+    // contract: `this.proxy !== null` is the signal the screen path
+    // checks to know it should NOT publish semantic deltas.
+    this.proxy = options.proxy
+      ? new ClaudeProxyAdapter({
+          channel: this.semantic,
+          attributionPolicy: options.proxy.attributionPolicy,
+          onDiagnostic: options.proxy.onDiagnostic,
+        })
+      : null
 
     // --- Wire terminal events ---
 
@@ -199,9 +285,52 @@ export class ClaudeCodeHeadless extends EventEmitter {
       const pickerKey = picker.visible ? JSON.stringify(picker) : null
       this.pickerState = picker
 
-      // Forward raw screen
+      // Forward raw screen (legacy flat surface).
       this.emit('screen', snap)
       this.emit('event', { type: 'screen', ts: Date.now(), ...snap })
+
+      // Screen channel — visual terminal truth.
+      //
+      // This fires for EVERY snapshot because the channel is for
+      // consumers mirroring the PTY; they want the same cadence the
+      // terminal is actually rendering at. Semantic throttling
+      // (dedupe-on-unchanged-text) is handled below in the semantic
+      // branch, not here — mirroring the terminal and producing
+      // semantic deltas are different jobs with different cadence
+      // requirements.
+      this.screen.publishSnapshot({ plain: snap.plain, markdown: snap.markdown })
+
+      // Semantic channel — live assistant text (source='screen').
+      //
+      // We derive semantic deltas from the screen extractor as long as
+      // a turn is active. Skipped entirely when `this.proxy` is
+      // present: the consumer opted into proxy-sourced semantics, and
+      // two publishers fighting over `activeTurnId` produces incorrect
+      // source_changed events and wrong `turn_delta.fullText`
+      // snapshots. Screen channel publishing is unaffected — the app
+      // still gets screen snapshots for overlays/PTY mirroring.
+      if (!this.proxy && this.liveSemanticTurnId) {
+        const fullText = extractAssistantInProgress(snap.plain)
+        if (fullText && fullText !== this.lastScreenSemanticText) {
+          // Compute the markdown flavor from the full snapshot rather
+          // than re-running the extractor on markdown — the extractor
+          // is written against plain text. This is a coarse
+          // approximation; the committed channel is still the source
+          // of truth for final formatting.
+          const textDelta = fullText.startsWith(this.lastScreenSemanticText)
+            ? fullText.slice(this.lastScreenSemanticText.length)
+            : undefined
+          this.lastScreenSemanticText = fullText
+          this.semantic.applyDelta({
+            turnId: this.liveSemanticTurnId,
+            fullText,
+            textDelta,
+            markdownText: extractAssistantInProgress(snap.markdown) || undefined,
+            source: 'screen',
+            confidence: 'fallback',
+          })
+        }
+      }
 
       // Activity detection.
       //
@@ -228,6 +357,31 @@ export class ClaudeCodeHeadless extends EventEmitter {
           this.lastActivity = activity
           this.emit('activity', activity)
           this.emit('event', { type: 'activity', ts: Date.now(), status: activity })
+
+          // Screen channel — the mirror of "is the spinner up".
+          this.screen.publishActivity({ active: true, status: activity })
+
+          // Semantic channel — idle→active is our best screen-level
+          // proxy for "assistant turn started". Skipped when proxy
+          // is configured: the adapter will emit `turn_started` with
+          // the real Anthropic message id once `message_start`
+          // arrives. We still mint the `liveSemanticTurnId` string
+          // below in the proxy branch (just not publish) so legacy
+          // screen-path code reading it for diagnostics keeps
+          // working — but we do not call `startTurn` to avoid
+          // fighting the adapter over `activeTurnId`.
+          if (!this.liveSemanticTurnId) {
+            this.liveSemanticTurnId = `live-${Date.now()}`
+            this.lastScreenSemanticText = ''
+            if (!this.proxy) {
+              this.semantic.startTurn({
+                turnId: this.liveSemanticTurnId,
+                role: 'assistant',
+                source: 'screen',
+                confidence: 'fallback',
+              })
+            }
+          }
         } else {
           // Defer the idle emission — give the next snapshot a chance
           // to reinstate the spinner before we tell consumers we're
@@ -241,6 +395,32 @@ export class ClaudeCodeHeadless extends EventEmitter {
             this.lastActivity = null
             this.emit('idle')
             this.emit('event', { type: 'idle', ts: Date.now() })
+
+            // Screen channel — mirror the debounced idle transition.
+            this.screen.publishActivity({ active: false, status: null })
+
+            // Semantic channel — close out the screen-driven live turn
+            // with whatever text the extractor last saw. Skipped when
+            // proxy is configured: the adapter owns turn completion
+            // via `message_delta` / `response-end`, and letting an
+            // idle-timeout closer race against it would produce
+            // duplicate `turn_completed` events. If JSONL later
+            // commits a different/better text, the committed channel
+            // will carry that truth; we don't retroactively mutate
+            // the semantic stream because reconciliation across
+            // channels is the consumer's call, not ours.
+            if (this.liveSemanticTurnId) {
+              if (!this.proxy) {
+                this.semantic.finishTurn({
+                  turnId: this.liveSemanticTurnId,
+                  fullText: this.lastScreenSemanticText || undefined,
+                  source: 'screen',
+                  confidence: 'fallback',
+                })
+              }
+              this.liveSemanticTurnId = null
+              this.lastScreenSemanticText = ''
+            }
           }, 2500)
         }
       }
@@ -249,6 +429,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       if (trustKey !== this.lastTrustKey) {
         this.lastTrustKey = trustKey
         this.emit('trust-dialog', trust)
+        this.screen.publishTrustDialog(trust)
         if (trust.visible) {
           this.emit('event', {
             type: 'trust_dialog',
@@ -264,6 +445,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       if (resumePromptKey !== this.lastResumePromptKey) {
         this.lastResumePromptKey = resumePromptKey
         this.emit('resume-prompt', resumePrompt)
+        this.screen.publishResumePrompt(resumePrompt)
         if (resumePrompt.visible) {
           this.emit('event', {
             type: 'resume_prompt',
@@ -278,6 +460,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       if (compactionKey !== this.lastCompactionKey) {
         this.lastCompactionKey = compactionKey
         this.emit('compaction-state', compaction)
+        this.screen.publishCompaction(compaction)
         this.emit('event', {
           type: 'compaction_state',
           ts: Date.now(),
@@ -289,6 +472,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       if (pickerKey !== this.lastPickerKey) {
         this.lastPickerKey = pickerKey
         this.emit('slash-picker', picker)
+        this.screen.publishSlashPicker(picker)
         this.emit('event', { type: 'slash_picker', ts: Date.now(), state: picker })
       }
     })
@@ -314,17 +498,131 @@ export class ClaudeCodeHeadless extends EventEmitter {
   async start(): Promise<{ projectDir: string }> {
     const projectDir = await getProjectDirForCwd(this.cwd)
 
+    // Single JSONL sink. Deduplicated here because on the fresh and
+    // resume paths we want identical channel routing: the committed
+    // channel gets the raw entry, and whenever a JSONL entry commits
+    // an assistant turn we promote the currently-active screen-driven
+    // semantic turn to source='jsonl' with confidence='high' before
+    // finalising. That's the cleanest way to let late subscribers
+    // see the authoritative text even though the live stream came
+    // from the screen extractor.
+    const onJsonlEntry = (entry: JsonlEntry, filePath: string) => {
+      this.emit('jsonl-entry', entry, filePath)
+      this.emit('event', {
+        type: 'jsonl_entry', ts: Date.now(), entry, file: filePath,
+      })
+
+      const typed = entry as unknown as Entry
+      this.committed.publishEntry(typed, filePath)
+
+      if (
+        isConversationEntry(typed) &&
+        typed.type === 'user' &&
+        Array.isArray(typed.message.content)
+      ) {
+        // WHY bridge committed tool_result blocks back onto the semantic channel:
+        //
+        // Anthropic's live SSE stream never carries tool results. They arrive in
+        // the NEXT user-role transcript entry after the tool has finished. If we
+        // leave them on the committed channel only, a renderer that is correctly
+        // using semantic state for live turns still has to subscribe to two
+        // independent sources and re-implement pairing logic by tool_use_id.
+        //
+        // Claude's own UI doesn't have that split-brain problem because it owns
+        // both the stream loop and transcript reconciliation internally. cc-shell
+        // does not, so the safe contract here is: semantic owns "live turn
+        // structure", and that includes late-arriving tool results. The committed
+        // channel remains the durable source of truth; this bridge just mirrors
+        // the result shape onto the semantic bus so the renderer does not have to
+        // guess where tool output lives.
+        const semanticTurnId =
+          typeof typed.parentUuid === 'string' && typed.parentUuid
+            ? typed.parentUuid
+            : typed.uuid
+        for (const block of typed.message.content) {
+          if (block.type !== 'tool_result') continue
+          const content =
+            typeof block.content === 'string'
+              ? block.content
+              : Array.isArray(block.content)
+                ? block.content
+                    .map(item =>
+                      typeof item === 'string'
+                        ? item
+                        : typeof item.text === 'string'
+                          ? item.text
+                          : '',
+                    )
+                    .filter(Boolean)
+                    .join('\n')
+                : ''
+          this.semantic.publishToolResult({
+            turnId: semanticTurnId,
+            toolUseId: block.tool_use_id,
+            content,
+            isError: block.is_error === true,
+            source: 'jsonl',
+            confidence: 'high',
+          })
+        }
+      }
+
+      // Promote the active screen-driven live semantic turn to
+      // authoritative text once JSONL commits an assistant message.
+      // We do this ONLY while a live turn is still open AND proxy is
+      // not configured. When proxy is configured the adapter owns
+      // semantic publishing end-to-end (with the real Anthropic
+      // message id as turnId); firing a jsonl-sourced promotion
+      // against the screen-path's synthetic `live-<ts>` id would
+      // collide with the adapter's turnId and emit source_changed
+      // events that confuse the renderer. The committed channel
+      // still carries the canonical text either way, so nothing is
+      // lost for consumers that want the settled view.
+      if (
+        !this.proxy &&
+        this.liveSemanticTurnId &&
+        isConversationEntry(typed) &&
+        typed.type === 'assistant'
+      ) {
+        const msg = typed.message
+        let text = ''
+        if (typeof msg.content === 'string') {
+          text = msg.content
+        } else if (Array.isArray(msg.content)) {
+          text = msg.content
+            .map(b => (b.type === 'text' && typeof b.text === 'string' ? b.text : ''))
+            .filter(Boolean)
+            .join('\n')
+        }
+        if (text) {
+          this.semantic.applyDelta({
+            turnId: this.liveSemanticTurnId,
+            fullText: text,
+            source: 'jsonl',
+            confidence: 'high',
+          })
+          this.semantic.finishTurn({
+            turnId: this.liveSemanticTurnId,
+            fullText: text,
+            source: 'jsonl',
+            confidence: 'high',
+          })
+          this.liveSemanticTurnId = null
+          this.lastScreenSemanticText = ''
+        }
+      }
+    }
+    const onJsonlError = (err: Error) => {
+      this.emit('jsonl-error', err)
+      this.committed.publishError(err)
+    }
+
     if (this.resumeSessionId) {
       const filePath = join(projectDir, `${this.resumeSessionId}.jsonl`)
       const stop = tailSessionFile(
         filePath,
-        (entry) => {
-          this.emit('jsonl-entry', entry, filePath)
-          this.emit('event', {
-            type: 'jsonl_entry', ts: Date.now(), entry, file: filePath,
-          })
-        },
-        (err) => this.emit('jsonl-error', err),
+        (entry) => onJsonlEntry(entry, filePath),
+        onJsonlError,
         {
           bootstrapTailLines: ClaudeCodeHeadless.RESUME_BOOTSTRAP_TAIL_LINES,
         },
@@ -333,13 +631,8 @@ export class ClaudeCodeHeadless extends EventEmitter {
     } else {
       this.stopJsonlTail = await tailNewSessionFile(
         projectDir,
-        (entry, file) => {
-          this.emit('jsonl-entry', entry, file)
-          this.emit('event', {
-            type: 'jsonl_entry', ts: Date.now(), entry, file,
-          })
-        },
-        (err) => this.emit('jsonl-error', err),
+        onJsonlEntry,
+        onJsonlError,
       )
     }
 
@@ -434,6 +727,16 @@ export class ClaudeCodeHeadless extends EventEmitter {
     return this.terminal.isExited()
   }
 
+  // --- Proxy integration ---
+
+  /** Forward a transport event from the consumer's proxy runtime
+   *  (mitmproxy-style: `{ kind, flow_id, url, host, path, method,
+   *  headers, status_code, chunk_b64, body, … }`) into the adapter.
+   *  No-op when proxy was not configured in options. */
+  handleProxyTransportEvent(event: ProxyTransportEvent): void {
+    this.proxy?.handleTransportEvent(event)
+  }
+
   // --- Cleanup ---
 
   /** Stop processing: detach the JSONL tailer and terminal. Does NOT
@@ -456,5 +759,10 @@ export class ClaudeCodeHeadless extends EventEmitter {
       }
       this.stopJsonlTail = null
     }
+    // Proxy adapter has its own flow state (per-flow TextDecoders,
+    // SSE buffers, per-block accumulators). Releasing it here means a
+    // stop → restart cycle starts from a clean slate instead of
+    // replaying stale partial state.
+    this.proxy?.dispose()
   }
 }

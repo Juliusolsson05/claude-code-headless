@@ -1,4 +1,19 @@
 #!/usr/bin/env tsx
+// End-to-end experiment runner.
+//
+// This harness now exercises the SAME protocol path as the Electron
+// demo: proxy transport events flow into `ClaudeCodeHeadless` via its
+// built-in `ClaudeProxyAdapter`, which drives the `semantic` channel
+// with block-level events. We subscribe to the semantic channel to
+// assemble the proxy-sourced view, to the screen path for the
+// fallback view, and to the committed path for the settled view.
+//
+// Previously this file re-parsed buffered `response.body` payloads
+// from the mitmproxy addon — a path that the addon no longer emits
+// for SSE responses. Keeping the old code around would have meant
+// `run.ts` and the demo validated different protocols: a regression
+// in the live path could pass `proxy-test` and still break the demo.
+
 import { mkdir, writeFile } from 'fs/promises'
 import { createWriteStream } from 'fs'
 import { join } from 'path'
@@ -7,7 +22,6 @@ import { ClaudeCodeHeadless } from '../../ClaudeCodeHeadless.js'
 import { extractAssistantInProgress } from '../../parsers/ScreenParser.js'
 import { summarizeComparison } from './compareWithScreen.js'
 import { createProxyServer } from './proxyServer.js'
-import { parseAnthropicEvents } from './sseParser.js'
 import { spawnClaudeWithProxy } from './spawnClaudeWithProxy.js'
 
 async function main(): Promise<void> {
@@ -36,39 +50,62 @@ async function main(): Promise<void> {
     caCertPath: proxy.info.caCertPath,
   })
 
+  // Enabling `options.proxy` tells ClaudeCodeHeadless that proxy is
+  // the semantic source of truth — its screen path will stop
+  // publishing semantic deltas (screen channel still fires for
+  // overlays). The adapter is exposed as `headless.proxy`, and we
+  // feed transport events through `handleProxyTransportEvent`.
   const headless = new ClaudeCodeHeadless({
     pty,
     cwd,
     cols: 120,
     rows: 40,
     snapshotIntervalMs: 16,
+    proxy: {
+      onDiagnostic: (m) => process.stderr.write(`[adapter] ${m}\n`),
+    },
   })
 
   const proxyLog = createWriteStream(join(runDir, 'proxy-events.jsonl'), { flags: 'a' })
+  const semanticLog = createWriteStream(join(runDir, 'semantic-events.jsonl'), { flags: 'a' })
   const screenLog = createWriteStream(join(runDir, 'screen-events.jsonl'), { flags: 'a' })
-  const jsonlLog = createWriteStream(join(runDir, 'jsonl-events.jsonl'), { flags: 'a' })
+  const committedLog = createWriteStream(join(runDir, 'committed-events.jsonl'), { flags: 'a' })
 
+  // Proxy-sourced text rolls up text_delta events from the semantic
+  // channel. This is a coarse aggregate — the block-level stream is
+  // richer — but it's directly comparable against `screenText` for
+  // the summary. Multi-text-block turns concatenate naturally since
+  // the channel already emits per-block `textSoFar` and our rollup
+  // uses the `textDelta` increment.
   let proxyText = ''
   let latestScreenText = ''
 
+  // --- Proxy transport: record + forward into the adapter ---------------
   proxy.on('event', event => {
     proxyLog.write(JSON.stringify(event) + '\n')
-
-    const body = typeof event.body === 'string' ? event.body : null
-    const url = typeof event.url === 'string' ? event.url : ''
-    if (!body || !url.includes('/v1/messages')) return
-
-    for (const parsed of parseAnthropicEvents(body)) {
-      if (parsed.type === 'text_delta') {
-        proxyText += parsed.text
-      }
-    }
+    // The adapter type requires a narrower shape; the on-disk event
+    // is `Record<string, unknown>`. Casting is safe here because the
+    // addon enforces the shape on the Python side.
+    headless.handleProxyTransportEvent(event as unknown as Parameters<
+      typeof headless.handleProxyTransportEvent
+    >[0])
   })
-
   proxy.on('stderr', text => {
     process.stderr.write(`[mitmdump] ${text}`)
   })
 
+  // --- Semantic channel: the new source of truth -----------------------
+  headless.semantic.on('event', ev => {
+    semanticLog.write(JSON.stringify(ev) + '\n')
+  })
+  headless.semantic.on('text_delta', ev => {
+    // Only count proxy-sourced deltas for the aggregate — screen
+    // fallback deltas (source='screen') are suppressed today when
+    // proxy is configured, but the guard is cheap and future-proof.
+    if (ev.source === 'proxy') proxyText += ev.textDelta
+  })
+
+  // --- Screen channel: mirror for overlays + the fallback view --------
   headless.on('screen', snap => {
     latestScreenText = extractAssistantInProgress(snap.recent)
     screenLog.write(
@@ -80,8 +117,9 @@ async function main(): Promise<void> {
     )
   })
 
-  headless.on('jsonl-entry', (entry, file) => {
-    jsonlLog.write(JSON.stringify({ ts: Date.now(), file, entry }) + '\n')
+  // --- Committed channel: durable transcript truth --------------------
+  headless.committed.on('event', ev => {
+    committedLog.write(JSON.stringify(ev) + '\n')
   })
 
   headless.on('exit', ({ exitCode, signal }) => {
@@ -97,8 +135,9 @@ async function main(): Promise<void> {
     await headless.stop()
     await proxy.stop()
     proxyLog.end()
+    semanticLog.end()
     screenLog.end()
-    jsonlLog.end()
+    committedLog.end()
 
     const summary = summarizeComparison({
       proxyText,
@@ -115,6 +154,10 @@ async function main(): Promise<void> {
           proxyUrl: proxy.info.proxyUrl,
           caCertPath: proxy.info.caCertPath,
           prompt: prompt ?? null,
+          // Document which protocol the run exercised, so future runs
+          // comparing results can tell apart pre- and post-migration
+          // harness behavior.
+          protocol: 'semantic-channel-v1',
         },
         null,
         2,
