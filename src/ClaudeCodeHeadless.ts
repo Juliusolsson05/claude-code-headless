@@ -221,6 +221,16 @@ export class ClaudeCodeHeadless extends EventEmitter {
    *  delta. Used to suppress duplicate deltas when the screen
    *  snapshotter fires but the assistant block hasn't actually changed. */
   private lastScreenSemanticText = ''
+  /** Screen-fallback baseline — the assistant block visible on the
+   *  TUI at the moment a live turn starts. While the extracted text
+   *  still equals this baseline, the turn has not actually produced
+   *  new bytes; publishing it as the first `text_delta` would leak
+   *  the PREVIOUS turn's answer into the new turn. We hold deltas
+   *  until the buffer moves past the baseline, at which point the
+   *  screen has genuine new content to stream. Fixes the "stale
+   *  previous assistant text rendered below new user prompt" bug. */
+  private screenBaselineText = ''
+  private screenBaselineSatisfied = false
 
   constructor(options: ClaudeCodeHeadlessOptions) {
     super()
@@ -310,13 +320,31 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // snapshots. Screen channel publishing is unaffected — the app
       // still gets screen snapshots for overlays/PTY mirroring.
       if (!this.proxy && this.liveSemanticTurnId) {
-        const fullText = extractAssistantInProgress(snap.plain)
+        // Extract from the wider `recent` window (~200 rows), not
+        // just the viewport — taller replies scroll the `⏺` marker
+        // out of the visible region and the narrow extractor returns
+        // empty while the assistant is still actively writing.
+        const fullText = extractAssistantInProgress(snap.recent)
+
+        // Baseline gate. If the live turn just started and the TUI
+        // still shows the PREVIOUS assistant's text, publishing
+        // `fullText` as the first delta would leak that old answer
+        // into the new turn (the user sees yesterday's reply briefly
+        // under their new prompt). Suppress until the extracted text
+        // actually differs from the baseline captured at turn start.
+        if (!this.screenBaselineSatisfied) {
+          if (!fullText || fullText === this.screenBaselineText) {
+            return
+          }
+          this.screenBaselineSatisfied = true
+        }
+
         if (fullText && fullText !== this.lastScreenSemanticText) {
-          // Compute the markdown flavor from the full snapshot rather
-          // than re-running the extractor on markdown — the extractor
-          // is written against plain text. This is a coarse
-          // approximation; the committed channel is still the source
-          // of truth for final formatting.
+          // Compute the markdown flavor from the wider `recent`
+          // snapshot rather than re-running the extractor on
+          // markdown — the extractor is written against plain text.
+          // This is a coarse approximation; the committed channel is
+          // still the source of truth for final formatting.
           const textDelta = fullText.startsWith(this.lastScreenSemanticText)
             ? fullText.slice(this.lastScreenSemanticText.length)
             : undefined
@@ -325,7 +353,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
             turnId: this.liveSemanticTurnId,
             fullText,
             textDelta,
-            markdownText: extractAssistantInProgress(snap.markdown) || undefined,
+            markdownText: extractAssistantInProgress(snap.recentMarkdown) || undefined,
             source: 'screen',
             confidence: 'fallback',
           })
@@ -373,6 +401,13 @@ export class ClaudeCodeHeadless extends EventEmitter {
           if (!this.liveSemanticTurnId) {
             this.liveSemanticTurnId = `live-${Date.now()}`
             this.lastScreenSemanticText = ''
+            // Capture the assistant block currently on screen as
+            // the baseline. Until the next delta differs from this,
+            // the "turn" has not produced any real new bytes — it's
+            // just the previous turn's text still rendered in the
+            // TUI buffer. See screenBaselineText field docs.
+            this.screenBaselineText = extractAssistantInProgress(snap.recent) || ''
+            this.screenBaselineSatisfied = false
             if (!this.proxy) {
               this.semantic.startTurn({
                 turnId: this.liveSemanticTurnId,
@@ -420,6 +455,8 @@ export class ClaudeCodeHeadless extends EventEmitter {
               }
               this.liveSemanticTurnId = null
               this.lastScreenSemanticText = ''
+              this.screenBaselineText = ''
+              this.screenBaselineSatisfied = false
             }
           }, 2500)
         }
@@ -609,6 +646,8 @@ export class ClaudeCodeHeadless extends EventEmitter {
           })
           this.liveSemanticTurnId = null
           this.lastScreenSemanticText = ''
+          this.screenBaselineText = ''
+          this.screenBaselineSatisfied = false
         }
       }
     }
