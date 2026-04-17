@@ -62,27 +62,33 @@ export class ProxyServer extends EventEmitter {
         String(this.info.proxyPort),
         '--set',
         `confdir=${this.info.confDir}`,
-        // ignore_hosts makes mitmproxy a raw TCP tunnel for every
-        // host that DOESN'T match api.anthropic.com. We set
-        // HTTPS_PROXY on the spawned Claude process so our proxy
-        // can tap the SSE stream from the Anthropic API — but that
-        // env var also applies to every child the agent spawns
-        // (bash tool calls, git, curl, npm, brew, …). Without this
-        // flag the proxy MITM-terminates those connections too,
-        // presents a cert signed by the mitmproxy CA, and the
-        // caller's trust store rejects it — visible as "SSL cert
-        // verify failed" when the agent tries to `git push`, etc.
+        // Scope MITM to api.anthropic.com only. Every other host
+        // is passed through as a raw TCP tunnel.
         //
-        // Negative-lookahead regex: match (and therefore PASS
-        // THROUGH) any host that is not api.anthropic.com at the
-        // start of the string followed by end-of-string or colon.
-        // The ($|:) anchor rejects spoofed subdomains like
-        // api.anthropic.com.evil.com — that form does NOT pass
-        // through and stays under MITM, which is what we want
-        // because we'd rather fail noisily than trust an
-        // impostor.
+        // WHY this matters: the agent inherits HTTPS_PROXY through
+        // its env, which cascades into every child process it
+        // spawns (bash tool calls → git, curl, npm, brew, …).
+        // Without scoping, those children hit our proxy, receive a
+        // cert signed by the mitmproxy CA, and fail TLS validation
+        // — the visible symptom is "SSL cert verify failed" on
+        // `git push`.
+        //
+        // WHY allow_hosts and not ignore_hosts: a previous attempt
+        // used ignore_hosts with a negative-lookahead regex
+        // (^(?!api\.anthropic\.com($|:)).*). Python's standalone
+        // re.search agreed with that regex, but mitmproxy 12.2.2
+        // evidently parses the filter differently and tunneled
+        // *every* host including api.anthropic.com — capture went
+        // to zero flows. allow_hosts flips the polarity: we enumerate
+        // the one host we DO want to MITM. Positive match, no
+        // lookaheads, no parser edge cases.
+        //
+        // The (:443)? anchor keeps the match tight — both
+        // "api.anthropic.com" and "api.anthropic.com:443" match,
+        // but spoofed variants like "api.anthropic.com.evil.com"
+        // do not.
         '--set',
-        String.raw`ignore_hosts=^(?!api\.anthropic\.com($|:)).*`,
+        String.raw`allow_hosts=^api\.anthropic\.com(:443)?$`,
         '-s',
         this.info.addonPath,
       ],
