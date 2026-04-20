@@ -9,6 +9,7 @@ import type {
   CommittedCompactBoundaryEvent,
   CommittedEntryEvent,
   CommittedEvent,
+  CommittedToolResultEvent,
   CommittedTurnEvent,
 } from './types.js'
 
@@ -41,6 +42,11 @@ export type CommittedChannelEvents = {
   turn_committed: [CommittedTurnEvent]
   entry: [CommittedEntryEvent]
   compact_boundary: [CommittedCompactBoundaryEvent]
+  /** Committed tool_result content. Fires after `publishEntry` has
+   *  processed a user-role entry that carried tool_result blocks.
+   *  See `CommittedToolResultEvent` docstring for why this lives on
+   *  the committed channel rather than semantic. */
+  tool_result: [CommittedToolResultEvent]
   // WHY not 'error':
   //   Node's EventEmitter treats the literal event name 'error'
   //   specially — if no listener is attached, the emitter throws
@@ -136,6 +142,66 @@ export class CommittedChannel extends EventEmitter {
       }
       this.emit('turn_committed', ev)
       this.emit('event', ev)
+
+      // Tool-result extraction.
+      //
+      // WHY this lives here and not on the semantic channel anymore:
+      // see the CommittedToolResultEvent docstring. Short version —
+      // tool_result is durable data that arrives in a user-role
+      // transcript entry AFTER the assistant turn ended. Publishing
+      // it on the semantic channel forced the renderer to keep the
+      // assistant's live turn artificially alive, which is the
+      // "committed data mutating live semantics" leak the 2026-04-18
+      // redesign plan called out.
+      //
+      // We locate the parent assistant turn via `parentUuid` (the
+      // uuid of the preceding assistant entry) with a fallback to
+      // the user entry's own uuid. The fallback is a belt-and-braces
+      // guard for older transcripts that may not have parentUuid set
+      // on every entry; the renderer matches on toolUseId anyway so
+      // the wrong turnId is only a reconciliation hint, not a
+      // correctness issue.
+      if (entry.type === 'user' && Array.isArray(entry.message.content)) {
+        const parentEntry = entry as unknown as {
+          uuid: string
+          parentUuid?: string
+        }
+        const parentTurnId =
+          typeof parentEntry.parentUuid === 'string' && parentEntry.parentUuid
+            ? parentEntry.parentUuid
+            : parentEntry.uuid
+        for (const block of entry.message.content) {
+          if (block.type !== 'tool_result') continue
+          const content =
+            typeof block.content === 'string'
+              ? block.content
+              : Array.isArray(block.content)
+                ? block.content
+                    .map(item =>
+                      typeof item === 'string'
+                        ? item
+                        : typeof item.text === 'string'
+                          ? item.text
+                          : '',
+                    )
+                    .filter(Boolean)
+                    .join('\n')
+                : ''
+          const toolUseIdRaw = (block as { tool_use_id?: unknown }).tool_use_id
+          if (typeof toolUseIdRaw !== 'string') continue
+          const toolResultEv: CommittedToolResultEvent = {
+            type: 'tool_result',
+            turnId: parentTurnId,
+            toolUseId: toolUseIdRaw,
+            content,
+            isError: (block as { is_error?: unknown }).is_error === true,
+            file,
+            ts,
+          }
+          this.emit('tool_result', toolResultEv)
+          this.emit('event', toolResultEv)
+        }
+      }
     }
   }
 

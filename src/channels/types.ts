@@ -60,6 +60,85 @@ export type SemanticSource = 'proxy' | 'jsonl' | 'screen'
 export type SemanticConfidence = 'high' | 'medium' | 'fallback'
 
 // ---------------------------------------------------------------------------
+// Live-turn ownership model.
+// ---------------------------------------------------------------------------
+//
+// WHY this exists as its own thing:
+//
+// The SemanticChannel itself only tracks "what turnId is currently
+// active on the wire". It does NOT know *which source* claimed that
+// slot and it used to silently auto-heal mismatched producers by
+// sealing one turn and opening another. That auto-heal masked real
+// lifecycle bugs and produced the 0/1/0/1 flicker we fixed in the
+// Codex semantic flicker plan.
+//
+// The ownership model lives on the headless orchestrator (Claude /
+// Codex classes) instead, because only the orchestrator has the full
+// picture — it sees proxy state, rollout state, screen state, and
+// JSONL state at once. The orchestrator is the only place that can
+// answer the question "given these N possible live producers, which
+// one actually owns the current turn?"
+//
+// Rule of ownership:
+//
+//   At any moment, a session may have ZERO or ONE authoritative live
+//   semantic producer. Other sources may publish reconciliation and
+//   overlay signals, but they may NOT mutate the visible live turn
+//   once another source has ownership.
+//
+// See docs/superpowers/plans/2026-04-18-headless-live-turn-redesign.md
+// for the full architectural rationale.
+
+/** Which raw source is allowed to publish live-turn mutations onto
+ *  the authoritative `SemanticChannel`. Distinct from `SemanticSource`
+ *  because `SemanticSource` tags events that have already happened,
+ *  while `LiveOwnerKind` names producers that are eligible to publish
+ *  in the first place. `jsonl` is deliberately absent: JSONL is a
+ *  committed/durable source, not a live producer. */
+export type LiveOwnerKind = 'proxy' | 'screen'
+
+/** Ownership state held by the orchestrator. Consumers don't depend
+ *  on this directly; it exists so every site that wants to mutate the
+ *  live turn can ask "am I allowed to?" in one place instead of
+ *  reimplementing the check against ad hoc fields (`liveSemanticTurnId`
+ *  + `semanticSource` + proxy adapter presence + …). */
+export interface LiveOwnerState {
+  /** Which source currently owns the live turn, or `null` when no
+   *  live turn is open. */
+  kind: LiveOwnerKind | null
+  /** The turnId the current owner opened. Mirrors SemanticChannel's
+   *  activeTurnId during the live phase. */
+  turnId: string | null
+  /** Monotonic start wallclock. Useful for stale-owner detection and
+   *  for dashboarding slow handoffs. */
+  startedAt: number | null
+  /** Finer-grained phase. `live` = owner is actively streaming on
+   *  the channel; `reconciling` = owner finished but we're still
+   *  waiting on a durable-commit confirmation before we free the
+   *  slot. `idle` = no owner. */
+  status: 'idle' | 'live' | 'reconciling'
+}
+
+/** Diagnostic record emitted when an ownership helper decides whether
+ *  to accept a publish. Not meant as a renderer contract — this feeds
+ *  the debug panel and the headless test harness so we can see
+ *  transitions without inferring them from the event stream.
+ *
+ *  `action` captures the outcome so the debug UI can group like with
+ *  like: how many times did screen try to claim when proxy already
+ *  owned? How often did we promote screen→proxy cleanly? */
+export interface LiveOwnerDecision {
+  accept: boolean
+  action: 'start' | 'drop' | 'promote' | 'finalize' | 'clear'
+  kind: LiveOwnerKind
+  turnId: string
+  reason: string
+  prev: LiveOwnerState
+  next: LiveOwnerState
+  ts: number
+}
+
+// ---------------------------------------------------------------------------
 // Semantic channel — "what is the model doing right now".
 // ---------------------------------------------------------------------------
 //
@@ -496,6 +575,120 @@ export type SemanticFlowIgnoredEvent = {
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle-violation diagnostic.
+// ---------------------------------------------------------------------------
+//
+// Fires when a publisher calls into SemanticChannel with a turnId that
+// does not match the channel's current active turnId (start-while-
+// active, delta-on-wrong-turn, etc.).
+//
+// WHY this is its own event (not reusing `stream_error`):
+//
+// Stream errors describe *upstream* (SSE / transport) failures. A
+// lifecycle violation is our *own* producers disagreeing about the
+// live-turn slot. Mixing them on one event type would make the debug
+// panel less useful and would tempt a consumer into retrying a
+// transport call on something that is actually a local state bug.
+//
+// WHY this does NOT appear in the `SemanticEvent` union:
+//
+// The union is what cc-shell's reducer folds. Adding lifecycle
+// violations to the reducer would force a renderer decision on what
+// to do with them, which is not where policy belongs today. Keeping
+// the event as a channel-only emission (`semantic.on('lifecycle_
+// violation', ...)`) lets the debug panel subscribe without rippling
+// through every consumer's type surface.
+export type SemanticLifecycleViolationEvent = {
+  type: 'lifecycle_violation'
+  kind:
+    /** `startTurn` called while a different turn was already active. */
+    | 'start_while_active'
+    /** `applyDelta` called with a turnId the channel never saw a
+     *  start for, or with a turnId that does not match the currently
+     *  active one. */
+    | 'delta_mismatched_turn'
+    /** `finishTurn` called with a turnId that is not active. Always
+     *  silently dropped; we emit the diagnostic so debug tooling can
+     *  see it without adding console noise. */
+    | 'finish_mismatched_turn'
+  /** Turn the caller attempted to publish for. */
+  attemptedTurnId: string
+  /** Turn the channel thinks is active, or null if the channel had
+   *  no open turn when the violation happened. */
+  activeTurnId: string | null
+  /** Which producer called the bad method. Informational only — the
+   *  channel treats every violation identically regardless of source. */
+  source: SemanticSource
+  ts: number
+}
+
+// ---------------------------------------------------------------------------
+// Stream phase — "what is the model doing right now".
+// ---------------------------------------------------------------------------
+//
+// The minimal state the upstream Claude Code client tracks as `streamMode`
+// in `utils/messages.ts`' handleMessageFromStream. We emit it as a
+// first-class channel event so downstream renderers (cc-shell, future
+// consumers) don't have to re-fold the per-block event stream into a
+// phase label.
+//
+// Vocabulary decisions:
+//   - `requesting`   — stream open, no content yet.
+//   - `thinking`     — a `thinking` / `redacted_thinking` block is active.
+//   - `responding`   — a `text` / `connector_text` block is active.
+//   - `tool-input`   — a `tool_use` block is accumulating input_json_delta.
+//   - `tool-use`     — Claude Code's post-`message_stop` bucket. In
+//                      practice, the cc-shell UX renders this for the
+//                      narrow window between `message_stop` and the first
+//                      tool_result; after `content_block_stop` on the last
+//                      tool_use block the adapter transitions to
+//                      `awaiting-tool` so a long-running shell / API call
+//                      is visually distinct from "Claude is thinking".
+//   - `awaiting-tool`— tool call completed input accumulation; waiting on
+//                      the tool runtime to return. Extension beyond Claude
+//                      Code's vocabulary because for cc-shell this is a
+//                      dominant wall-clock phase, not a punctuation.
+//   - `idle`         — nothing in flight. Also the terminal state after a
+//                      successful `finishTurn` or an error.
+//
+// `submitting` (the gap between user-press-enter and the first adapter
+// event) is owned by the renderer, not the adapter — the adapter never
+// sees the user input, it only sees the response stream.
+export type StreamPhase =
+  | 'idle'
+  | 'requesting'
+  | 'thinking'
+  | 'responding'
+  | 'tool-input'
+  | 'tool-use'
+  | 'awaiting-tool'
+
+/** Semantic stream phase — the authoritative "what is the model doing
+ *  right now" signal. Derived at the transport-event boundary (see
+ *  `ClaudeProxyAdapter.applyAnthropicEvent`) and mirrored onto the
+ *  upstream claude-code `streamMode` state machine. Consumers drive UI
+ *  off this one field instead of re-folding the block-level stream. */
+export type SemanticStreamPhaseEvent = {
+  type: 'stream_phase'
+  /** null while phase is `idle` before any `message_start`, or while
+   *  the adapter has promoted a flow to active but not yet parsed its
+   *  first `message_start` frame. */
+  turnId: string | null
+  phase: StreamPhase
+  /** Tool name when phase is `tool-input` / `tool-use` /
+   *  `awaiting-tool` — lets the renderer show "Calling Read" without
+   *  joining against block state. */
+  toolName?: string
+  /** Tool use id when phase is `tool-input` / `tool-use` /
+   *  `awaiting-tool` — so the renderer can match against incoming
+   *  `tool_result` events and flip out of `awaiting-tool`. */
+  toolUseId?: string
+  source: SemanticSource
+  confidence: SemanticConfidence
+  ts: number
+}
+
+// ---------------------------------------------------------------------------
 
 export type SemanticEvent =
   | SemanticTurnStartedEvent
@@ -518,6 +711,7 @@ export type SemanticEvent =
   | SemanticApiErrorEvent
   | SemanticFlowSelectedEvent
   | SemanticFlowIgnoredEvent
+  | SemanticStreamPhaseEvent
 
 // ---------------------------------------------------------------------------
 // Screen channel — "what is on the terminal".
@@ -613,7 +807,48 @@ export type CommittedCompactBoundaryEvent = {
   ts: number
 }
 
+/** A committed tool_result block, surfaced on the committed channel.
+ *
+ *  WHY this event exists (new as of the 2026-04-18 redesign):
+ *
+ *  Anthropic's live SSE stream never carries tool_result content; the
+ *  results arrive in the NEXT user-role transcript entry after the
+ *  tool has finished. The pre-redesign implementation bridged those
+ *  results back onto the SEMANTIC channel, keeping the "live" turn
+ *  alive past its natural `turn_completed` so the renderer reducer
+ *  could attach the result onto the originating tool_use block. That
+ *  was the exact "committed data mutating live semantic state" leak
+ *  the redesign plan (2026-04-18-headless-live-turn-redesign.md)
+ *  called out as a design error.
+ *
+ *  Instead, tool_result content now lands on the COMMITTED channel.
+ *  Durable / settled data belongs on durable channels; the renderer
+ *  pairs the result with its originating tool_use block using
+ *  `toolUseId` exactly the way it did before — just fed through a
+ *  different transport.
+ *
+ *  We carry `turnId` as the ASSISTANT turn the tool_use belonged to
+ *  (i.e. the parent turn, not the current user turn that carried the
+ *  result). This lets the renderer's history state locate the right
+ *  historical turn even after it has rolled out of the active slot. */
+export type CommittedToolResultEvent = {
+  type: 'tool_result'
+  /** The assistant turn the tool_use belonged to. */
+  turnId: string
+  toolUseId: string
+  /** Flattened text content. Claude's transcript format allows
+   *  `content` to be either a string or an array of `{text: string}`
+   *  items; the channel normalises to a string here so consumers
+   *  don't each reimplement the flatten. */
+  content: string
+  isError: boolean
+  /** File path the entry came from, mirroring other committed events. */
+  file: string
+  ts: number
+}
+
 export type CommittedEvent =
   | CommittedTurnEvent
   | CommittedEntryEvent
   | CommittedCompactBoundaryEvent
+  | CommittedToolResultEvent

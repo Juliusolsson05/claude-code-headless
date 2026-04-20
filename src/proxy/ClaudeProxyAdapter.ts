@@ -34,6 +34,7 @@ import type { SemanticChannel } from '../channels/SemanticChannel.js'
 import type {
   SemanticBlockKind,
   SemanticConfidence,
+  StreamPhase,
 } from '../channels/types.js'
 import {
   parseAnthropicEventsFromSse,
@@ -167,8 +168,20 @@ export const defaultAttributionPolicy: AttributionPolicy =
 // another's state. The adapter keeps a Map<flowId, FlowState> and
 // drops entries on `response-end`.
 
+// `text` blocks technically never carry signature or citations, but
+// `content_block_stop` fires a single `publishBlockCompleted` call
+// that unions text+connector_text, and `citations_delta` fires before
+// we know which sub-kind the block is. Widening `text` with the
+// optional fields keeps those call sites typechecking without branching
+// on `kind` every time. The fields stay undefined on actual text blocks.
 type BlockState =
-  | { kind: 'text'; index: number; text: string }
+  | {
+      kind: 'text'
+      index: number
+      text: string
+      signature?: string
+      citations?: unknown[]
+    }
   | {
       kind: 'connector_text'
       index: number
@@ -214,6 +227,15 @@ type FlowState = {
    *  duplicate emission when response-end fires after an explicit
    *  message_delta. */
   turnStopped: boolean
+  /** Tool-use blocks that finalised input during this flow, in the
+   *  order their `content_block_stop` fired. Populated from the
+   *  tool_use/server_tool_use/mcp_tool_use branch in
+   *  applyAnthropicEvent so that at `message_stop` we can transition
+   *  the phase to `awaiting-tool` with the earliest unresolved tool
+   *  name/id. Intentionally separate from `blocks` (which is cleared
+   *  on content_block_stop) because we need the info AFTER the block
+   *  has finalised and been deleted from `blocks`. */
+  pendingToolUses: Array<{ toolUseId: string; toolName: string }>
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +346,7 @@ export class ClaudeProxyAdapter {
       usage: {},
       turnStarted: false,
       turnStopped: false,
+      pendingToolUses: [],
     }
     this.flows.set(flowId, state)
     this.onDiagnostic(`flow ${flowId} accepted as candidate`)
@@ -351,6 +374,13 @@ export class ClaudeProxyAdapter {
           source: 'proxy',
           confidence: 'high',
         })
+        // First-chunk promotion → emit 'requesting' with a null turnId.
+        // We don't have the Anthropic `message_id` yet (it arrives on
+        // the first `message_start` frame); the renderer treats a null
+        // turnId phase as "attached to the current session, not a
+        // specific turn" and upgrades it when the next phase event
+        // arrives with a real turnId.
+        this.publishPhase(state, 'requesting')
       } else {
         state.attribution = 'secondary'
         this.channel.publishFlowIgnored({
@@ -415,6 +445,16 @@ export class ClaudeProxyAdapter {
         source: 'proxy',
         confidence: 'medium',
       })
+      // Stream died without a clean `message_delta`. Drop phase back to
+      // idle — there's no recovery path on this flow. We do NOT
+      // transition to `awaiting-tool` even if there are pending tool
+      // uses, because the pending-tool tracker was populated from
+      // content_block_stop; the runtime-side tool executor may never
+      // have received the tool_use (we died mid-stream), so promising
+      // the user "waiting for the tool" would be incorrect.
+      if (state.attribution === 'active') {
+        this.publishPhase(state, 'idle')
+      }
     }
 
     this.flows.delete(flowId)
@@ -455,6 +495,11 @@ export class ClaudeProxyAdapter {
           source,
           confidence,
         })
+        // API error terminates the active turn from the adapter's
+        // point of view. We don't attempt to preserve awaiting-tool
+        // state because the failure happened BEFORE we got whatever
+        // tool results would have arrived.
+        this.publishPhase(state, 'idle')
         return
       }
 
@@ -475,6 +520,12 @@ export class ClaudeProxyAdapter {
             confidence,
           })
           state.turnStarted = true
+
+          // Re-emit `requesting` now that we have a real turnId. The
+          // channel's phase dedupe would swallow a no-op `requesting`
+          // repeat, but the turnId has changed from null → ev.messageId
+          // so this event carries new information.
+          this.publishPhase(state, 'requesting')
 
           // Initial usage snapshot. Always publish even when empty —
           // consumers can show "0 tokens input so far" before the
@@ -558,6 +609,34 @@ export class ClaudeProxyAdapter {
             source,
             confidence,
           })
+
+          // Phase transition — mirrors upstream handleMessageFromStream
+          // switch (utils/messages.ts:2929). content_block_start is the
+          // only place a phase can enter `thinking` / `responding` /
+          // `tool-input`; later deltas don't change the phase.
+          switch (kind) {
+            case 'text':
+            case 'connector_text':
+              this.publishPhase(state, 'responding')
+              break
+            case 'thinking':
+            case 'redacted_thinking':
+              this.publishPhase(state, 'thinking')
+              break
+            case 'tool_use':
+            case 'server_tool_use':
+            case 'mcp_tool_use': {
+              const toolName =
+                block && 'toolName' in block ? block.toolName : undefined
+              const toolUseId =
+                block && 'toolUseId' in block ? block.toolUseId : undefined
+              this.publishPhase(state, 'tool-input', { toolName, toolUseId })
+              break
+            }
+            // 'other' (unknown block kinds), 'image', 'document',
+            // 'tool_result', etc. don't map to a user-visible phase —
+            // leave the current phase in place.
+          }
         }
         return
       }
@@ -702,6 +781,22 @@ export class ClaudeProxyAdapter {
           )
           return
         }
+        // Citations only apply to text / connector_text / other. Thinking
+        // and tool_use blocks never receive citations per Anthropic's
+        // stream schema, so narrow before writing. Hitting the default
+        // branch with a thinking/tool_use block is a protocol violation
+        // upstream; soft-error rather than silently corrupting state.
+        if (
+          block.kind !== 'text' &&
+          block.kind !== 'connector_text' &&
+          block.kind !== 'other'
+        ) {
+          this.softError(
+            state,
+            `citations_delta on ${block.kind} block at index ${ev.index}`,
+          )
+          return
+        }
         block.citations = [...(block.citations ?? []), ev.citation]
         if (isActive && state.turnId) {
           this.channel.publishCitationsDelta({
@@ -791,6 +886,14 @@ export class ClaudeProxyAdapter {
               source,
               confidence,
             })
+            // Record the pending tool-use so message_delta / onEnd can
+            // transition to `awaiting-tool` with a concrete id.
+            if (block.toolUseId) {
+              state.pendingToolUses.push({
+                toolUseId: block.toolUseId,
+                toolName: block.toolName,
+              })
+            }
             break
           }
           case 'other':
@@ -844,6 +947,24 @@ export class ClaudeProxyAdapter {
           source,
           confidence,
         })
+
+        // Phase terminal transition.
+        //   - If tool_use blocks were produced this turn, they have no
+        //     tool_result yet (results land on the committed / JSONL
+        //     channel, not this flow). Transition to `awaiting-tool`
+        //     with the earliest pending tool — that's the one the
+        //     runtime is working on first. The renderer clears this
+        //     when the matching `tool_result` event arrives.
+        //   - Otherwise the turn is done and the session is idle.
+        if (state.pendingToolUses.length > 0) {
+          const first = state.pendingToolUses[0]!
+          this.publishPhase(state, 'awaiting-tool', {
+            toolName: first.toolName,
+            toolUseId: first.toolUseId,
+          })
+        } else {
+          this.publishPhase(state, 'idle')
+        }
         return
       }
 
@@ -869,6 +990,27 @@ export class ClaudeProxyAdapter {
       confidence: 'medium',
     })
     this.onDiagnostic(message)
+  }
+
+  /** Emit a stream-phase event on behalf of this flow, but ONLY if the
+   *  flow is the active producer. Secondary flows must stay silent so
+   *  a concurrent warmup or retry can't flip the renderer's phase
+   *  mid-turn. Channel-level dedupe (see `SemanticChannel.publishStreamPhase`)
+   *  swallows no-op transitions, so we don't bother guarding here. */
+  private publishPhase(
+    state: FlowState,
+    phase: StreamPhase,
+    extras: { toolName?: string; toolUseId?: string } = {},
+  ): void {
+    if (state.attribution !== 'active') return
+    this.channel.publishStreamPhase({
+      turnId: state.turnId,
+      phase,
+      toolName: extras.toolName,
+      toolUseId: extras.toolUseId,
+      source: 'proxy',
+      confidence: 'high',
+    })
   }
 }
 

@@ -11,10 +11,12 @@ import type {
   SemanticEvent,
   SemanticFlowIgnoredEvent,
   SemanticFlowSelectedEvent,
+  SemanticLifecycleViolationEvent,
   SemanticSignatureEvent,
   SemanticSource,
   SemanticSourceChangedEvent,
   SemanticStreamErrorEvent,
+  SemanticStreamPhaseEvent,
   SemanticTextDeltaEvent,
   SemanticThinkingDeltaEvent,
   SemanticToolInputDeltaEvent,
@@ -25,6 +27,7 @@ import type {
   SemanticTurnStartedEvent,
   SemanticTurnStoppedEvent,
   SemanticUsageEvent,
+  StreamPhase,
 } from './types.js'
 
 // SemanticChannel — the "what the model is producing right now" stream.
@@ -54,6 +57,40 @@ import type {
 // changes, …). Those belong on `ScreenChannel`. If you find yourself
 // wanting to emit visual-only state here, stop — you are re-creating
 // the entwined surface that this whole split was meant to kill.
+//
+// -----------------------------------------------------------------------
+// Lifecycle strictness (2026-04-18 redesign).
+// -----------------------------------------------------------------------
+//
+// Prior versions of this channel auto-sealed mismatched turns and
+// auto-started turns on delta-without-start. That behaviour was
+// defensible when screen was the only live producer — races between
+// the idle detector and the JSONL tailer genuinely did happen and
+// someone had to paper over them. It became actively harmful once
+// proxy streaming landed: two authoritative producers could push
+// onto the same channel, the channel's auto-heal would flip
+// `activeTurnId` between them, and the renderer reducer would keep
+// wiping its block map on every flip (see the Codex semantic flicker
+// plan, 2026-04-17).
+//
+// The fix is to make the channel strict:
+//
+//   * `startTurn` while another turn is active → DROP, emit
+//     `lifecycle_violation`. Callers must explicitly `finishTurn` the
+//     previous turn before opening a new one.
+//
+//   * `applyDelta` with a turnId that does not match the active turn
+//     (or with no active turn at all) → DROP, emit
+//     `lifecycle_violation`. Callers must `startTurn` first.
+//
+//   * `finishTurn` with a mismatched turnId → DROP (unchanged), emit
+//     `lifecycle_violation` so dashboards can see the miss.
+//
+// The channel is now a transport, not a healer. Producer coherence is
+// enforced by the orchestrator (ClaudeCodeHeadless / CodexHeadless)
+// via the LiveOwner ownership model — see
+// `claude-code-headless/src/channels/types.ts` for the ownership types
+// and `2026-04-18-headless-live-turn-redesign.md` for the full plan.
 
 export type SemanticChannelEvents = {
   event: [SemanticEvent]
@@ -92,6 +129,20 @@ export type SemanticChannelEvents = {
   // Attribution diagnostics
   flow_selected: [SemanticFlowSelectedEvent]
   flow_ignored: [SemanticFlowIgnoredEvent]
+
+  // Upstream stream-phase derivation. Mirrors Claude Code's
+  // `streamMode` state machine (utils/messages.ts:2929). Emitted by the
+  // proxy adapter at `content_block_start` / `message_stop` /
+  // `content_block_stop` transitions; by the screen-spinner path as a
+  // coarser `thinking` / `idle` fallback when proxy is off.
+  stream_phase: [SemanticStreamPhaseEvent]
+
+  // Lifecycle-violation diagnostics. Fires when a publisher calls in
+  // with a turnId that does not match the active turn. Intentionally
+  // NOT emitted on the catch-all `'event'` stream — see the rationale
+  // in channels/types.ts for why lifecycle violations stay off the
+  // reducer-facing `SemanticEvent` union.
+  lifecycle_violation: [SemanticLifecycleViolationEvent]
 }
 
 export interface SemanticChannel {
@@ -131,11 +182,25 @@ export class SemanticChannel extends EventEmitter {
   }
 
   /**
-   * Begin a semantic turn. If a turn was already active this is a
-   * no-op — callers should finalize the prior turn first. We tolerate
-   * the no-op rather than throw because both JSONL and screen can
-   * race to announce a new turn, and throwing would make the caller
-   * responsible for synchronising producers that inherently can't be.
+   * Begin a semantic turn.
+   *
+   * Strict lifecycle rules (see file header):
+   *
+   *   * Same-turn re-entry is an idempotent no-op. Producers that
+   *     legitimately promote their own turn (e.g. proxy seeing a
+   *     duplicate `message_start` on SSE reconnect) must see
+   *     unchanged state.
+   *
+   *   * Attempting to open a turn while a DIFFERENT turn is already
+   *     active is a protocol violation. We DROP the new start and
+   *     emit a `lifecycle_violation` event so dashboards can see it.
+   *     The previous auto-seal behaviour was removed because it hid
+   *     cross-source ownership bugs (see the Codex semantic flicker
+   *     plan, 2026-04-17-codex-semantic-flicker-fix.md).
+   *
+   * Callers who legitimately need to replace the active turn must
+   * call `finishTurn(activeTurnId, …)` first — the orchestrator's
+   * ownership helpers do this as part of `transitionLiveOwner`.
    */
   startTurn(params: {
     turnId: string
@@ -145,18 +210,17 @@ export class SemanticChannel extends EventEmitter {
   }): void {
     if (this.activeTurnId === params.turnId) return
 
-    // If the previous turn never got a `turn_completed`, emit one now
-    // with the text we had so consumers can flush their live buffer
-    // instead of silently losing it. This matters when screen-driven
-    // idle detection missed the end of the previous turn and JSONL
-    // announces the next one directly.
     if (this.activeTurnId) {
-      this.finishTurn({
-        turnId: this.activeTurnId,
-        fullText: this.lastFullText || undefined,
-        source: this.lastSource ?? params.source,
-        confidence: 'medium',
-      })
+      const violation: SemanticLifecycleViolationEvent = {
+        type: 'lifecycle_violation',
+        kind: 'start_while_active',
+        attemptedTurnId: params.turnId,
+        activeTurnId: this.activeTurnId,
+        source: params.source,
+        ts: Date.now(),
+      }
+      this.emit('lifecycle_violation', violation)
+      return
     }
 
     this.activeTurnId = params.turnId
@@ -177,11 +241,29 @@ export class SemanticChannel extends EventEmitter {
   }
 
   /**
-   * Publish a delta for the active turn. `fullText` is required (late
-   * subscribers rely on it); `textDelta` is optional because
-   * screen-sourced updates give snapshots, not increments. Callers
-   * are expected to compute `textDelta` when they can (proxy SSE
-   * naturally does; screen adapters can diff against `getLastFullText`).
+   * Publish a delta for the active turn.
+   *
+   * Strict lifecycle rules (see file header):
+   *
+   *   * If no turn is active, or the caller's turnId does not match
+   *     the active turn, the delta is DROPPED. A
+   *     `lifecycle_violation` event fires so debug tooling can see
+   *     the miss without console noise. The old auto-start behaviour
+   *     was removed because it lets any racing producer silently
+   *     take over the active turn slot.
+   *
+   *   * Same-turn snapshots with unchanged text and no explicit
+   *     textDelta are still suppressed — this is a cadence optimization
+   *     (screen fires ~60Hz), not a lifecycle decision.
+   *
+   *   * A same-turn source change still emits `source_changed`
+   *     before the delta, so consumers that want to reset optimistic
+   *     rendering on promotion (screen→proxy) keep their hook.
+   *
+   * `fullText` is required (late subscribers rely on it); `textDelta`
+   * is optional because screen-sourced updates give snapshots, not
+   * increments. Callers compute `textDelta` when they can (proxy SSE
+   * naturally does; screen adapters diff against `getLastFullText`).
    */
   applyDelta(params: {
     turnId: string
@@ -191,22 +273,24 @@ export class SemanticChannel extends EventEmitter {
     source: SemanticSource
     confidence?: SemanticTurnDeltaEvent['confidence']
   }): void {
-    // Idempotency guard. Screen snapshots fire at ~60Hz; many of them
-    // carry no new text. Suppressing no-ops at the channel boundary
-    // means downstream markdown renderers don't have to be clever.
-    if (
-      this.activeTurnId === params.turnId &&
-      this.lastFullText === params.fullText &&
-      !params.textDelta
-    ) {
+    if (this.activeTurnId !== params.turnId) {
+      const violation: SemanticLifecycleViolationEvent = {
+        type: 'lifecycle_violation',
+        kind: 'delta_mismatched_turn',
+        attemptedTurnId: params.turnId,
+        activeTurnId: this.activeTurnId,
+        source: params.source,
+        ts: Date.now(),
+      }
+      this.emit('lifecycle_violation', violation)
       return
     }
 
-    // Source switch mid-turn (screen → proxy, typically). Emit the
-    // dedicated event BEFORE the delta so consumers can reset any
-    // rendering state that was tied to the lower-trust source.
+    if (this.lastFullText === params.fullText && !params.textDelta) {
+      return
+    }
+
     if (
-      this.activeTurnId === params.turnId &&
       this.lastSource !== null &&
       this.lastSource !== params.source
     ) {
@@ -220,18 +304,6 @@ export class SemanticChannel extends EventEmitter {
       }
       this.emit('source_changed', ev)
       this.emit('event', ev)
-    }
-
-    // Auto-start a turn if a delta arrives without a prior `startTurn`.
-    // Happens when JSONL announces an assistant entry we didn't see
-    // coming. Cheaper to heal here than to force every caller to
-    // orchestrate start/delta ordering.
-    if (this.activeTurnId !== params.turnId) {
-      this.startTurn({
-        turnId: params.turnId,
-        role: 'assistant',
-        source: params.source,
-      })
     }
 
     this.lastSource = params.source
@@ -252,11 +324,14 @@ export class SemanticChannel extends EventEmitter {
   }
 
   /**
-   * Finalize the active turn. Idempotent: emitting twice for the same
-   * turnId is a no-op, which matters because both the idle detector
-   * and the JSONL commit can legitimately think they're the one that
-   * ended the turn. Whichever arrives first wins; the second is
-   * dropped.
+   * Finalize the active turn.
+   *
+   * Idempotent by design: two producers (idle detector + JSONL
+   * commit) can legitimately both believe they ended the same turn.
+   * Whichever arrives first wins; the second is DROPPED and a
+   * `lifecycle_violation` event fires so debug tooling can count the
+   * misses. Dropping is safe because `turn_completed` has already
+   * fired; the duplicate would only confuse late subscribers.
    */
   finishTurn(params: {
     turnId: string
@@ -264,7 +339,18 @@ export class SemanticChannel extends EventEmitter {
     source: SemanticSource
     confidence?: SemanticTurnCompletedEvent['confidence']
   }): void {
-    if (this.activeTurnId !== params.turnId) return
+    if (this.activeTurnId !== params.turnId) {
+      const violation: SemanticLifecycleViolationEvent = {
+        type: 'lifecycle_violation',
+        kind: 'finish_mismatched_turn',
+        attemptedTurnId: params.turnId,
+        activeTurnId: this.activeTurnId,
+        source: params.source,
+        ts: Date.now(),
+      }
+      this.emit('lifecycle_violation', violation)
+      return
+    }
 
     const ev: SemanticTurnCompletedEvent = {
       type: 'turn_completed',
@@ -666,6 +752,62 @@ export class SemanticChannel extends EventEmitter {
       ts: Date.now(),
     }
     this.emit('flow_ignored', ev)
+    this.emit('event', ev)
+  }
+
+  // -------------------------------------------------------------------
+  // Stream-phase publisher.
+  //
+  // Stateful dedupe: the adapter will hit the same branch twice when
+  // two consecutive deltas land on the same block kind (e.g. two
+  // text_deltas on the same text block re-enter the `responding`
+  // branch). Publishing a duplicate event on every delta would explode
+  // the event volume with no information content, so we suppress
+  // identical back-to-back phases. The dedupe is intentionally naive —
+  // only (phase, turnId, toolUseId) must match. toolName change
+  // without a toolUseId change (shouldn't happen) still goes through.
+  // -------------------------------------------------------------------
+  private lastPhase: StreamPhase = 'idle'
+  private lastPhaseTurnId: string | null = null
+  private lastPhaseToolUseId: string | undefined = undefined
+
+  /** Last published phase. Adapter-internal fallbacks (screen, error
+   *  paths) read this so they don't emit a redundant `idle` when the
+   *  adapter has already moved on. */
+  getLastPhase(): StreamPhase {
+    return this.lastPhase
+  }
+
+  publishStreamPhase(params: {
+    turnId: string | null
+    phase: StreamPhase
+    toolName?: string
+    toolUseId?: string
+    source: SemanticSource
+    confidence?: SemanticConfidence
+  }): void {
+    if (
+      this.lastPhase === params.phase &&
+      this.lastPhaseTurnId === params.turnId &&
+      this.lastPhaseToolUseId === params.toolUseId
+    ) {
+      return
+    }
+    this.lastPhase = params.phase
+    this.lastPhaseTurnId = params.turnId
+    this.lastPhaseToolUseId = params.toolUseId
+
+    const ev: SemanticStreamPhaseEvent = {
+      type: 'stream_phase',
+      turnId: params.turnId,
+      phase: params.phase,
+      toolName: params.toolName,
+      toolUseId: params.toolUseId,
+      source: params.source,
+      confidence: params.confidence ?? this.defaultConfidence(params.source),
+      ts: Date.now(),
+    }
+    this.emit('stream_phase', ev)
     this.emit('event', ev)
   }
 }

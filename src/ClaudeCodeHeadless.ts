@@ -33,6 +33,11 @@ import { listSessionsForCwd, type SessionInfo } from './transcript/SessionList.j
 import { CommittedChannel } from './channels/CommittedChannel.js'
 import { ScreenChannel } from './channels/ScreenChannel.js'
 import { SemanticChannel } from './channels/SemanticChannel.js'
+import type {
+  LiveOwnerDecision,
+  LiveOwnerKind,
+  LiveOwnerState,
+} from './channels/types.js'
 import {
   ClaudeProxyAdapter,
   type AttributionPolicy,
@@ -135,6 +140,14 @@ export type ClaudeCodeHeadlessEvents = {
   'compaction-state': [CompactionState]
   'slash-picker': [SlashPickerState]
   exit: [{ exitCode: number; signal?: number }]
+
+  // Live-owner decision stream. Fires whenever an ownership helper
+  // accepts or rejects a claim, promotes between owners, or clears
+  // the owner. Diagnostic-only — consumers that render a
+  // ProxyDebugPanel can subscribe to watch live-turn authority
+  // change hands. NOT wired through the `event` union because the
+  // reducer in cc-shell doesn't need a new branch for this.
+  'live-owner-change': [LiveOwnerDecision]
 }
 
 export interface ClaudeCodeHeadless {
@@ -201,6 +214,36 @@ export class ClaudeCodeHeadless extends EventEmitter {
   readonly semantic = new SemanticChannel()
   readonly screen = new ScreenChannel()
   readonly committed = new CommittedChannel()
+
+  /** Shadow SemanticChannel — receives screen-fallback publishes and
+   *  everything else keyed to the synthetic screen-sourced turnId
+   *  (`live-<ts>`).
+   *
+   *  WHY this channel exists:
+   *
+   *  Screen-sourced live deltas were the original sin that made the
+   *  main `semantic` channel impossible to reason about — proxy and
+   *  screen would race for the same `activeTurnId` slot, the channel
+   *  would silently auto-heal, and the renderer reducer would see
+   *  turn starts and deltas flap between turnIds. The 2026-04-18
+   *  headless-live-turn-redesign plan draws a hard line: screen is a
+   *  fallback/overlay source, not a live content source. So we route
+   *  all screen-sourced startTurn/applyDelta/finishTurn calls here
+   *  instead of onto `semantic`.
+   *
+   *  The channel is public so the cc-shell debug panel and the
+   *  headless testing harness can still observe screen-fallback
+   *  activity. The point is that the RENDERER does not subscribe to
+   *  this channel — cc-shell's assistant rendering path consumes only
+   *  `semantic`, which means it will no longer see screen-derived
+   *  content even when proxy is absent. That is deliberate: the user
+   *  has explicitly accepted degraded live UX for Claude-without-
+   *  proxy in exchange for eliminating the cross-source flicker.
+   *
+   *  Screen parsing for OVERLAYS (trust dialog, slash picker,
+   *  compaction banner, resume prompt, activity state) continues to
+   *  fire on the `screen` channel — that part was never the problem. */
+  readonly semanticShadow = new SemanticChannel()
   /** Proxy adapter when `options.proxy` was set, else null. Exposed
    *  so consumers can inspect flow decisions (flow_selected /
    *  flow_ignored events on the semantic channel) and call
@@ -232,6 +275,31 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private screenBaselineText = ''
   private screenBaselineSatisfied = false
 
+  /** Live-turn ownership.
+   *
+   *  Only one producer may publish lifecycle events on the
+   *  authoritative `this.semantic` channel at a time. This field
+   *  tracks that producer. Helpers on the class (`claimLiveOwner`,
+   *  `clearLiveOwner`, etc.) are the one place that mutates it — the
+   *  rest of the code asks "may I publish?" by consulting
+   *  `canSourceMutateLiveTurn`.
+   *
+   *  Screen is a legitimate `LiveOwnerKind` here EVEN THOUGH screen
+   *  no longer publishes on the authoritative channel. The reason is
+   *  that ownership is a session-wide concept: if screen has claimed
+   *  the live turn (because it saw activity first), proxy must not
+   *  silently take over the renderer's view by pushing onto
+   *  `this.semantic` while screen is still publishing on shadow. By
+   *  modelling screen ownership explicitly we can express "proxy has
+   *  preempted screen" as a single transition instead of two
+   *  unrelated side effects. */
+  private liveOwner: LiveOwnerState = {
+    kind: null,
+    turnId: null,
+    startedAt: null,
+    status: 'idle',
+  }
+
   constructor(options: ClaudeCodeHeadlessOptions) {
     super()
     this.cwd = options.cwd
@@ -257,6 +325,66 @@ export class ClaudeCodeHeadless extends EventEmitter {
           onDiagnostic: options.proxy.onDiagnostic,
         })
       : null
+
+    // Proxy ownership claim via the authoritative SemanticChannel.
+    //
+    // The ClaudeProxyAdapter publishes directly onto `this.semantic`
+    // using the Anthropic `msg_…` id as the turnId. We mirror those
+    // lifecycle events into the orchestrator's `liveOwner` so the
+    // rest of the class can answer "is proxy live right now?" without
+    // peeking into adapter internals.
+    //
+    // WHY we listen INSTEAD of wrapping adapter publishes in ownership
+    // checks:
+    //
+    //   * The adapter stays provider-focused — it shouldn't need a
+    //     back-reference to orchestrator policy.
+    //   * Anthropic's SSE guarantees a single `message_start` before
+    //     any content blocks, so the listener latches ownership at
+    //     exactly the right moment without the adapter doing extra
+    //     bookkeeping.
+    //   * If screen was live when proxy arrives, `transitionLiveOwner`
+    //     cleanly seals the screen fallback on the shadow channel and
+    //     hands authority to proxy.
+    //
+    // The listener is attached after the adapter is constructed so
+    // that the adapter's own turn_started emission goes through the
+    // new strict SemanticChannel, which then fires the event this
+    // listener picks up.
+    this.semantic.on('turn_started', ev => {
+      if (ev.source !== 'proxy') return
+      this.transitionLiveOwner('proxy', ev.turnId, 'proxy turn_started')
+    })
+    this.semantic.on('turn_completed', ev => {
+      if (ev.source !== 'proxy') return
+      // Proxy completion transitions the slot to `reconciling` rather
+      // than clearing it outright.
+      //
+      // WHY the two-phase wind-down:
+      //
+      //   The live SSE turn has ended from the model's perspective,
+      //   but Claude does not commit the assistant message to the
+      //   JSONL transcript until some delay after SSE closes. Between
+      //   `turn_completed` and the eventual `turn_committed` on the
+      //   committed channel, the assistant turn is "done but not yet
+      //   durable". The redesign plan (Task 5 of 2026-04-18-headless-
+      //   live-turn-redesign.md) calls that window reconciling.
+      //
+      //   Marking the slot reconciling instead of idle lets debug
+      //   tooling surface the window clearly, and leaves room for
+      //   phase 5's `turn_reconciled` / `turn_durably_committed`
+      //   events without another state-machine change.
+      //
+      //   A brand-new turn (proxy or screen) can still claim
+      //   ownership: `claimLiveOwner` treats reconciling as "free
+      //   enough to evict" so the next turn is not blocked on a
+      //   previous turn's durability wait. Full clearing happens
+      //   either (a) on the next claim or (b) — phase 5 — when the
+      //   committed channel confirms the JSONL commit.
+      if (this.liveOwner.kind === 'proxy' && this.liveOwner.turnId === ev.turnId) {
+        this.beginReconcilingLiveOwner('proxy turn_completed')
+      }
+    })
 
     // --- Wire terminal events ---
 
@@ -310,16 +438,24 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // requirements.
       this.screen.publishSnapshot({ plain: snap.plain, markdown: snap.markdown })
 
-      // Semantic channel — live assistant text (source='screen').
+      // Semantic fallback via the SHADOW channel.
       //
-      // We derive semantic deltas from the screen extractor as long as
-      // a turn is active. Skipped entirely when `this.proxy` is
-      // present: the consumer opted into proxy-sourced semantics, and
-      // two publishers fighting over `activeTurnId` produces incorrect
-      // source_changed events and wrong `turn_delta.fullText`
-      // snapshots. Screen channel publishing is unaffected — the app
-      // still gets screen snapshots for overlays/PTY mirroring.
-      if (!this.proxy && this.liveSemanticTurnId) {
+      // Screen-derived live text does NOT land on `this.semantic` —
+      // the cc-shell renderer subscribes to the authoritative
+      // channel and we do not want screen content driving assistant
+      // rendering. See the class-level note on `semanticShadow` and
+      // the 2026-04-18 redesign plan for the rule.
+      //
+      // We still run the extractor and fire deltas on shadow so the
+      // debug panel and any future bootstrap-only consumer can see
+      // what screen would have said. When a stronger owner (proxy)
+      // preempts screen via `transitionLiveOwner`, the
+      // `liveOwner.kind === 'screen'` gate below stops publishing
+      // immediately — finalize is handled during the transition.
+      if (
+        this.liveOwner.kind === 'screen' &&
+        this.liveSemanticTurnId
+      ) {
         // Extract from the wider `recent` window (~200 rows), not
         // just the viewport — taller replies scroll the `⏺` marker
         // out of the visible region and the narrow extractor returns
@@ -349,7 +485,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
             ? fullText.slice(this.lastScreenSemanticText.length)
             : undefined
           this.lastScreenSemanticText = fullText
-          this.semantic.applyDelta({
+          this.semanticShadow.applyDelta({
             turnId: this.liveSemanticTurnId,
             fullText,
             textDelta,
@@ -389,28 +525,68 @@ export class ClaudeCodeHeadless extends EventEmitter {
           // Screen channel — the mirror of "is the spinner up".
           this.screen.publishActivity({ active: true, status: activity })
 
-          // Semantic channel — idle→active is our best screen-level
-          // proxy for "assistant turn started". Skipped when proxy
-          // is configured: the adapter will emit `turn_started` with
-          // the real Anthropic message id once `message_start`
-          // arrives. We still mint the `liveSemanticTurnId` string
-          // below in the proxy branch (just not publish) so legacy
-          // screen-path code reading it for diagnostics keeps
-          // working — but we do not call `startTurn` to avoid
-          // fighting the adapter over `activeTurnId`.
-          if (!this.liveSemanticTurnId) {
-            this.liveSemanticTurnId = `live-${Date.now()}`
-            this.lastScreenSemanticText = ''
-            // Capture the assistant block currently on screen as
-            // the baseline. Until the next delta differs from this,
-            // the "turn" has not produced any real new bytes — it's
-            // just the previous turn's text still rendered in the
-            // TUI buffer. See screenBaselineText field docs.
-            this.screenBaselineText = extractAssistantInProgress(snap.recent) || ''
-            this.screenBaselineSatisfied = false
-            if (!this.proxy) {
-              this.semantic.startTurn({
-                turnId: this.liveSemanticTurnId,
+          // Screen-fallback `stream_phase` — published to the
+          // authoritative semantic channel ONLY when no proxy is
+          // running. The proxy adapter's phase derivation is
+          // strictly higher-confidence (it sees content_block_start
+          // per kind and can distinguish thinking/responding/tool-input);
+          // the screen spinner can't tell those apart because the
+          // rotating-glyph line is the same in every sub-phase. When
+          // proxy is off, `thinking` is the conservative bucket —
+          // upstream Claude Code itself labels mid-stream activity
+          // as `thinking` in the spinner and that's the closest
+          // analog for "something is happening, don't know what
+          // exactly." The shadow channel always gets the event too
+          // so debug tooling can see screen-derived phase regardless.
+          if (!this.proxy) {
+            this.semantic.publishStreamPhase({
+              turnId: this.liveSemanticTurnId,
+              phase: 'thinking',
+              source: 'screen',
+              confidence: 'fallback',
+            })
+          }
+          this.semanticShadow.publishStreamPhase({
+            turnId: this.liveSemanticTurnId,
+            phase: 'thinking',
+            source: 'screen',
+            confidence: 'fallback',
+          })
+
+          // Screen-fallback live turn — opens on the SHADOW channel.
+          //
+          // We only open a screen-fallback turn when nothing else
+          // owns the live slot. If proxy has already claimed (via
+          // its listener above), `claimLiveOwner('screen', …)` will
+          // reject and we skip publishing entirely. This is the
+          // "pre-owner bootstrap" rule from the redesign plan —
+          // screen is permitted as a fallback but may not race a
+          // stronger source.
+          //
+          // The synthetic `live-<ts>` turnId keeps state keyed
+          // consistently across the screen applyDelta path, the
+          // idle-debounce finishTurn path, and the JSONL-promotion
+          // bridge — all of which publish on shadow.
+          if (!this.liveSemanticTurnId && this.liveOwner.kind === null) {
+            const candidateTurnId = `live-${Date.now()}`
+            const decision = this.claimLiveOwner(
+              'screen',
+              candidateTurnId,
+              'screen activity detected',
+            )
+            if (decision.accept) {
+              this.liveSemanticTurnId = candidateTurnId
+              this.lastScreenSemanticText = ''
+              // Capture the assistant block currently on screen as
+              // the baseline. Until the next delta differs from
+              // this, the "turn" has not produced any real new
+              // bytes — it's just the previous turn's text still
+              // rendered in the TUI buffer. See screenBaselineText
+              // field docs.
+              this.screenBaselineText = extractAssistantInProgress(snap.recent) || ''
+              this.screenBaselineSatisfied = false
+              this.semanticShadow.startTurn({
+                turnId: candidateTurnId,
                 role: 'assistant',
                 source: 'screen',
                 confidence: 'fallback',
@@ -434,29 +610,35 @@ export class ClaudeCodeHeadless extends EventEmitter {
             // Screen channel — mirror the debounced idle transition.
             this.screen.publishActivity({ active: false, status: null })
 
-            // Semantic channel — close out the screen-driven live turn
-            // with whatever text the extractor last saw. Skipped when
-            // proxy is configured: the adapter owns turn completion
-            // via `message_delta` / `response-end`, and letting an
-            // idle-timeout closer race against it would produce
-            // duplicate `turn_completed` events. If JSONL later
-            // commits a different/better text, the committed channel
-            // will carry that truth; we don't retroactively mutate
-            // the semantic stream because reconciliation across
-            // channels is the consumer's call, not ours.
-            if (this.liveSemanticTurnId) {
-              if (!this.proxy) {
-                this.semantic.finishTurn({
-                  turnId: this.liveSemanticTurnId,
-                  fullText: this.lastScreenSemanticText || undefined,
-                  source: 'screen',
-                  confidence: 'fallback',
-                })
-              }
-              this.liveSemanticTurnId = null
-              this.lastScreenSemanticText = ''
-              this.screenBaselineText = ''
-              this.screenBaselineSatisfied = false
+            // Screen-fallback `stream_phase` → idle. Same gating as
+            // the active→true path above: only hit `this.semantic`
+            // when no proxy is running, so we don't clobber a
+            // higher-confidence phase the adapter has already set.
+            if (!this.proxy) {
+              this.semantic.publishStreamPhase({
+                turnId: null,
+                phase: 'idle',
+                source: 'screen',
+                confidence: 'fallback',
+              })
+            }
+            this.semanticShadow.publishStreamPhase({
+              turnId: null,
+              phase: 'idle',
+              source: 'screen',
+              confidence: 'fallback',
+            })
+
+            // Close the screen fallback (if any) on the shadow
+            // channel and release screen ownership. Safe to call
+            // unconditionally — `finalizeScreenFallbackTurn` is a
+            // no-op when no live turn was open, and
+            // `clearLiveOwner` is a no-op when ownership is already
+            // idle. Proxy-owned turns are finalized by their own
+            // `turn_completed`, not by this debounce.
+            if (this.liveOwner.kind === 'screen') {
+              this.finalizeScreenFallbackTurn('screen idle debounce')
+              this.clearLiveOwner('screen idle debounce')
             }
           }, 2500)
         }
@@ -525,6 +707,245 @@ export class ClaudeCodeHeadless extends EventEmitter {
     })
   }
 
+  // --- Live-turn ownership helpers --------------------------------------
+  //
+  // WHY these live on the orchestrator and not on SemanticChannel:
+  //
+  // The channel is a transport — it knows `activeTurnId` and nothing
+  // else. The ownership *policy* (which source is allowed to publish,
+  // when promotions happen, whether screen yields to proxy) needs
+  // visibility across proxy state, screen state, JSONL state, and the
+  // consumer's configuration. That's the orchestrator's job.
+  //
+  // Every ownership transition is explicit — no side-effect
+  // promotions hiding in delta handlers. See the redesign plan at
+  // docs/superpowers/plans/2026-04-18-headless-live-turn-redesign.md
+  // for the full rationale.
+
+  /** True if `kind` is currently allowed to mutate the live turn for
+   *  `turnId`. A `null` owner accepts any kind (bootstrap case). */
+  private canSourceMutateLiveTurn(
+    kind: LiveOwnerKind,
+    turnId: string | null,
+  ): boolean {
+    if (this.liveOwner.kind === null) return true
+    if (this.liveOwner.kind !== kind) return false
+    if (turnId && this.liveOwner.turnId && turnId !== this.liveOwner.turnId) {
+      return false
+    }
+    return true
+  }
+
+  /** Claim the live-turn slot for `kind` with `turnId`. Emits a
+   *  `live-owner-change` diagnostic. Returns the decision so callers
+   *  can branch on `accept`. */
+  private claimLiveOwner(
+    kind: LiveOwnerKind,
+    turnId: string,
+    reason: string,
+  ): LiveOwnerDecision {
+    const prev = this.liveOwner
+    const now = Date.now()
+    // Re-claiming the same slot is idempotent — accepts without
+    // firing a spurious transition event, which keeps debug panels
+    // quiet during legitimate same-turn refreshes.
+    if (prev.kind === kind && prev.turnId === turnId) {
+      const decision: LiveOwnerDecision = {
+        accept: true,
+        action: 'start',
+        kind,
+        turnId,
+        reason: `re-claim: ${reason}`,
+        prev,
+        next: prev,
+        ts: now,
+      }
+      return decision
+    }
+
+    // Another owner is already live. Deny — unless that owner is in
+    // `reconciling` state (waiting on durability confirmation after
+    // its SSE turn ended). Reconciling owners can be evicted by a
+    // new claim because their live phase is already over; blocking
+    // new turns on a reconciliation window would stall the session.
+    //
+    // When evicting a reconciling owner we still emit a `clear`
+    // decision first so debug tooling sees the slot transition
+    // explicitly instead of a silent overwrite.
+    if (prev.kind !== null && prev.kind !== kind) {
+      if (prev.status === 'reconciling') {
+        this.clearLiveOwner(
+          `evicted by ${kind} claim (was reconciling ${prev.kind}:${prev.turnId})`,
+        )
+        // Re-read after eviction; ownership is now idle.
+      } else {
+        const decision: LiveOwnerDecision = {
+          accept: false,
+          action: 'drop',
+          kind,
+          turnId,
+          reason: `owner=${prev.kind} turnId=${prev.turnId} — ${reason}`,
+          prev,
+          next: prev,
+          ts: now,
+        }
+        this.emit('live-owner-change', decision)
+        return decision
+      }
+    }
+
+    const next: LiveOwnerState = {
+      kind,
+      turnId,
+      startedAt: now,
+      status: 'live',
+    }
+    this.liveOwner = next
+    const decision: LiveOwnerDecision = {
+      accept: true,
+      action: 'start',
+      kind,
+      turnId,
+      reason,
+      prev,
+      next,
+      ts: now,
+    }
+    this.emit('live-owner-change', decision)
+    return decision
+  }
+
+  /** Transition the current owner from `live` to `reconciling`.
+   *  Kind and turnId are preserved; only `status` flips. Used after
+   *  a proxy `turn_completed` so debug tooling can see the slot is
+   *  waiting on durable JSONL commit before it frees up. No-op if
+   *  there is no current owner or the owner is already reconciling. */
+  private beginReconcilingLiveOwner(reason: string): void {
+    const prev = this.liveOwner
+    if (prev.kind === null) return
+    if (prev.status === 'reconciling') return
+    const next: LiveOwnerState = {
+      kind: prev.kind,
+      turnId: prev.turnId,
+      startedAt: prev.startedAt,
+      status: 'reconciling',
+    }
+    this.liveOwner = next
+    this.emit('live-owner-change', {
+      accept: true,
+      action: 'finalize',
+      kind: prev.kind,
+      turnId: prev.turnId ?? '',
+      reason,
+      prev,
+      next,
+      ts: Date.now(),
+    })
+  }
+
+  /** Release the live-turn slot. Safe to call with no current owner;
+   *  emits no transition event in that case (keeps shutdown quiet). */
+  private clearLiveOwner(reason: string): void {
+    const prev = this.liveOwner
+    if (prev.kind === null) return
+    const next: LiveOwnerState = {
+      kind: null,
+      turnId: null,
+      startedAt: null,
+      status: 'idle',
+    }
+    this.liveOwner = next
+    this.emit('live-owner-change', {
+      accept: true,
+      action: 'clear',
+      kind: prev.kind,
+      turnId: prev.turnId ?? '',
+      reason,
+      prev,
+      next,
+      ts: Date.now(),
+    })
+  }
+
+  /** Promote from one owner to another. Used when proxy arrives after
+   *  screen has been streaming — we seal the screen fallback on the
+   *  shadow channel, release the screen owner, and claim proxy on the
+   *  real channel. Centralising the transition keeps the reset of
+   *  screen-specific bookkeeping in one place. */
+  private transitionLiveOwner(
+    nextKind: LiveOwnerKind,
+    nextTurnId: string,
+    reason: string,
+  ): LiveOwnerDecision {
+    const prev = this.liveOwner
+    if (prev.kind === null) {
+      return this.claimLiveOwner(nextKind, nextTurnId, reason)
+    }
+    if (prev.kind === nextKind && prev.turnId === nextTurnId) {
+      return {
+        accept: true,
+        action: 'start',
+        kind: nextKind,
+        turnId: nextTurnId,
+        reason: `no-op transition: ${reason}`,
+        prev,
+        next: prev,
+        ts: Date.now(),
+      }
+    }
+
+    // Close out the outgoing owner's bookkeeping. Screen needs a
+    // shadow-channel finalize so shadow subscribers see a clean
+    // close; other kinds don't need anything here because their
+    // publishing lives on `this.semantic` and the orchestrator is
+    // not the one calling finishTurn for them.
+    if (prev.kind === 'screen') {
+      this.finalizeScreenFallbackTurn('preempted by ' + nextKind)
+    }
+
+    const next: LiveOwnerState = {
+      kind: nextKind,
+      turnId: nextTurnId,
+      startedAt: Date.now(),
+      status: 'live',
+    }
+    this.liveOwner = next
+    const decision: LiveOwnerDecision = {
+      accept: true,
+      action: 'promote',
+      kind: nextKind,
+      turnId: nextTurnId,
+      reason: `${prev.kind} → ${nextKind}: ${reason}`,
+      prev,
+      next,
+      ts: Date.now(),
+    }
+    this.emit('live-owner-change', decision)
+    return decision
+  }
+
+  /** Close out the screen fallback on the shadow channel and reset
+   *  screen-specific state fields. Idempotent. Kept as a helper so
+   *  every "screen turn is over" path (idle debounce, proxy preempt,
+   *  JSONL promotion) clears the same fields in the same order —
+   *  prior inline resets had drifted and let a later turn inherit a
+   *  prior turn's baseline text. */
+  private finalizeScreenFallbackTurn(reason: string): void {
+    if (this.liveSemanticTurnId) {
+      this.semanticShadow.finishTurn({
+        turnId: this.liveSemanticTurnId,
+        fullText: this.lastScreenSemanticText || undefined,
+        source: 'screen',
+        confidence: 'fallback',
+      })
+    }
+    this.liveSemanticTurnId = null
+    this.lastScreenSemanticText = ''
+    this.screenBaselineText = ''
+    this.screenBaselineSatisfied = false
+    void reason
+  }
+
   /**
    * Start processing: resolve the JSONL project dir, attach the
    * transcript tailer. Call this after the PTY is spawned.
@@ -552,71 +973,51 @@ export class ClaudeCodeHeadless extends EventEmitter {
       const typed = entry as unknown as Entry
       this.committed.publishEntry(typed, filePath)
 
-      if (
-        isConversationEntry(typed) &&
-        typed.type === 'user' &&
-        Array.isArray(typed.message.content)
-      ) {
-        // WHY bridge committed tool_result blocks back onto the semantic channel:
-        //
-        // Anthropic's live SSE stream never carries tool results. They arrive in
-        // the NEXT user-role transcript entry after the tool has finished. If we
-        // leave them on the committed channel only, a renderer that is correctly
-        // using semantic state for live turns still has to subscribe to two
-        // independent sources and re-implement pairing logic by tool_use_id.
-        //
-        // Claude's own UI doesn't have that split-brain problem because it owns
-        // both the stream loop and transcript reconciliation internally. cc-shell
-        // does not, so the safe contract here is: semantic owns "live turn
-        // structure", and that includes late-arriving tool results. The committed
-        // channel remains the durable source of truth; this bridge just mirrors
-        // the result shape onto the semantic bus so the renderer does not have to
-        // guess where tool output lives.
-        const semanticTurnId =
-          typeof typed.parentUuid === 'string' && typed.parentUuid
-            ? typed.parentUuid
-            : typed.uuid
-        for (const block of typed.message.content) {
-          if (block.type !== 'tool_result') continue
-          const content =
-            typeof block.content === 'string'
-              ? block.content
-              : Array.isArray(block.content)
-                ? block.content
-                    .map(item =>
-                      typeof item === 'string'
-                        ? item
-                        : typeof item.text === 'string'
-                          ? item.text
-                          : '',
-                    )
-                    .filter(Boolean)
-                    .join('\n')
-                : ''
-          this.semantic.publishToolResult({
-            turnId: semanticTurnId,
-            toolUseId: block.tool_use_id,
-            content,
-            isError: block.is_error === true,
-            source: 'jsonl',
-            confidence: 'high',
-          })
-        }
-      }
+      // Tool_result extraction used to happen here, bridging committed
+      // results onto the SEMANTIC channel as a synthetic `tool_result`
+      // event. As of the 2026-04-18 redesign (Task 6 of
+      // docs/superpowers/plans/2026-04-18-headless-live-turn-redesign.md)
+      // the extraction has moved into `CommittedChannel.publishEntry`
+      // and fires on the COMMITTED channel instead.
+      //
+      // WHY the move: Anthropic's SSE never carries tool_result content;
+      // it arrives only in the next user-role JSONL entry, long after
+      // the assistant turn has naturally ended. The old bridge kept the
+      // renderer's live assistant turn artificially alive so that late
+      // arrivals could mutate it — exactly the "committed data leaks
+      // back into live semantics" leak the redesign plan identifies as
+      // the root cause of cross-layer ownership confusion.
+      //
+      // The renderer's pairing-by-`toolUseId` logic is unchanged; it
+      // now subscribes to `committed.tool_result` instead of
+      // `semantic.tool_result`. See `CommittedChannel.publishEntry`
+      // for the extraction + emission.
 
-      // Promote the active screen-driven live semantic turn to
-      // authoritative text once JSONL commits an assistant message.
-      // We do this ONLY while a live turn is still open AND proxy is
-      // not configured. When proxy is configured the adapter owns
-      // semantic publishing end-to-end (with the real Anthropic
-      // message id as turnId); firing a jsonl-sourced promotion
-      // against the screen-path's synthetic `live-<ts>` id would
-      // collide with the adapter's turnId and emit source_changed
-      // events that confuse the renderer. The committed channel
-      // still carries the canonical text either way, so nothing is
-      // lost for consumers that want the settled view.
+      // JSONL promotion of the screen-fallback turn — SHADOW only.
+      //
+      // WHY this now targets `semanticShadow` instead of `semantic`:
+      //
+      // The `liveSemanticTurnId` is the synthetic `live-<ts>` id that
+      // the screen fallback minted when activity was detected. Since
+      // screen lifecycle runs on the shadow channel (see the 2026-
+      // 04-18 redesign plan), the real `this.semantic` never saw a
+      // `turn_started` for this id. Publishing a JSONL-sourced delta
+      // or completion onto the real channel would trip the channel's
+      // strict `lifecycle_violation` guard and be dropped.
+      //
+      // Routing this promotion to the shadow channel lets shadow
+      // subscribers (debug panel, testing harness) see the authoritative
+      // JSONL text as the closing delta on the screen fallback turn —
+      // a clean story on the shadow timeline. The renderer still gets
+      // the settled assistant text through the `committed` channel,
+      // which is where durable state belongs anyway.
+      //
+      // Proxy ownership is deliberately NOT inspected here: this path
+      // only fires when screen owns (`liveOwner.kind === 'screen'`);
+      // proxy-owned turns are finalized by their own SSE lifecycle on
+      // the real channel, never by JSONL commits.
       if (
-        !this.proxy &&
+        this.liveOwner.kind === 'screen' &&
         this.liveSemanticTurnId &&
         isConversationEntry(typed) &&
         typed.type === 'assistant'
@@ -632,13 +1033,13 @@ export class ClaudeCodeHeadless extends EventEmitter {
             .join('\n')
         }
         if (text) {
-          this.semantic.applyDelta({
+          this.semanticShadow.applyDelta({
             turnId: this.liveSemanticTurnId,
             fullText: text,
             source: 'jsonl',
             confidence: 'high',
           })
-          this.semantic.finishTurn({
+          this.semanticShadow.finishTurn({
             turnId: this.liveSemanticTurnId,
             fullText: text,
             source: 'jsonl',
@@ -648,6 +1049,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
           this.lastScreenSemanticText = ''
           this.screenBaselineText = ''
           this.screenBaselineSatisfied = false
+          this.clearLiveOwner('jsonl committed assistant turn')
         }
       }
     }
