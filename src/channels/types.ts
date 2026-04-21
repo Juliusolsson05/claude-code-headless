@@ -417,10 +417,12 @@ export type SemanticBlockCompletedEvent = SemanticBlockRef & {
 
 export type SemanticToolResultEvent = {
   type: 'tool_result'
-  /** The turn the tool_use belonged to — not the current user turn
-   *  that carried the result. This is what the renderer uses to
-   *  place the result under the originating tool_use. */
-  turnId: string
+  /** Optional turn hint. Claude proxy-sourced tool_result events
+   *  populate this with the live `msg_…` turn id; the committed →
+   *  semantic bridge leaves it undefined because it only knows the
+   *  parent entry uuid. The renderer pairs results to live tool blocks
+   *  by `toolUseId`, so this field is diagnostic only. */
+  turnId?: string
   toolUseId: string
   content: string
   isError: boolean
