@@ -41,6 +41,9 @@ export class ProxyServer extends EventEmitter {
   private child: ChildProcess | null = null
   private watcherTimer: ReturnType<typeof setInterval> | null = null
   private lastEventOffset = 0
+  private readonly stderrTail: string[] = []
+  private childExitCode: number | null = null
+  private childExitSignal: NodeJS.Signals | null = null
 
   constructor(readonly info: ProxyServerInfo) {
     super()
@@ -103,7 +106,13 @@ export class ProxyServer extends EventEmitter {
       this.emit('stdout', chunk.toString('utf8'))
     })
     this.child.stderr?.on('data', chunk => {
-      this.emit('stderr', chunk.toString('utf8'))
+      const text = chunk.toString('utf8')
+      this.pushStderrTail(text)
+      this.emit('stderr', text)
+    })
+    this.child.once('exit', (code, signal) => {
+      this.childExitCode = code
+      this.childExitSignal = signal
     })
 
     await this.waitForCa()
@@ -138,10 +147,29 @@ export class ProxyServer extends EventEmitter {
         await access(this.info.caCertPath, fsConstants.R_OK)
         return
       } catch {
+        if (this.childExitCode !== null || this.childExitSignal !== null) {
+          const exitSummary = this.childExitSignal
+            ? `signal ${this.childExitSignal}`
+            : `code ${this.childExitCode ?? 'unknown'}`
+          const stderr = this.stderrTail.join('').trim()
+          throw new Error(
+            stderr.length > 0
+              ? `mitmproxy exited before CA became ready (${exitSummary}): ${stderr}`
+              : `mitmproxy exited before CA became ready (${exitSummary})`,
+          )
+        }
         await sleep(200)
       }
     }
     throw new Error(`Timed out waiting for mitmproxy CA at ${this.info.caCertPath}`)
+  }
+
+  private pushStderrTail(text: string): void {
+    if (!text) return
+    this.stderrTail.push(text)
+    if (this.stderrTail.length > 20) {
+      this.stderrTail.splice(0, this.stderrTail.length - 20)
+    }
   }
 
   private startPollingEvents(): void {
@@ -197,7 +225,7 @@ export async function createProxyServer(
 ): Promise<ProxyServer> {
   const opts = typeof options === 'string' ? { baseDir: options } : (options ?? {})
   const workDir = await createWorkDir(opts)
-  const confDir = join(workDir, 'mitmproxy-conf')
+  const confDir = await resolveConfDir(opts, workDir)
   await mkdir(confDir, { recursive: true })
   const mitmDumpPath = await resolveMitmDumpPath(opts.baseDir)
   const addonPath = await resolveAddonPath()
@@ -216,6 +244,23 @@ export async function createProxyServer(
     eventsFile,
     caCertPath,
   })
+}
+
+async function resolveConfDir(
+  options: CreateProxyServerOptions,
+  workDir: string,
+): Promise<string> {
+  if (options.baseDir) {
+    return join(workDir, 'mitmproxy-conf')
+  }
+  // App sessions should share one stable mitmproxy CA/config.
+  //
+  // A fresh per-session confdir forces mitmproxy down the CA creation
+  // path on every resume. That makes continuing sessions feel slow and
+  // also turns any mitmdump startup hiccup into a "proxy startup
+  // failed" timeout. Keep per-run logs in `workDir`, but reuse one
+  // shared confdir for the CA material itself.
+  return join(homedir(), '.config', 'cc-shell', 'proxy', '_shared-conf')
 }
 
 async function resolveAddonPath(): Promise<string> {
@@ -295,9 +340,27 @@ async function resolveMitmDumpPath(baseDir?: string): Promise<string> {
   const envPath = process.env.CC_PROXY_TEST_MITMDUMP
   if (envPath) return envPath
 
+  // Candidate lookup order:
+  //   1. explicit `baseDir` passed by the caller (the canonical path
+  //      when cc-shell is embedding this package).
+  //   2. `./.proxy-testing/venv/bin/mitmdump` under cwd — covers the
+  //      case where this package is the process root (running the
+  //      proxy harness directly via `npm run proxy-test-bootstrap`).
+  //   3. `./packages/claude-code-headless/.proxy-testing/...` under
+  //      cwd — the cc-shell monorepo layout post tree-reshape
+  //      (Phase 5 moved the submodule from the repo root into
+  //      `packages/`). Keep this AHEAD of the pre-reshape candidate
+  //      so cc-shell checkouts find the binary without re-running
+  //      the bootstrap script.
+  //   4. `./claude-code-headless/.proxy-testing/...` under cwd — the
+  //      pre-reshape cc-shell layout. Kept for backwards compat with
+  //      any older checkouts still on a branch that hasn't merged
+  //      the monorepo reshape yet.
+  //   5+. homebrew / /usr/local fallback.
   const candidates = [
     join(baseDir ?? process.cwd(), '.proxy-testing', 'venv', 'bin', 'mitmdump'),
     join(process.cwd(), '.proxy-testing', 'venv', 'bin', 'mitmdump'),
+    join(process.cwd(), 'packages', 'claude-code-headless', '.proxy-testing', 'venv', 'bin', 'mitmdump'),
     join(process.cwd(), 'claude-code-headless', '.proxy-testing', 'venv', 'bin', 'mitmdump'),
     '/opt/homebrew/bin/mitmdump',
     '/usr/local/bin/mitmdump',
