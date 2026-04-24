@@ -12,6 +12,12 @@ import {
 } from './parsers/ScreenParser.js'
 import { detectCompaction, type CompactionState } from './parsers/CompactionParser.js'
 import { detectResumePrompt, type ResumePromptState } from './parsers/ResumePromptParser.js'
+import {
+  detectPermissionPrompt,
+  PERMISSION_PROMPT_APPROVE_KEYS,
+  PERMISSION_PROMPT_DENY_KEYS,
+  type PermissionPromptState,
+} from './parsers/PermissionPromptParser.js'
 import { detectSlashPicker, type SlashPickerState } from './parsers/SlashPickerParser.js'
 import { detectTrustDialog, type TrustDialogState, TRUST_DIALOG_ACCEPT_KEYS } from './parsers/TrustDialogParser.js'
 import {
@@ -110,6 +116,10 @@ export type ResumePromptEvent = {
   type: 'resume_prompt'; ts: number; state: ResumePromptState
   confirm: () => void; cancel: () => void
 }
+export type PermissionPromptEvent = {
+  type: 'permission_prompt'; ts: number; state: PermissionPromptState
+  approve: () => void; deny: () => void
+}
 export type CompactionStateEvent = {
   type: 'compaction_state'; ts: number; state: CompactionState
 }
@@ -123,6 +133,7 @@ export type HeadlessEvent =
   | JsonlEntryEvent
   | TrustDialogEvent
   | ResumePromptEvent
+  | PermissionPromptEvent
   | CompactionStateEvent
   | SlashPickerEvent
   | ExitEvent
@@ -137,6 +148,7 @@ export type ClaudeCodeHeadlessEvents = {
   'jsonl-error': [Error]
   'trust-dialog': [TrustDialogState]
   'resume-prompt': [ResumePromptState]
+  'permission-prompt': [PermissionPromptState]
   'compaction-state': [CompactionState]
   'slash-picker': [SlashPickerState]
   exit: [{ exitCode: number; signal?: number }]
@@ -198,6 +210,8 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private lastTrustKey: string | null = null
   private resumePromptState: ResumePromptState = { visible: false }
   private lastResumePromptKey: string | null = null
+  private permissionPromptState: PermissionPromptState = { visible: false }
+  private lastPermissionPromptKey: string | null = null
   private compactionState: CompactionState = { visible: false }
   private lastCompactionKey: string | null = null
   private pickerState: SlashPickerState = { visible: false, items: [] }
@@ -408,6 +422,18 @@ export class ClaudeCodeHeadless extends EventEmitter {
           })
         : null
       this.resumePromptState = resumePrompt
+
+      const permissionPrompt = detectPermissionPrompt(snap.plain)
+      const permissionPromptKey = permissionPrompt.visible
+        ? JSON.stringify({
+            title: permissionPrompt.title ?? null,
+            toolName: permissionPrompt.toolName ?? null,
+            command: permissionPrompt.command ?? null,
+            options: permissionPrompt.options ?? [],
+            selectedIndex: permissionPrompt.selectedIndex ?? 0,
+          })
+        : null
+      this.permissionPromptState = permissionPrompt
 
       const compaction = detectCompaction(snap.plain)
       const compactionKey = compaction.visible
@@ -672,6 +698,21 @@ export class ClaudeCodeHeadless extends EventEmitter {
             state: resumePrompt,
             confirm: () => this.write('\r'),
             cancel: () => this.write('\x1b'),
+          })
+        }
+      }
+
+      // Permission prompt detection
+      if (permissionPromptKey !== this.lastPermissionPromptKey) {
+        this.lastPermissionPromptKey = permissionPromptKey
+        this.emit('permission-prompt', permissionPrompt)
+        if (permissionPrompt.visible) {
+          this.emit('event', {
+            type: 'permission_prompt',
+            ts: Date.now(),
+            state: permissionPrompt,
+            approve: () => this.write(PERMISSION_PROMPT_APPROVE_KEYS),
+            deny: () => this.write(PERMISSION_PROMPT_DENY_KEYS),
           })
         }
       }
