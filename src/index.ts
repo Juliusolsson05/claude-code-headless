@@ -16,6 +16,7 @@ export {
   type JsonlEntryEvent,
   type TrustDialogEvent,
   type ResumePromptEvent,
+  type PermissionPromptEvent,
   type CompactionStateEvent,
   type SlashPickerEvent,
   type ExitEvent,
@@ -51,6 +52,13 @@ export {
   TRUST_DIALOG_ACCEPT_KEYS,
   type TrustDialogState,
 } from './parsers/TrustDialogParser.js'
+
+export {
+  detectPermissionPrompt,
+  PERMISSION_PROMPT_APPROVE_KEYS,
+  PERMISSION_PROMPT_DENY_KEYS,
+  type PermissionPromptState,
+} from './parsers/PermissionPromptParser.js'
 
 export {
   detectCompaction,
