@@ -271,14 +271,21 @@ async function resolveAddonPath(): Promise<string> {
     resolve(process.cwd(), 'claude-code-headless/src/testing/proxy-testing/mitmAddon.py'),
   ]
   for (const candidate of candidates) {
+    const filesystemPath = unpackAsarPath(candidate)
     try {
-      await access(candidate, fsConstants.R_OK)
-      return candidate
+      await access(filesystemPath, fsConstants.R_OK)
+      return filesystemPath
     } catch {
       // try next
     }
   }
   throw new Error('Unable to locate mitmAddon.py for proxy-testing')
+}
+
+function unpackAsarPath(path: string): string {
+  return path.includes('.asar/')
+    ? path.replace('.asar/', '.asar.unpacked/')
+    : path
 }
 
 function sanitizeSegment(value: string): string {
