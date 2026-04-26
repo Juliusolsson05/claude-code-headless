@@ -7,7 +7,7 @@
   "types": "dist/index.d.ts",
   "files": ["dist"],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp src/testing/proxy-testing/mitmAddon.py dist/testing/proxy-testing/mitmAddon.py",
     "test": "tsx src/testing/verify.ts",
     "record": "tsx src/testing/record.ts",
     "replay": "tsx src/testing/replay.ts",
