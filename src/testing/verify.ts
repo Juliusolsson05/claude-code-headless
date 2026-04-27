@@ -27,6 +27,7 @@ import { detectResumePrompt } from '../parsers/ResumePromptParser.js'
 import { detectTrustDialog } from '../parsers/TrustDialogParser.js'
 import { detectSlashPicker } from '../parsers/SlashPickerParser.js'
 import { terminalToMarkdown } from '../terminal/HeadlessTerminal.js'
+import { evaluateClaudeConditions } from '../conditions/index.js'
 
 type RawEvent = { ts: number; data: string }
 type Meta = { cols?: number; rows?: number }
@@ -42,6 +43,35 @@ function assert(label: string, ok: boolean, detail?: string) {
     failed++
     console.log(`  ✗ ${label}${detail ? ` — ${detail}` : ''}`)
   }
+}
+
+function verifyConditionEvaluator(): void {
+  console.log('\n── condition evaluator ──')
+  const snapshot = evaluateClaudeConditions({
+    trustDialog: {
+      visible: true,
+      workspace: '/tmp/project',
+      options: [
+        { key: '1', label: 'Yes, I trust this folder' },
+        { key: '2', label: 'No, exit' },
+      ],
+    },
+    resumePrompt: { visible: false },
+    permissionPrompt: { visible: false },
+    compaction: { visible: false },
+    slashPicker: { visible: false, items: [] },
+  })
+  assert('snapshot provider is claude', snapshot.provider === 'claude')
+  assert(
+    'trust dialog condition is mapped',
+    snapshot.conditions['claude.trust-dialog']?.state.workspace === '/tmp/project',
+  )
+  assert(
+    'trust dialog exposes pty actions',
+    snapshot.conditions['claude.trust-dialog']?.actions.some(
+      action => action.kind === 'pty' && action.id === 'accept',
+    ) === true,
+  )
 }
 
 async function verifyRecording(dir: string): Promise<void> {
@@ -120,6 +150,8 @@ async function verifyRecording(dir: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  verifyConditionEvaluator()
+
   const arg = process.argv[2]
 
   if (arg) {
