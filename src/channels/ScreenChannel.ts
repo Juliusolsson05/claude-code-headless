@@ -4,6 +4,7 @@ import type {
   ScreenActivityEvent,
   ScreenCompactionEvent,
   ScreenEvent,
+  ScreenPermissionPromptEvent,
   ScreenResumePromptEvent,
   ScreenSlashPickerEvent,
   ScreenSnapshotEvent,
@@ -35,6 +36,7 @@ export type ScreenChannelEvents = {
   activity: [ScreenActivityEvent]
   trust_dialog: [ScreenTrustDialogEvent]
   resume_prompt: [ScreenResumePromptEvent]
+  permission_prompt: [ScreenPermissionPromptEvent]
   compaction: [ScreenCompactionEvent]
   slash_picker: [ScreenSlashPickerEvent]
 }
@@ -101,6 +103,16 @@ export class ScreenChannel extends EventEmitter {
       ts: Date.now(),
     }
     this.emit('resume_prompt', ev)
+    this.emit('event', ev)
+  }
+
+  publishPermissionPrompt(state: ScreenPermissionPromptEvent['state']): void {
+    const ev: ScreenPermissionPromptEvent = {
+      type: 'permission_prompt',
+      state,
+      ts: Date.now(),
+    }
+    this.emit('permission_prompt', ev)
     this.emit('event', ev)
   }
 

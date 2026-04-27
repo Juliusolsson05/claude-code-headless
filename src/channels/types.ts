@@ -32,6 +32,7 @@
 
 import type { Entry } from '../transcript/TranscriptTypes.js'
 import type { CompactionState } from '../parsers/CompactionParser.js'
+import type { PermissionPromptState } from '../parsers/PermissionPromptParser.js'
 import type { ResumePromptState } from '../parsers/ResumePromptParser.js'
 import type { SlashPickerState } from '../parsers/SlashPickerParser.js'
 import type { TrustDialogState } from '../parsers/TrustDialogParser.js'
@@ -753,6 +754,12 @@ export type ScreenResumePromptEvent = {
   ts: number
 }
 
+export type ScreenPermissionPromptEvent = {
+  type: 'permission_prompt'
+  state: PermissionPromptState
+  ts: number
+}
+
 export type ScreenCompactionEvent = {
   type: 'compaction'
   state: CompactionState
@@ -770,6 +777,7 @@ export type ScreenEvent =
   | ScreenActivityEvent
   | ScreenTrustDialogEvent
   | ScreenResumePromptEvent
+  | ScreenPermissionPromptEvent
   | ScreenCompactionEvent
   | ScreenSlashPickerEvent
 
