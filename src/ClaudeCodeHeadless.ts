@@ -28,6 +28,11 @@ import {
 import { isConversationEntry, type Entry } from './transcript/TranscriptTypes.js'
 import { getProjectDirForCwd } from './transcript/ProjectDir.js'
 import { listSessionsForCwd, type SessionInfo } from './transcript/SessionList.js'
+import {
+  claudeConditionSnapshotKey,
+  evaluateClaudeConditions,
+  type ClaudeConditionSnapshot,
+} from './conditions/index.js'
 
 // Three-channel truth model. See src/channels/types.ts for the WHY.
 // Keeping these as separate readonly fields on the class is what makes
@@ -124,6 +129,11 @@ export type CompactionStateEvent = {
   type: 'compaction_state'; ts: number; state: CompactionState
 }
 export type SlashPickerEvent = { type: 'slash_picker'; ts: number; state: SlashPickerState }
+export type ConditionsEvent = {
+  type: 'conditions'
+  ts: number
+  snapshot: ClaudeConditionSnapshot
+}
 export type ExitEvent = { type: 'exit'; ts: number; exitCode: number; signal?: number }
 
 export type HeadlessEvent =
@@ -136,6 +146,7 @@ export type HeadlessEvent =
   | PermissionPromptEvent
   | CompactionStateEvent
   | SlashPickerEvent
+  | ConditionsEvent
   | ExitEvent
 
 export type ClaudeCodeHeadlessEvents = {
@@ -151,6 +162,7 @@ export type ClaudeCodeHeadlessEvents = {
   'permission-prompt': [PermissionPromptState]
   'compaction-state': [CompactionState]
   'slash-picker': [SlashPickerState]
+  conditions: [ClaudeConditionSnapshot]
   exit: [{ exitCode: number; signal?: number }]
 
   // Live-owner decision stream. Fires whenever an ownership helper
@@ -216,6 +228,12 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private lastCompactionKey: string | null = null
   private pickerState: SlashPickerState = { visible: false, items: [] }
   private lastPickerKey: string | null = null
+  private conditionSnapshot: ClaudeConditionSnapshot = {
+    provider: 'claude',
+    conditions: {},
+    ts: Date.now(),
+  }
+  private lastConditionKey = '{}'
 
   // --- Three-channel truth surface ---------------------------------------
   //
@@ -448,6 +466,16 @@ export class ClaudeCodeHeadless extends EventEmitter {
       const picker = detectSlashPicker(this.terminal.getTerminal())
       const pickerKey = picker.visible ? JSON.stringify(picker) : null
       this.pickerState = picker
+
+      const conditions = evaluateClaudeConditions({
+        trustDialog: trust,
+        resumePrompt,
+        permissionPrompt,
+        compaction,
+        slashPicker: picker,
+      })
+      const conditionsKey = claudeConditionSnapshotKey(conditions)
+      this.conditionSnapshot = conditions
 
       // Forward raw screen (legacy flat surface).
       this.emit('screen', snap)
@@ -706,6 +734,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       if (permissionPromptKey !== this.lastPermissionPromptKey) {
         this.lastPermissionPromptKey = permissionPromptKey
         this.emit('permission-prompt', permissionPrompt)
+        this.screen.publishPermissionPrompt(permissionPrompt)
         if (permissionPrompt.visible) {
           this.emit('event', {
             type: 'permission_prompt',
@@ -734,6 +763,16 @@ export class ClaudeCodeHeadless extends EventEmitter {
         this.emit('slash-picker', picker)
         this.screen.publishSlashPicker(picker)
         this.emit('event', { type: 'slash_picker', ts: Date.now(), state: picker })
+      }
+
+      if (conditionsKey !== this.lastConditionKey) {
+        this.lastConditionKey = conditionsKey
+        this.emit('conditions', conditions)
+        this.emit('event', {
+          type: 'conditions',
+          ts: conditions.ts,
+          snapshot: conditions,
+        })
       }
     })
 
@@ -1197,6 +1236,10 @@ export class ClaudeCodeHeadless extends EventEmitter {
 
   getCompactionState(): CompactionState {
     return this.compactionState
+  }
+
+  getConditionSnapshot(): ClaudeConditionSnapshot {
+    return this.conditionSnapshot
   }
 
   /** List resumable sessions for this cwd. */

@@ -19,8 +19,24 @@ export {
   type PermissionPromptEvent,
   type CompactionStateEvent,
   type SlashPickerEvent,
+  type ConditionsEvent,
   type ExitEvent,
 } from './ClaudeCodeHeadless.js'
+
+export type {
+  ClaudeCompactionCondition,
+  ClaudeCondition,
+  ClaudeConditionKind,
+  ClaudeConditionMap,
+  ClaudeConditionSnapshot,
+  ClaudePermissionPromptCondition,
+  ClaudeResumePromptCondition,
+  ClaudeSlashPickerCondition,
+  ClaudeTrustDialogCondition,
+  ConditionAction,
+  ConditionCustomAction,
+  ConditionPtyAction,
+} from './conditions/index.js'
 
 // --- Terminal ---
 export {
@@ -171,6 +187,7 @@ export type {
   ScreenActivityEvent,
   ScreenTrustDialogEvent as ChannelTrustDialogEvent,
   ScreenResumePromptEvent as ChannelResumePromptEvent,
+  ScreenPermissionPromptEvent as ChannelPermissionPromptEvent,
   ScreenCompactionEvent,
   ScreenSlashPickerEvent,
   // Committed channel
