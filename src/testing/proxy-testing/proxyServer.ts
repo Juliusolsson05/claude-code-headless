@@ -268,6 +268,9 @@ async function resolveAddonPath(): Promise<string> {
   const candidates = [
     join(here, 'mitmAddon.py'),
     resolve(here, '../../../src/testing/proxy-testing/mitmAddon.py'),
+    resolve(here, '../../../../../packages/claude-code-headless/src/testing/proxy-testing/mitmAddon.py'),
+    resolve(process.cwd(), 'packages/claude-code-headless/src/testing/proxy-testing/mitmAddon.py'),
+    resolve(process.cwd(), 'packages/claude-code-headless/dist/testing/proxy-testing/mitmAddon.py'),
     resolve(process.cwd(), 'claude-code-headless/src/testing/proxy-testing/mitmAddon.py'),
   ]
   for (const candidate of candidates) {

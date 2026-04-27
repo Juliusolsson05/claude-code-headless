@@ -99,6 +99,22 @@ export type ClaudeCodeHeadlessOptions = {
     attributionPolicy?: AttributionPolicy
     /** Optional diagnostic sink for adapter decisions. */
     onDiagnostic?: (message: string) => void
+    /** Returns the user-selected primary model (e.g.
+     *  `'claude-opus-4-7'`) for this session. Used by the adapter to
+     *  identify auxiliary Haiku calls — session title generation,
+     *  compaction summaries, hook agents, teleport title-and-branch
+     *  — and suppress them so they don't leak into the visible
+     *  transcript as phantom assistant turns. See
+     *  `ClaudeProxyAdapterOptions.getSessionModel` for the full
+     *  rationale. When omitted, sidecar filtering is inert and the
+     *  pre-fix behaviour is preserved. */
+    getSessionModel?: () => string | null | undefined
+    /** Pattern that identifies a sidecar model. Defaults to
+     *  `/haiku/i` because every known auxiliary call in Claude Code
+     *  v2.1.x routes through `getSmallFastModel()` (Haiku). Pass
+     *  `null` to disable sidecar filtering even when
+     *  `getSessionModel` is provided. */
+    sidecarModelPattern?: RegExp | null
   }
 }
 
@@ -337,6 +353,12 @@ export class ClaudeCodeHeadless extends EventEmitter {
           channel: this.semantic,
           attributionPolicy: options.proxy.attributionPolicy,
           onDiagnostic: options.proxy.onDiagnostic,
+          // Pass-throughs for sidecar Haiku filtering. The adapter
+          // owns the decision logic; this class is just plumbing the
+          // caller's session-model knowledge through. See
+          // ClaudeProxyAdapter for why both fields exist.
+          getSessionModel: options.proxy.getSessionModel,
+          sidecarModelPattern: options.proxy.sidecarModelPattern,
         })
       : null
 

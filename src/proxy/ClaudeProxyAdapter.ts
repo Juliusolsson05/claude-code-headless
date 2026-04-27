@@ -250,6 +250,55 @@ export type ClaudeProxyAdapterOptions = {
   /** Called with a short free-form string for every diagnostic-worthy
    *  adapter decision. Hook for logging; default is no-op. */
   onDiagnostic?: (message: string) => void
+
+  // -----------------------------------------------------------------
+  // Sidecar-flow filtering.
+  // -----------------------------------------------------------------
+  //
+  // Claude Code makes auxiliary `/v1/messages` calls that are NOT part
+  // of the visible conversation: session title generation
+  // (vendor utils/sessionTitle.ts), compaction summaries, agent-tool
+  // verification, hook agents, teleport title-and-branch, etc. These
+  // all use a "small fast model" (Haiku) and emit JSON-shaped text
+  // that the user never asked to see. Without filtering, the adapter
+  // promotes the first such flow to `'active'` (the lock is keyed on
+  // first-chunk arrival), publishes `turn_started` + text deltas, and
+  // the renderer ghosts the JSON content into the transcript as a
+  // phantom message that is never superseded by a JSONL entry
+  // (Claude Code only writes real conversation turns to the rollout).
+  //
+  // The fix is to detect the sidecar at `message_start` (which carries
+  // the model name) and demote the flow to `'secondary'` BEFORE
+  // calling `channel.startTurn`. The check runs at message_start —
+  // not at request time — because the Anthropic request body is not
+  // surfaced by the proxy event stream and only the response carries
+  // the model id.
+  //
+  // The rule is intentionally NOT "filter every Haiku flow": a user
+  // who explicitly picks Haiku as their primary model would have
+  // their real conversation suppressed. Instead, a flow is treated as
+  // sidecar iff its model matches `sidecarModelPattern` AND
+  // `getSessionModel()` returns a model that does NOT match the
+  // pattern. Both conditions are required, so:
+  //
+  //   * Haiku title-gen on an Opus session → filtered ✓
+  //   * Haiku title-gen on a Haiku session → not filtered (no false
+  //     positive on Haiku users)
+  //   * Sonnet conversation on a Sonnet session → not filtered ✓
+  //   * Adapter constructed without `getSessionModel` → no filtering
+  //     at all (preserves pre-fix behaviour for callers who haven't
+  //     opted in).
+
+  /** Returns the user-selected primary model for the current session,
+   *  or null/undefined if unknown. Read fresh on every check rather
+   *  than cached at construction so a `/model` mid-session takes
+   *  effect on the very next sidecar evaluation. */
+  getSessionModel?: () => string | null | undefined
+  /** Pattern that identifies a sidecar model. Defaults to `/haiku/i`
+   *  because every known auxiliary call in Claude Code v2.1.x uses
+   *  Haiku via `getSmallFastModel()`. Pass `null` to disable sidecar
+   *  filtering entirely even when a session model is provided. */
+  sidecarModelPattern?: RegExp | null
 }
 
 export class ClaudeProxyAdapter {
@@ -264,6 +313,14 @@ export class ClaudeProxyAdapter {
    *  response-end of whichever flow was holding it. */
   private activeStreamingFlowId: string | null = null
 
+  /** Sidecar-flow filter — see ClaudeProxyAdapterOptions for why this
+   *  exists. A `null` callback means no opt-in and the filter is
+   *  inert; a non-null callback combined with a non-null pattern (the
+   *  default `/haiku/i`) enables the demotion path in the
+   *  `message_start` branch of `applyAnthropicEvent`. */
+  private readonly getSessionModel: (() => string | null | undefined) | null
+  private readonly sidecarModelPattern: RegExp | null
+
   constructor(options: ClaudeProxyAdapterOptions) {
     this.channel = options.channel
     // Each adapter gets its own policy instance by default so its
@@ -272,6 +329,15 @@ export class ClaudeProxyAdapter {
     // across adapters can pass their own policy.
     this.policy = options.attributionPolicy ?? createDefaultAttributionPolicy()
     this.onDiagnostic = options.onDiagnostic ?? (() => {})
+    this.getSessionModel = options.getSessionModel ?? null
+    // `undefined` → use the default pattern; explicit `null` → disable
+    // filtering entirely. The distinction matters because this is the
+    // only knob a Haiku-as-primary user has to opt out of filtering
+    // without supplying their own session-model callback.
+    this.sidecarModelPattern =
+      options.sidecarModelPattern === undefined
+        ? /haiku/i
+        : options.sidecarModelPattern
   }
 
   /** Entry point. Wire this to whichever proxy runtime emits
@@ -511,6 +577,60 @@ export class ClaudeProxyAdapter {
         if (!ev.messageId) return
         state.turnId = ev.messageId
         if (ev.usage) state.usage = mergeUsage(state.usage, ev.usage)
+
+        // Sidecar demotion. message_start is the first SSE frame that
+        // carries the model id, which is the only signal we have for
+        // distinguishing a real conversation turn from an auxiliary
+        // Haiku call (title generation, compaction summary, etc.).
+        // The check has to live HERE — not in `classify()` — because
+        // the proxy event stream surfaces request headers but not the
+        // request body, and the model name lives in the body.
+        //
+        // Demotion sequence (note the ordering — it matters):
+        //   1. Publish `phase: 'idle'` to clear the brief `requesting`
+        //      state we ourselves emitted on first-chunk a few ms ago.
+        //      MUST run while attribution is still 'active' because
+        //      `publishPhase` early-returns on non-active flows (see
+        //      its docstring) — secondary flows must not flap the
+        //      spinner mid-turn.
+        //   2. Flip attribution → 'secondary'. After this, every later
+        //      event on this flow falls through the `isActive` gates
+        //      in the rest of `applyAnthropicEvent` (text_delta,
+        //      content_block_stop, message_stop all guard on
+        //      `isActive`) and never reaches the channel.
+        //   3. Publish `flow_ignored` so debug consumers can see the
+        //      decision and the renderer can pair it with the earlier
+        //      `flow_selected` we already published on first-chunk
+        //      (at that point we didn't yet know the model — the
+        //      model only ships in `message_start`).
+        //
+        // We do NOT release `activeStreamingFlowId` here. The lock is
+        // released by `onEnd` when this flow's response-end arrives,
+        // matching the lifetime of any other flow. Releasing earlier
+        // would let a concurrent real-turn flow promote during the
+        // sidecar's tail and produce two competing 'active'
+        // attributions for the same wall-clock window.
+        if (isActive && this.isSidecarFlow(ev.model)) {
+          // Clear the spinner BEFORE flipping attribution. `publishPhase`
+          // early-returns when attribution !== 'active' (so that
+          // secondary flows can't flap the spinner mid-turn), so an
+          // `idle` publish after demotion would be silently dropped.
+          // This one-time clearing is a legitimate active-flow action
+          // — we're undoing the `requesting` we ourselves emitted on
+          // first-chunk a few ms ago.
+          this.publishPhase(state, 'idle')
+          state.attribution = 'secondary'
+          this.channel.publishFlowIgnored({
+            flowId: state.flowId,
+            reason: `sidecar model ${ev.model ?? '<unknown>'} (session model differs from sidecar pattern)`,
+            source,
+            confidence,
+          })
+          this.onDiagnostic(
+            `flow ${state.flowId} demoted as sidecar (model=${ev.model})`,
+          )
+          return
+        }
 
         if (isActive && !state.turnStarted) {
           this.channel.startTurn({
@@ -990,6 +1110,35 @@ export class ClaudeProxyAdapter {
       confidence: 'medium',
     })
     this.onDiagnostic(message)
+  }
+
+  /** Decide whether a flow producing model `model` is an auxiliary
+   *  Haiku-style sidecar relative to the user's primary session
+   *  model. Returns false unless ALL of the following hold:
+   *
+   *    1. A `sidecarModelPattern` is configured (default `/haiku/i`,
+   *       can be `null` to disable filtering entirely).
+   *    2. A `getSessionModel` callback is configured (no callback ⇒
+   *       caller hasn't opted in; preserve pre-fix behaviour).
+   *    3. The callback returns a non-null primary model.
+   *    4. The flow's model matches the sidecar pattern.
+   *    5. The session model does NOT match the sidecar pattern.
+   *
+   *  Condition 5 is the false-positive guard: a user who explicitly
+   *  picked Haiku as their primary model would otherwise have their
+   *  real conversation flows suppressed. The "differs from pattern"
+   *  test means the rule reads "filter Haiku flows on non-Haiku
+   *  sessions," which exactly matches the production bug pattern
+   *  (Opus/Sonnet session, occasional Haiku title-gen call). */
+  private isSidecarFlow(flowModel: string | null): boolean {
+    if (this.sidecarModelPattern === null) return false
+    if (this.getSessionModel === null) return false
+    if (!flowModel) return false
+    const sessionModel = this.getSessionModel()
+    if (!sessionModel) return false
+    if (!this.sidecarModelPattern.test(flowModel)) return false
+    if (this.sidecarModelPattern.test(sessionModel)) return false
+    return true
   }
 
   /** Emit a stream-phase event on behalf of this flow, but ONLY if the
