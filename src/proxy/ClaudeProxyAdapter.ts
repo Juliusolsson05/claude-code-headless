@@ -236,7 +236,36 @@ type FlowState = {
    *  on content_block_stop) because we need the info AFTER the block
    *  has finalised and been deleted from `blocks`. */
   pendingToolUses: Array<{ toolUseId: string; toolName: string }>
+  /** Wall-clock ms of the most recent transport chunk we observed for
+   *  this flow. Drives the active-flow watchdog (see
+   *  STALE_ACTIVE_FLOW_MS): if the held active flow's lastChunkAt is
+   *  older than the window when a NEW candidate's first chunk arrives,
+   *  we force-release the lock so the new flow can promote. Without
+   *  this, a single severed stream that never receives `response-end`
+   *  pins activeStreamingFlowId forever and turns every later flow
+   *  into a `flow_ignored` event. */
+  lastChunkAt: number
 }
+
+// Watchdog window for activeStreamingFlowId.
+//
+// activeStreamingFlowId is normally released only by an explicit
+// response-end transport event (see onEnd). That contract breaks when
+// the SSE stream is severed mid-response — the proxy doesn't always
+// observe the disconnect, no `response-end` is published, and the lock
+// stays held. Every later real turn hits the gate in onChunk and gets
+// emitted as flow_ignored. See debug bundle
+// 2026-05-01T10-07-21-3357bfc7 where a flow held the lock for 14+
+// hours and blocked all subsequent semantic events.
+//
+// The window is intentionally generous. A live Claude turn chunks
+// continuously while streaming and pauses for at most a few seconds
+// between message frames, so 30s is far longer than any healthy turn
+// would sit silent. Erring long means we never reap a flow that is
+// merely slow; the cost of a false-positive reap is publishing a
+// turn_stopped(stopReason=null) for a turn that was actually still
+// streaming, which would corrupt the live feed for the user.
+const STALE_ACTIVE_FLOW_MS = 30_000
 
 // ---------------------------------------------------------------------------
 // Adapter.
@@ -413,6 +442,10 @@ export class ClaudeProxyAdapter {
       turnStarted: false,
       turnStopped: false,
       pendingToolUses: [],
+      // Seed lastChunkAt at request time so a flow that takes a while
+      // to send its first SSE chunk (e.g. slow upstream) doesn't look
+      // "stale" to the watchdog the very first time onChunk runs.
+      lastChunkAt: Date.now(),
     }
     this.flows.set(flowId, state)
     this.onDiagnostic(`flow ${flowId} accepted as candidate`)
@@ -424,12 +457,31 @@ export class ClaudeProxyAdapter {
     const b64 = event.chunk_b64
     if (typeof b64 !== 'string' || !b64) return
 
+    // Bump lastChunkAt for the watchdog. We do this for every chunk on
+    // every flow (active, candidate, secondary) so the timestamp
+    // always reflects "when did transport last touch this stream",
+    // not "when did the renderer get a useful event from this stream".
+    state.lastChunkAt = Date.now()
+
     // First-chunk promotion. Only SSE responses produce chunk events
     // (the mitmproxy addon gates its stream tap on response
     // Content-Type: text/event-stream), so arrival here is a
     // reliable "this is live streaming" signal — unlike the request
     // headers, which don't distinguish warmup from real turns.
     if (state.attribution === 'candidate') {
+      // Watchdog gate: if the held active flow has been silent past
+      // the window, the SSE stream almost certainly died without a
+      // clean response-end. Free the lock here so this candidate can
+      // promote — otherwise we'd flow_ignored every later turn until
+      // the session restarts. See the STALE_ACTIVE_FLOW_MS comment
+      // for the full incident this prevents.
+      if (this.activeStreamingFlowId !== null && this.activeStreamingFlowId !== flowId) {
+        const stale = this.flows.get(this.activeStreamingFlowId)
+        if (stale && Date.now() - stale.lastChunkAt > STALE_ACTIVE_FLOW_MS) {
+          this.reapStaleActiveFlow(stale)
+        }
+      }
+
       if (this.activeStreamingFlowId === null) {
         this.activeStreamingFlowId = flowId
         state.attribution = 'active'
@@ -529,6 +581,44 @@ export class ClaudeProxyAdapter {
     // identity: flows that ended without ever chunking (warmups)
     // won't have taken the lock in the first place.
     if (this.activeStreamingFlowId === flowId) {
+      this.activeStreamingFlowId = null
+    }
+  }
+
+  /** Force-release a stale active flow whose response-end never
+   *  arrived. Mirrors the cleanup branch in `onEnd` that synthesises a
+   *  turn_stopped when the stream dies without an explicit
+   *  message_delta — same confidence, same publishPhase('idle'). The
+   *  only delta vs. onEnd is that we got here via the watchdog in
+   *  onChunk rather than a real transport event, so we also emit a
+   *  diagnostic carrying the silent duration so debug bundles can
+   *  attribute the recovery (otherwise reviewers would see a
+   *  flow_selected on a new flow with no obvious reason the previous
+   *  active was let go). Caller is responsible for then promoting the
+   *  new candidate normally. */
+  private reapStaleActiveFlow(state: FlowState): void {
+    if (state.attribution === 'active' && state.turnStarted && !state.turnStopped) {
+      this.channel.publishTurnStopped({
+        turnId: state.turnId ?? state.flowId,
+        stopReason: null,
+        source: 'proxy',
+        confidence: 'medium',
+      })
+      state.turnStopped = true
+      this.channel.finishTurn({
+        turnId: state.turnId ?? state.flowId,
+        fullText: state.fullText || undefined,
+        source: 'proxy',
+        confidence: 'medium',
+      })
+      this.publishPhase(state, 'idle')
+    }
+    const silentMs = Date.now() - state.lastChunkAt
+    this.onDiagnostic(
+      `flow ${state.flowId} reaped (no chunk for ${Math.round(silentMs / 1000)}s)`,
+    )
+    this.flows.delete(state.flowId)
+    if (this.activeStreamingFlowId === state.flowId) {
       this.activeStreamingFlowId = null
     }
   }
