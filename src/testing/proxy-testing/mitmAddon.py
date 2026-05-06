@@ -14,10 +14,23 @@ def _write(payload):
         fh.write(json.dumps(payload) + "\n")
 
 
+# Cap at 256 KiB so an oversized body (e.g. an attachment-heavy turn)
+# can never wedge the JSONL writer or balloon the in-memory event
+# buffer. 256 KiB is generous: a maxed-out title-gen request — the only
+# consumer of this field — is well under 4 KiB, and a normal turn
+# request is bounded by Claude Code's own context budget. Larger
+# requests still emit a `request` event, just without `body_b64`, so
+# the adapter falls back to its model-name heuristic.
+_REQUEST_BODY_CAP = 256 * 1024
+
+
 def request(flow: http.HTTPFlow) -> None:
     request = flow.request
     path = request.path or ""
-    if request.host.endswith("anthropic.com") and "/v1/messages" in path:
+    is_messages = (
+        request.host.endswith("anthropic.com") and "/v1/messages" in path
+    )
+    if is_messages:
         request.headers["Accept-Encoding"] = "identity"
 
     payload = {
@@ -29,6 +42,22 @@ def request(flow: http.HTTPFlow) -> None:
         "path": request.path,
         "headers": dict(request.headers),
     }
+
+    # Body capture is gated on /v1/messages because:
+    #   * the adapter only consumes it for sidecar detection on those
+    #     flows, so emitting it for unrelated traffic (auth, MCP
+    #     registry, telemetry) is pure noise on the wire to the renderer
+    #     and a leak risk for any non-Anthropic host the user proxies;
+    #   * `request.content` materialises the buffered body, which we
+    #     don't want to do for every flow on every host.
+    if is_messages:
+        try:
+            content = request.content or b""
+            if 0 < len(content) <= _REQUEST_BODY_CAP:
+                payload["body_b64"] = base64.b64encode(content).decode("ascii")
+        except Exception as exc:
+            payload["body_error"] = str(exc)
+
     _write(payload)
 
 

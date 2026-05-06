@@ -28,6 +28,7 @@
 //   - It is testable without a PTY. Feed it transport events, assert
 //     on SemanticChannel emissions. Production wiring is incidental.
 
+import { Buffer } from 'node:buffer'
 import { TextDecoder } from 'node:util'
 
 import type { SemanticChannel } from '../channels/SemanticChannel.js'
@@ -58,6 +59,14 @@ export type ProxyTransportEvent = {
   headers?: Record<string, string>
   /** Base64-encoded transport bytes on `response-chunk`. */
   chunk_b64?: string
+  /** Base64-encoded REQUEST body, populated by the mitm addon for
+   *  /v1/messages calls only and capped at 256 KiB. Used by the sidecar
+   *  filter to detect title-gen / compaction / hook-agent calls that
+   *  share the user's primary model and therefore can't be caught by
+   *  the model-name heuristic. Optional because (a) older addons don't
+   *  emit it, (b) non-/v1/messages requests omit it, and (c) oversized
+   *  bodies are dropped silently. Consumers MUST tolerate absence. */
+  body_b64?: string
   /** Final buffered body on `response`. Not consumed by this adapter —
    *  chunks are the single source of truth for streaming. Kept as
    *  input so callers can pass through a generic proxy stream without
@@ -199,6 +208,51 @@ type BlockState =
     }
   | { kind: 'other'; index: number; rawType: string; citations?: unknown[] }
 
+type ParsedRequestShape = {
+  /** Caller-supplied generation cap. Title-gen requests typically set
+   *  this to 32-512; real turns set it to 8192+. Stored verbatim — the
+   *  filter compares against an explicit threshold rather than a ratio
+   *  to remain robust to future Claude Code defaults.
+   *
+   *  CAVEAT: `CLAUDE_CODE_MAX_OUTPUT_TOKENS` lets a user override the
+   *  real-turn cap downwards with no lower bound (only `> 0`). A user
+   *  who sets it to 1024 would have real turns demoted by a
+   *  threshold-only check. That's why signal 2a in `isSidecarFlow`
+   *  pairs `maxTokens` with `messageCount` — see the comment there. */
+  maxTokens: number | null
+  /** Length of the request's `messages` array. Real conversation
+   *  turns carry the full history (tens of messages once a session
+   *  warms up; even a first user turn typically has ≥1 with cache
+   *  primers above it on retries). Auxiliary calls (title gen,
+   *  branch-name gen, compaction summary, hook agent) post a tiny
+   *  synthetic conversation — almost always 1, occasionally 2.
+   *  Stored as a count, not the array, so a 200 KiB request body
+   *  doesn't pin in memory after the request is parsed.
+   *
+   *  Used in conjunction with `maxTokens` so the predicate is robust
+   *  to a user who sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS=1024` for
+   *  their primary model (real turns would have small max_tokens but
+   *  still a long messages array). */
+  messageCount: number | null
+  /** Per-text-block prefixes from the request's `system` field. Each
+   *  entry is the first 200 chars of one block's `text`, in source
+   *  order. Stored as an ARRAY (not a single concatenation) because
+   *  Claude Code's `sideQuery` constructs `system` as
+   *  `[attributionHeader?, getCLISyspromptPrefix?, ...callerSystem]`
+   *  — the auxiliary prompt is at index 2+, not 0. An earlier
+   *  revision read only `system[0]` and the fingerprint check became
+   *  effectively dead code; matching against every block keeps the
+   *  signal usable regardless of how Claude Code orders its system
+   *  prelude. Truncating each block to 200 chars bounds per-flow
+   *  memory while still capturing the auxiliary prompt's identifying
+   *  prefix (the longest known fingerprint is ~50 chars).
+   *
+   *  Empty array (not null) when the system field was absent or
+   *  contained no text blocks; null only when the request body
+   *  itself was missing. */
+  systemPrefixes: string[] | null
+}
+
 type FlowState = {
   flowId: string
   attribution: FlowAttribution
@@ -219,6 +273,13 @@ type FlowState = {
    *  following claude.ts:2924 rules: `>0` guard for input/cache
    *  tokens, `??` merge for output/server/cache_creation. */
   usage: AnthropicUsage
+  /** Parsed shape of the request body, populated at `onRequest` time
+   *  when the addon supplied `body_b64`. Null when the addon did not
+   *  emit a body, parsing failed, or the request was made by an older
+   *  addon version. The sidecar filter must treat null as "no signal"
+   *  and fall back to the existing model-name heuristic — never as
+   *  evidence that a flow is real. */
+  requestShape: ParsedRequestShape | null
   /** Set to true once we've emitted `turn_started` for this flow, so
    *  repeated message_start events (shouldn't happen, but defensive)
    *  don't fire a second start. */
@@ -246,6 +307,76 @@ type FlowState = {
    *  into a `flow_ignored` event. */
   lastChunkAt: number
 }
+
+/** System-prompt prefixes that identify Claude Code's auxiliary
+ *  /v1/messages calls (title generation, branch-name gen, compaction
+ *  summary, hook agents). Matched as a case-insensitive prefix
+ *  against the request's `system` text — see `isSidecarFlow`.
+ *
+ *  We list literal English prefixes rather than a regex pattern so
+ *  the failure mode of a prompt rename is "we miss this call until
+ *  we add the new prefix" — not "we silently misclassify a real
+ *  turn". The `max_tokens <= 1024` signal in `isSidecarFlow` is the
+ *  real safety net when prompts drift; this list is the cheap
+ *  positive-ID path that catches them before we even need to look
+ *  at the budget.
+ *
+ *  Source of truth shared with `describeSidecarReason` so the human-
+ *  readable demotion reason can never disagree with the predicate
+ *  that triggered demotion. Earlier revisions kept a separate
+ *  "non-empty systemPrefix" check inside `describeSidecarReason`,
+ *  which over-reported `auxiliary system prompt` whenever a flow
+ *  carrying ANY system text was demoted on `max_tokens` alone. By
+ *  matching against this list in both places we guarantee the
+ *  reason text reflects the actual signal.
+ *
+ *  Drawn from the Claude Code 2.1.x source as of 2026-05-06; extend
+ *  as new sidecars are observed in debug bundles. */
+const SIDECAR_SYSTEM_PROMPT_PREFIXES = [
+  'You are a helpful AI assistant tasked with generating',
+  'You will be given a conversation', // teleport branch+title
+  'Generate a concise', // compaction summary, title gen
+  'Summarize the following', // hook-agent variants
+] as const
+
+/** Real Claude Code turns set max_tokens to 8192+ by default; every
+ *  known auxiliary call (title gen, branch-name gen, compaction
+ *  summary, hook agent) caps at <= 1024. 1024 is the highest known
+ *  auxiliary value (compaction summary), and `sideQuery` defaults to
+ *  1024 when callers omit it.
+ *
+ *  CAVEAT: `CLAUDE_CODE_MAX_OUTPUT_TOKENS` lets a user override the
+ *  primary-model cap downwards (only `> 0` is enforced). A user who
+ *  pinned that env to 1024 would have real turns demoted by a
+ *  threshold-only check. That's why signal 2a in `isSidecarFlow`
+ *  pairs this threshold with `AUXILIARY_MESSAGE_COUNT_THRESHOLD` —
+ *  the compound predicate stays narrow (real turns carry the full
+ *  messages array even when the user pinned a low budget) while
+ *  still catching every observed auxiliary shape (sideQuery default
+ *  1024 with a 1- or 2-message synthetic body).
+ *
+ *  Hoisted to module scope so `isSidecarFlow` and
+ *  `describeSidecarReason` share a single source. */
+const MAX_TOKENS_SIDECAR_THRESHOLD = 1024
+
+/** Companion to `MAX_TOKENS_SIDECAR_THRESHOLD`. Auxiliary calls are
+ *  invoked with synthetic conversations that contain 1 or 2
+ *  messages — a single user-role description, occasionally preceded
+ *  by an assistant-role priming message. Real cc-shell conversations
+ *  reach this count only on the very first turn, but they also
+ *  always include cache-priming or attachment messages above the
+ *  raw user input, so the realistic floor for a real turn is ≥ 4.
+ *
+ *  We pick 3 (rather than 2) to absorb the unlikely case that
+ *  Claude Code starts including one extra synthetic system-style
+ *  message in a future auxiliary call. Picking 5 or higher would
+ *  catch isolated test sessions; picking 1 would miss any auxiliary
+ *  call that adds a single priming message.
+ *
+ *  Used ONLY in conjunction with `MAX_TOKENS_SIDECAR_THRESHOLD` —
+ *  on its own this signal is too weak (a one-message real turn
+ *  exists when a user starts a new pane). */
+const AUXILIARY_MESSAGE_COUNT_THRESHOLD = 3
 
 // Watchdog window for activeStreamingFlowId.
 //
@@ -439,6 +570,7 @@ export class ClaudeProxyAdapter {
       blocks: new Map(),
       fullText: '',
       usage: {},
+      requestShape: null,
       turnStarted: false,
       turnStopped: false,
       pendingToolUses: [],
@@ -447,6 +579,9 @@ export class ClaudeProxyAdapter {
       // "stale" to the watchdog the very first time onChunk runs.
       lastChunkAt: Date.now(),
     }
+    state.requestShape = this.parseRequestBody(
+      typeof event.body_b64 === 'string' ? event.body_b64 : undefined,
+    )
     this.flows.set(flowId, state)
     this.onDiagnostic(`flow ${flowId} accepted as candidate`)
   }
@@ -700,7 +835,7 @@ export class ClaudeProxyAdapter {
         // would let a concurrent real-turn flow promote during the
         // sidecar's tail and produce two competing 'active'
         // attributions for the same wall-clock window.
-        if (isActive && this.isSidecarFlow(ev.model)) {
+        if (isActive && this.isSidecarFlow(state, ev.model)) {
           // Clear the spinner BEFORE flipping attribution. `publishPhase`
           // early-returns when attribution !== 'active' (so that
           // secondary flows can't flap the spinner mid-turn), so an
@@ -712,12 +847,15 @@ export class ClaudeProxyAdapter {
           state.attribution = 'secondary'
           this.channel.publishFlowIgnored({
             flowId: state.flowId,
-            reason: `sidecar model ${ev.model ?? '<unknown>'} (session model differs from sidecar pattern)`,
+            reason: this.describeSidecarReason(state, ev.model),
             source,
             confidence,
           })
           this.onDiagnostic(
-            `flow ${state.flowId} demoted as sidecar (model=${ev.model})`,
+            `flow ${state.flowId} demoted as sidecar (model=${ev.model}` +
+            `, maxTokens=${state.requestShape?.maxTokens ?? '?'}` +
+            `, messages=${state.requestShape?.messageCount ?? '?'}` +
+            `, sysPrefix=${(state.requestShape?.systemPrefixes?.[0] ?? '').slice(0, 40)})`,
           )
           return
         }
@@ -1202,33 +1340,243 @@ export class ClaudeProxyAdapter {
     this.onDiagnostic(message)
   }
 
-  /** Decide whether a flow producing model `model` is an auxiliary
-   *  Haiku-style sidecar relative to the user's primary session
-   *  model. Returns false unless ALL of the following hold:
+  /** Decode and minimally parse the addon-supplied request body so the
+   *  sidecar filter can read max_tokens / system / messages.length
+   *  without re-parsing on every chunk. We stay deliberately tolerant
+   *  here: any failure produces null, and null means "fall through to
+   *  the model-name heuristic" — never "this is a real turn". The
+   *  threshold for fingerprint matching lives in isSidecarFlow,
+   *  not here, because this method must remain free of policy. */
+  private parseRequestBody(b64: string | undefined): ParsedRequestShape | null {
+    if (!b64 || typeof b64 !== 'string') return null
+    let json: unknown
+    try {
+      const raw = Buffer.from(b64, 'base64').toString('utf-8')
+      json = JSON.parse(raw)
+    } catch {
+      return null
+    }
+    if (!json || typeof json !== 'object') return null
+    const obj = json as Record<string, unknown>
+
+    const maxTokens =
+      typeof obj.max_tokens === 'number' && Number.isFinite(obj.max_tokens)
+        ? obj.max_tokens
+        : null
+
+    const messages = Array.isArray(obj.messages) ? obj.messages : null
+    const messageCount = messages ? messages.length : null
+
+    // Anthropic accepts `system` as either a single string or an array
+    // of typed blocks (currently only `{ type: 'text', text }` is used
+    // in the wild, but we tolerate other types by skipping them). We
+    // collect the prefix of EVERY text block, not just the first,
+    // because Claude Code's `sideQuery` (vendor/utils/sideQuery.ts) puts
+    // the attribution header in slot 0 and `getCLISyspromptPrefix` in
+    // slot 1; the auxiliary prompt the fingerprint cares about lives at
+    // index 2+. An earlier revision read only `system[0]` and quietly
+    // turned the fingerprint check into dead code. The cap of 200 chars
+    // per block keeps memory bounded — the longest known fingerprint
+    // prefix is ~50 chars, so 200 is generous headroom.
+    const systemPrefixes: string[] = []
+    const sys = obj.system
+    if (typeof sys === 'string') {
+      // Single-string form is the legacy shape — every text we'd want
+      // to fingerprint is in this one string.
+      systemPrefixes.push(sys.slice(0, 200))
+    } else if (Array.isArray(sys)) {
+      for (const block of sys) {
+        const b = block as { type?: string; text?: string } | null | undefined
+        if (b && typeof b.text === 'string' && b.text.length > 0) {
+          systemPrefixes.push(b.text.slice(0, 200))
+        }
+      }
+    }
+
+    return { maxTokens, messageCount, systemPrefixes }
+  }
+
+  /** Whether the given flow looks like a sidecar (auxiliary) call rather
+   *  than the user's visible turn. Two independent signals; either one
+   *  is sufficient:
    *
-   *    1. A `sidecarModelPattern` is configured (default `/haiku/i`,
-   *       can be `null` to disable filtering entirely).
-   *    2. A `getSessionModel` callback is configured (no callback ⇒
-   *       caller hasn't opted in; preserve pre-fix behaviour).
-   *    3. The callback returns a non-null primary model.
-   *    4. The flow's model matches the sidecar pattern.
-   *    5. The session model does NOT match the sidecar pattern.
+   *    1. Model heuristic (legacy, kept). The flow's response model
+   *       matches `sidecarModelPattern` (default /haiku/i) AND the
+   *       session model does not. This catches Claude Code versions
+   *       that still route auxiliary calls to Haiku.
    *
-   *  Condition 5 is the false-positive guard: a user who explicitly
-   *  picked Haiku as their primary model would otherwise have their
-   *  real conversation flows suppressed. The "differs from pattern"
-   *  test means the rule reads "filter Haiku flows on non-Haiku
-   *  sessions," which exactly matches the production bug pattern
-   *  (Opus/Sonnet session, occasional Haiku title-gen call). */
-  private isSidecarFlow(flowModel: string | null): boolean {
+   *    2. Request-shape heuristic (new). The request body — surfaced
+   *       by the mitm addon at onRequest time — carries one of Claude
+   *       Code's known title-gen / summary system-prompt prefixes
+   *       (signal 2b) OR pairs a tiny max_tokens budget with a tiny
+   *       messages array (signal 2a, compound). Recent Claude Code
+   *       versions route these calls against the user's primary
+   *       model, so the legacy model heuristic alone misses them.
+   *
+   *  Both signals are gated on the same opt-in/disable contract that
+   *  controlled the original Haiku-only filter (see
+   *  `ClaudeProxyAdapterOptions`). A caller that constructed the
+   *  adapter without `getSessionModel`, or with `sidecarModelPattern`
+   *  explicitly set to `null`, has opted OUT of sidecar filtering;
+   *  honouring that contract for the body-shape heuristic too is
+   *  required to preserve back-compat for adapter consumers that
+   *  passed a non-Claude-Code workload through this code path.
+   *
+   *  Returning true causes the message_start branch in
+   *  applyAnthropicEvent to demote the flow to 'secondary'. A false
+   *  negative on either signal is recoverable (we just don't filter
+   *  that one call); a false POSITIVE silently hides a real turn —
+   *  so each signal is written conservatively.
+   */
+  private isSidecarFlow(state: FlowState, flowModel: string | null | undefined): boolean {
+    // Opt-in / disable gate (Critical-2 fix). Both forms must short-
+    // circuit ALL signals here — body-shape included — to honour the
+    // documented contract:
+    //   * `sidecarModelPattern: null` → "disable filtering entirely"
+    //   * `getSessionModel: undefined` → "caller hasn't opted in"
+    // Earlier revisions of the body-shape branch ran regardless of
+    // these flags, which silently changed the meaning of the opt-out
+    // for adapter consumers. The whole subsystem now lives behind one
+    // gate so future signals don't have to remember to re-check.
     if (this.sidecarModelPattern === null) return false
     if (this.getSessionModel === null) return false
-    if (!flowModel) return false
+
+    // Signal 1: legacy model match.
     const sessionModel = this.getSessionModel()
-    if (!sessionModel) return false
-    if (!this.sidecarModelPattern.test(flowModel)) return false
-    if (this.sidecarModelPattern.test(sessionModel)) return false
-    return true
+    if (typeof flowModel === 'string' && typeof sessionModel === 'string') {
+      if (
+        this.sidecarModelPattern.test(flowModel) &&
+        !this.sidecarModelPattern.test(sessionModel)
+      ) {
+        return true
+      }
+    }
+
+    // Signal 2: request shape. Skipped when the addon did not supply a
+    // body (older mitmAddon.py, oversized payload, parse failure) — in
+    // those cases we degrade to signal 1 only and the user falls back
+    // to the prior behaviour.
+    const shape = state.requestShape
+    if (shape) {
+      // 2a. Compound budget signal. A small `max_tokens` ALONE used
+      // to be enough; that risked false-positives for users who set
+      // `CLAUDE_CODE_MAX_OUTPUT_TOKENS=1024` (or lower) for their
+      // primary model — real turns would be silently demoted. Pair
+      // it with `messageCount` because a real conversation always
+      // carries a non-trivial history while every known auxiliary
+      // call posts ≤ 3 synthetic messages. Both conditions firing is
+      // a much narrower predicate while still catching every observed
+      // sidecar shape (sideQuery default 1024 + 1-msg synthetic body).
+      if (
+        typeof shape.maxTokens === 'number' &&
+        shape.maxTokens > 0 &&
+        shape.maxTokens <= MAX_TOKENS_SIDECAR_THRESHOLD &&
+        typeof shape.messageCount === 'number' &&
+        shape.messageCount > 0 &&
+        shape.messageCount <= AUXILIARY_MESSAGE_COUNT_THRESHOLD
+      ) {
+        return true
+      }
+
+      // 2b. System-prompt fingerprint. We match prefixes (case-
+      // insensitive) against EVERY block in `systemPrefixes` rather
+      // than the first because Claude Code's `sideQuery` prepends
+      // attribution and CLI-sysprompt blocks before the auxiliary
+      // prompt. List lives at module scope
+      // (SIDECAR_SYSTEM_PROMPT_PREFIXES) so describeSidecarReason
+      // can re-match against the same source of truth.
+      if (shape.systemPrefixes && shape.systemPrefixes.length > 0) {
+        for (const blockPrefix of shape.systemPrefixes) {
+          const lc = blockPrefix.toLowerCase()
+          if (lc.length === 0) continue
+          for (const fp of SIDECAR_SYSTEM_PROMPT_PREFIXES) {
+            if (lc.startsWith(fp.toLowerCase())) return true
+          }
+        }
+      }
+    }
+
+    return false
+  }
+
+  /** Human-readable label for why a flow was demoted, derived after
+   *  the fact from whichever signal(s) tripped. We re-evaluate each
+   *  signal here rather than threading the trigger through the call
+   *  chain — the cost is negligible (string comparisons on a 200-char
+   *  prefix and a numeric compare) and it keeps the demotion site
+   *  free of branching. The output goes straight to the debug panel
+   *  and the proxy-semantic dump, so phrase it for a human reader. */
+  private describeSidecarReason(state: FlowState, flowModel: string | null | undefined): string {
+    // Mirror the opt-in / disable gate from isSidecarFlow so the two
+    // never disagree. In practice describeSidecarReason is only ever
+    // called after isSidecarFlow returned true (which already implies
+    // the gate passed), so this is defence-in-depth — but cheap.
+    if (this.sidecarModelPattern === null || this.getSessionModel === null) {
+      return 'sidecar (signals mismatch — see adapter logs)'
+    }
+
+    const reasons: string[] = []
+    if (typeof flowModel === 'string') {
+      const sessionModel = this.getSessionModel()
+      if (
+        typeof sessionModel === 'string' &&
+        this.sidecarModelPattern.test(flowModel) &&
+        !this.sidecarModelPattern.test(sessionModel)
+      ) {
+        reasons.push(`sidecar model ${flowModel}`)
+      }
+    }
+    const shape = state.requestShape
+    if (shape) {
+      // Match the COMPOUND signal 2a from isSidecarFlow exactly —
+      // both `max_tokens` AND `messageCount` must be small. Earlier
+      // revisions reported `tiny max_tokens (...)` whenever the
+      // budget alone was small, which was misleading once we tightened
+      // the predicate to require a small messages array too.
+      if (
+        typeof shape.maxTokens === 'number' &&
+        shape.maxTokens > 0 &&
+        shape.maxTokens <= MAX_TOKENS_SIDECAR_THRESHOLD &&
+        typeof shape.messageCount === 'number' &&
+        shape.messageCount > 0 &&
+        shape.messageCount <= AUXILIARY_MESSAGE_COUNT_THRESHOLD
+      ) {
+        reasons.push(
+          `tiny max_tokens (${shape.maxTokens}) on ${shape.messageCount}-message request`,
+        )
+      }
+      // Match against the SAME fingerprint list isSidecarFlow uses,
+      // and against EVERY system block (not just the first), because
+      // sideQuery prepends attribution + CLI-sysprompt blocks before
+      // the auxiliary prompt. A flow demoted purely on max_tokens
+      // that happens to carry a non-fingerprint system prompt should
+      // NOT be labelled `auxiliary system prompt` — that would
+      // mislead future debug sessions into chasing a fingerprint
+      // that never tripped.
+      if (shape.systemPrefixes && shape.systemPrefixes.length > 0) {
+        let matchedFp: string | null = null
+        outer: for (const blockPrefix of shape.systemPrefixes) {
+          const lc = blockPrefix.toLowerCase()
+          if (lc.length === 0) continue
+          for (const fp of SIDECAR_SYSTEM_PROMPT_PREFIXES) {
+            if (lc.startsWith(fp.toLowerCase())) {
+              matchedFp = fp
+              break outer
+            }
+          }
+        }
+        if (matchedFp !== null) {
+          reasons.push(`auxiliary system prompt`)
+        }
+      }
+    }
+    if (reasons.length === 0) {
+      // Defensive — isSidecarFlow returned true but no signal matches
+      // here. Means the heuristics drifted out of sync; surface as much
+      // detail as possible so we can fix the divergence.
+      return 'sidecar (signals mismatch — see adapter logs)'
+    }
+    return reasons.join(' + ')
   }
 
   /** Emit a stream-phase event on behalf of this flow, but ONLY if the
