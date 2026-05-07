@@ -67,6 +67,27 @@ export type ProxyTransportEvent = {
    *  emit it, (b) non-/v1/messages requests omit it, and (c) oversized
    *  bodies are dropped silently. Consumers MUST tolerate absence. */
   body_b64?: string
+  /** Pre-extracted shape of the REQUEST body, populated by the mitm
+   *  addon for /v1/messages calls regardless of body size. This field
+   *  was added because real Claude Code requests routinely run 700 KB
+   *  to 1+ MB (full conversation history every turn), which silently
+   *  dropped past `body_b64`'s 256 KiB cap. Result: the c8c2623 sidecar
+   *  filter saw `requestShape = null` for ~99% of traffic in
+   *  production debug bundles (e.g. 2026-05-07T08-26-35-212-5d948ab5)
+   *  and never demoted any flow.
+   *
+   *  By parsing in the addon (which already has the body buffered in
+   *  mitmproxy memory) we keep the IPC payload tiny — a few hundred
+   *  bytes per request instead of multi-MB base64 — while still
+   *  giving the adapter the three fields it needs (max_tokens,
+   *  messageCount, systemPrefixes). Consumers MUST tolerate absence:
+   *  older addons don't emit this and the adapter falls back to
+   *  parsing `body_b64` inline. */
+  request_shape?: {
+    max_tokens?: number | null
+    message_count?: number | null
+    system_prefixes?: string[]
+  }
   /** Final buffered body on `response`. Not consumed by this adapter —
    *  chunks are the single source of truth for streaming. Kept as
    *  input so callers can pass through a generic proxy stream without
@@ -579,9 +600,25 @@ export class ClaudeProxyAdapter {
       // "stale" to the watchdog the very first time onChunk runs.
       lastChunkAt: Date.now(),
     }
-    state.requestShape = this.parseRequestBody(
-      typeof event.body_b64 === 'string' ? event.body_b64 : undefined,
-    )
+    // Prefer the addon's pre-extracted request_shape over parsing
+    // body_b64 inline. The addon path works for any body size (it
+    // parses the buffered body inside the addon process and emits only
+    // the fields we care about), while body_b64 is gated on a 256 KiB
+    // cap that real Claude Code requests routinely exceed because they
+    // include the full conversation history. Both paths populate the
+    // same ParsedRequestShape so downstream isSidecarFlow logic doesn't
+    // need to know which source produced the data.
+    //
+    // Order of precedence:
+    //   1. event.request_shape  — new, post-2026-05-07 addon
+    //   2. event.body_b64       — older addons, small-body fallback
+    //   3. null                 — no signal; signal 1 (model name)
+    //                             still runs in isSidecarFlow.
+    state.requestShape =
+      this.normalizeRequestShape(event.request_shape) ??
+      this.parseRequestBody(
+        typeof event.body_b64 === 'string' ? event.body_b64 : undefined,
+      )
     this.flows.set(flowId, state)
     this.onDiagnostic(`flow ${flowId} accepted as candidate`)
   }
@@ -1340,13 +1377,58 @@ export class ClaudeProxyAdapter {
     this.onDiagnostic(message)
   }
 
+  /** Coerce the addon's pre-extracted `request_shape` payload into the
+   *  internal `ParsedRequestShape` slot. The addon emits the same
+   *  three fields (max_tokens, message_count, system_prefixes) that
+   *  `parseRequestBody` would have computed from `body_b64`, but
+   *  parsed inside the mitm process so size doesn't matter. Tolerance
+   *  rules mirror parseRequestBody: any malformed field collapses to
+   *  null, never to a real-turn-looking value. */
+  private normalizeRequestShape(raw: unknown): ParsedRequestShape | null {
+    if (!raw || typeof raw !== 'object') return null
+    const obj = raw as Record<string, unknown>
+
+    const rawMax = obj.max_tokens
+    const maxTokens =
+      typeof rawMax === 'number' && Number.isFinite(rawMax) ? rawMax : null
+
+    const rawCount = obj.message_count
+    const messageCount =
+      typeof rawCount === 'number' && Number.isFinite(rawCount) ? rawCount : null
+
+    // We trust the addon to have already capped each prefix at the
+    // ~200-char window described in parseRequestBody; we only filter
+    // out non-string entries defensively. A missing/non-array value
+    // becomes [] so the downstream `for...of` in isSidecarFlow runs
+    // zero iterations rather than throwing on a non-iterable.
+    const prefixes = obj.system_prefixes
+    const systemPrefixes = Array.isArray(prefixes)
+      ? prefixes.filter((value): value is string => typeof value === 'string')
+      : []
+
+    // If the addon emitted an empty object (shouldn't happen — the
+    // addon emits `request_shape` only when it successfully parsed a
+    // body) treat as no-signal so the body_b64 fallback can still try.
+    if (maxTokens === null && messageCount === null && systemPrefixes.length === 0) {
+      return null
+    }
+
+    return { maxTokens, messageCount, systemPrefixes }
+  }
+
   /** Decode and minimally parse the addon-supplied request body so the
    *  sidecar filter can read max_tokens / system / messages.length
    *  without re-parsing on every chunk. We stay deliberately tolerant
    *  here: any failure produces null, and null means "fall through to
    *  the model-name heuristic" — never "this is a real turn". The
    *  threshold for fingerprint matching lives in isSidecarFlow,
-   *  not here, because this method must remain free of policy. */
+   *  not here, because this method must remain free of policy.
+   *
+   *  Kept as a fallback for older addons that don't emit
+   *  `request_shape` directly. New addons (post-2026-05-07) parse
+   *  inside the addon and emit the shape via the dedicated field; this
+   *  base64-decode path is dormant for them and runs only when an
+   *  older addon binary is in use. */
   private parseRequestBody(b64: string | undefined): ParsedRequestShape | null {
     if (!b64 || typeof b64 !== 'string') return null
     let json: unknown
