@@ -84,9 +84,38 @@ export type ProxyTransportEvent = {
    *  older addons don't emit this and the adapter falls back to
    *  parsing `body_b64` inline. */
   request_shape?: {
+    /** Predicate-relevant: max_tokens budget. Real Claude Code
+     *  turns set 8192+; sidecars cap at 1024. */
     max_tokens?: number | null
+    /** Predicate-relevant: count of `messages` array entries. */
     message_count?: number | null
+    /** Predicate-relevant: leading 200 chars of every `system` text
+     *  block. Each entry preserves block order. */
     system_prefixes?: string[]
+    /** Diagnostic: count of entries in the `tools` array. Real
+     *  Claude Code turns ALWAYS ship the tools array (Bash, Edit,
+     *  Read, …); sidecars routed through sideQuery / queryHaiku
+     *  ship `tools: []` or omit. Strongest single signal we don't
+     *  yet wire into isSidecarFlow — landed here so future predicate
+     *  work can pick it up. */
+    tools_count?: number | null
+    /** Diagnostic: number of system blocks. Real turns: many
+     *  (attribution + CLI sysprompt + tools/workspace context).
+     *  Sidecars: 2-3. */
+    system_blocks_count?: number | null
+    /** Diagnostic: total characters across all system blocks. Real
+     *  turns measure in 10s of KB; sidecars in <5 KB. */
+    system_total_chars?: number | null
+    /** Diagnostic: total characters across all messages content
+     *  text blocks. Defence-in-depth signal against a sidecar
+     *  variant that ships the full conversation history. */
+    messages_total_chars?: number | null
+    /** Diagnostic: `cc_entrypoint` slug parsed from system[0].text's
+     *  attribution header. One of: cli / sdk-cli / mcp /
+     *  claude-code-github-action / local-agent. Doesn't discriminate
+     *  call type but lets bundle tooling correlate traffic back to
+     *  the parent process. */
+    attribution_entrypoint?: string | null
   }
   /** Final buffered body on `response`. Not consumed by this adapter —
    *  chunks are the single source of truth for streaming. Kept as

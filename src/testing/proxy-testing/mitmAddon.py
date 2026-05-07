@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import base64
 from mitmproxy import http
 
@@ -25,15 +26,16 @@ def _write(payload):
 # `2026-05-07T08-26-35-212-5d948ab5` (Content-Length 681862-1033291 on
 # every Claude Code turn; only the 323-byte warmup quota check fit).
 #
-# The cap is now diagnostic-only: `body_b64` exists for forensic
-# decoding of small bodies (warmup quota check, future small auxiliary
-# calls). The sidecar filter consumes `request_shape` instead — a small
-# JSON blob extracted from the buffered body INSIDE this addon process
-# and emitted regardless of body size. mitmproxy already had the body
-# in RAM (`request.content` materialises it on access) so the
-# in-process parse costs nothing extra; we just stop wasting bytes by
-# re-encoding multi-MB blobs into base64 over IPC.
-_REQUEST_BODY_CAP = 256 * 1024
+# Raised to 2 MiB so forensic tooling (debug bundles, ad-hoc decode)
+# can recover the actual prompt text from a real turn — the previous
+# 256 KiB cap silently lost the prompt for every conversation past the
+# first few turns. 2 MiB covers every body we have observed in
+# production and is small enough that an oversized attachment-heavy
+# turn still falls back to the request_shape path without wedging
+# the JSONL writer. The sidecar filter doesn't depend on body_b64
+# anymore — it reads `request_shape` directly — so the cap is purely
+# about diagnostic decode reach.
+_REQUEST_BODY_CAP = 2 * 1024 * 1024
 
 
 # How many leading characters of each system-prompt text block we ship
@@ -44,18 +46,158 @@ _REQUEST_BODY_CAP = 256 * 1024
 _SYSTEM_PREFIX_CHARS = 200
 
 
-def _extract_request_shape(content: bytes):
-    """Parse the addon-buffered request body into the three fields the
-    adapter's sidecar predicate actually reads: `max_tokens`,
-    `message_count`, `system_prefixes`. Mirrors
-    `ClaudeProxyAdapter.parseRequestBody` so the in-addon path and the
-    legacy base64 path produce indistinguishable shapes — the adapter
-    can't tell which source it received.
+# Headers we forward verbatim. Anything not on this list is silently
+# dropped before the event lands in proxy-events.jsonl.
+#
+# WHY allowlist instead of denylist:
+#   * Defense-in-depth on Authorization. mitmproxy decrypts the
+#     bearer token and we never want it on disk. An allowlist makes
+#     "we forgot to redact" structurally impossible — Authorization
+#     is simply not in the list.
+#   * The Anthropic SDK can attach custom headers via
+#     ANTHROPIC_CUSTOM_HEADERS; user-set values can carry secrets we
+#     don't want in bundles either.
+#   * Future-proof against new identifying headers Claude Code adds:
+#     dropping unknown headers means we don't accidentally leak a
+#     header that was added between our allowlist update and our
+#     review. If we miss a useful one, "no record" is a safer default
+#     than "every header on disk by default."
+#
+# Headers chosen by reading the source of truth in
+# `vendor/claude-code-src/full/services/api/client.ts` (defaultHeaders
+# block) plus the few transport-level headers that help correlate
+# requests in a packet capture.
+_HEADER_ALLOWLIST = frozenset({
+    "x-app",
+    "user-agent",
+    "x-claude-code-session-id",
+    "x-claude-remote-container-id",
+    "x-claude-remote-session-id",
+    "x-client-app",
+    "x-client-request-id",
+    "anthropic-beta",
+    "anthropic-version",
+    "x-anthropic-additional-protection",
+    "content-length",
+    "content-type",
+})
 
-    Tolerance rules:
+
+# Regex for extracting `cc_entrypoint=value` out of the Claude Code
+# attribution-header text block. The block always lives in
+# `system[0].text` (see vendor/claude-code-src/full/utils/sideQuery.ts
+# line 148-167); this regex pulls just the entrypoint slug so
+# downstream tooling can correlate calls back to their parent context
+# (cli vs sdk-cli vs mcp vs claude-code-github-action) without having
+# to re-parse the whole header string.
+_CC_ENTRYPOINT_RE = re.compile(r"cc_entrypoint=([^;]+);")
+
+
+def _filter_headers(raw):
+    """Filter mitmproxy's request.headers down to the allowlist.
+
+    Returns a plain dict of lowercase-keyed headers. Header names are
+    normalised to lowercase because mitmproxy preserves the wire
+    casing (User-Agent vs user-agent etc.) and downstream consumers
+    shouldn't have to care.
+    """
+    out = {}
+    for key, value in raw.items():
+        lower = key.lower()
+        if lower in _HEADER_ALLOWLIST:
+            out[lower] = value
+    return out
+
+
+def _messages_total_chars(messages):
+    """Sum of all text content across a Claude /v1/messages messages
+    array. Each message's `content` is either a string or an array of
+    typed blocks; we add up text blocks and conservatively count each
+    non-text block as 0 (we're not using this for billing, just for
+    discriminating sidecar shape — a tool_result block's bytes don't
+    move the sidecar/real-turn line).
+    """
+    total = 0
+    if not isinstance(messages, list):
+        return 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        total += len(text)
+    return total
+
+
+def _system_total_chars(sys_field):
+    """Sum of text length across all system blocks. String form
+    counts the string's length; array form sums every text block's
+    length. Used as one of the discriminators between sidecar
+    (small, single-task system) and real turn (large CLI sysprompt
+    + tool descriptions + workspace context)."""
+    if isinstance(sys_field, str):
+        return len(sys_field)
+    if not isinstance(sys_field, list):
+        return 0
+    total = 0
+    for block in sys_field:
+        if isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str):
+                total += len(text)
+    return total
+
+
+def _extract_request_shape(content: bytes):
+    """Parse the addon-buffered request body into the fields the
+    adapter's sidecar predicate reads PLUS forensic discriminators
+    we identified by reverse-engineering Claude Code's HTTP layer
+    (vendor/claude-code-src/full/services/api/client.ts and
+    utils/sideQuery.ts).
+
+    Predicate-relevant fields (consumed by ClaudeProxyAdapter
+    `isSidecarFlow`):
+      * max_tokens, message_count, system_prefixes — original three.
+
+    Forensic / future-predicate fields:
+      * tools_count             — real Claude Code turns ALWAYS ship
+                                  the tools array (Bash, Edit, Read,
+                                  …); sidecars routed through
+                                  sideQuery / queryHaiku ship tools=[].
+                                  Strongest single signal we don't
+                                  yet use.
+      * system_blocks_count     — real turns have many system blocks
+                                  (attribution, CLI sysprompt,
+                                  tools/workspace context). Sidecars
+                                  carry 2-3.
+      * system_total_chars      — real turns measure in 10s of KB,
+                                  sidecars in <5 KB.
+      * messages_total_chars    — defence-in-depth against a sidecar
+                                  variant that ships the full
+                                  conversation (predict-next-prompt
+                                  feature) by giving downstream
+                                  tooling another magnitude check.
+      * attribution_entrypoint  — extracted from the
+                                  `cc_entrypoint=…` field embedded in
+                                  system[0].text (the attribution
+                                  header). Identifies parent context:
+                                  cli / sdk-cli / mcp /
+                                  claude-code-github-action /
+                                  local-agent. Doesn't discriminate
+                                  call type but is invaluable for
+                                  correlating bundle traffic to the
+                                  parent process.
+
+    Tolerance rules (carried forward from the original):
       * non-JSON or non-object body         -> None  (no signal at all)
       * missing/non-numeric max_tokens      -> field is None
-      * missing/non-list messages           -> message_count is None
+      * missing/non-list messages           -> count fields are None
       * `system` as string OR array of {type:'text', text:str}
         blocks                              -> collect text prefixes,
                                                 cap each at
@@ -82,6 +224,7 @@ def _extract_request_shape(content: bytes):
 
     messages = obj.get("messages")
     message_count = len(messages) if isinstance(messages, list) else None
+    messages_total_chars = _messages_total_chars(messages)
 
     # Mirror the adapter's tolerance for both legacy `system: string`
     # and modern `system: [{type:'text', text:'...'}]` shapes. We
@@ -90,21 +233,47 @@ def _extract_request_shape(content: bytes):
     # CLI sysprompt in slot 1; the auxiliary fingerprint we care about
     # lives at slot 2+. See ClaudeProxyAdapter.parseRequestBody for the
     # full rationale this addon is duplicating.
-    system_prefixes = []
     sys_field = obj.get("system")
+    system_prefixes = []
     if isinstance(sys_field, str):
         system_prefixes.append(sys_field[:_SYSTEM_PREFIX_CHARS])
+        system_blocks_count = 1
     elif isinstance(sys_field, list):
         for block in sys_field:
             if isinstance(block, dict):
                 text = block.get("text")
                 if isinstance(text, str) and text:
                     system_prefixes.append(text[:_SYSTEM_PREFIX_CHARS])
+        system_blocks_count = len(sys_field)
+    else:
+        system_blocks_count = 0
+    system_total_chars = _system_total_chars(sys_field)
+
+    # tools is an array on every real Claude Code call. Sidecars omit
+    # it or pass []. None signals "field absent in body" — distinct
+    # from 0 which signals "explicit empty array, very likely sidecar".
+    tools = obj.get("tools")
+    tools_count = len(tools) if isinstance(tools, list) else None
+
+    # Pull cc_entrypoint out of the attribution header. This always
+    # lives in system[0] (see sideQuery.ts:148-167 in vendored Claude
+    # Code source). Look at the first prefix we collected; if no
+    # match, leave None.
+    attribution_entrypoint = None
+    if system_prefixes:
+        match = _CC_ENTRYPOINT_RE.search(system_prefixes[0])
+        if match:
+            attribution_entrypoint = match.group(1).strip()
 
     return {
         "max_tokens": max_tokens,
         "message_count": message_count,
         "system_prefixes": system_prefixes,
+        "tools_count": tools_count,
+        "system_blocks_count": system_blocks_count,
+        "system_total_chars": system_total_chars,
+        "messages_total_chars": messages_total_chars,
+        "attribution_entrypoint": attribution_entrypoint,
     }
 
 
@@ -117,6 +286,12 @@ def request(flow: http.HTTPFlow) -> None:
     if is_messages:
         request.headers["Accept-Encoding"] = "identity"
 
+    # Headers are filtered to an allowlist (see _filter_headers). The
+    # previous unfiltered `dict(request.headers)` exfiltrated bearer
+    # tokens, ANTHROPIC_CUSTOM_HEADERS-injected secrets, and any future
+    # identifying header Claude Code might add — none of which belong
+    # in a debug bundle the user can share. Allowlist makes the leak
+    # surface structurally bounded.
     payload = {
         "kind": "request",
         "flow_id": id(flow),
@@ -124,7 +299,7 @@ def request(flow: http.HTTPFlow) -> None:
         "url": request.pretty_url,
         "host": request.host,
         "path": request.path,
-        "headers": dict(request.headers),
+        "headers": _filter_headers(request.headers),
     }
 
     # Body inspection is gated on /v1/messages because:
