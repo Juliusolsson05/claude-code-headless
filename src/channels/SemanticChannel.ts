@@ -207,6 +207,13 @@ export class SemanticChannel extends EventEmitter {
     role: 'user' | 'assistant'
     source: SemanticSource
     confidence?: SemanticTurnStartedEvent['confidence']
+    /** Forwarded verbatim onto the emitted `turn_started` event.
+     *  Set by ClaudeProxyAdapter when the request-shape sniff
+     *  detected the compaction-prompt signature so the renderer can
+     *  show a placeholder instead of raw <analysis>/<summary> XML.
+     *  See SemanticTurnStartedEvent.isCompactionSynthesis for the
+     *  full rationale. */
+    isCompactionSynthesis?: boolean
   }): void {
     if (this.activeTurnId === params.turnId) return
 
@@ -235,6 +242,11 @@ export class SemanticChannel extends EventEmitter {
       source: params.source,
       confidence: params.confidence ?? (params.source === 'screen' ? 'fallback' : 'high'),
       ts: Date.now(),
+      // Only attach the flag when the caller opted in. Leaving the
+      // field absent (vs. explicitly `false`) keeps event payloads
+      // byte-identical for non-Claude sources, which matters for the
+      // golden fixture tests downstream of the channel.
+      ...(params.isCompactionSynthesis ? { isCompactionSynthesis: true } : {}),
     }
     this.emit('turn_started', ev)
     this.emit('event', ev)

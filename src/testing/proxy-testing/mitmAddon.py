@@ -93,6 +93,45 @@ _HEADER_ALLOWLIST = frozenset({
 _CC_ENTRYPOINT_RE = re.compile(r"cc_entrypoint=([^;]+);")
 
 
+# Signature regex for the Claude Code compaction-synthesis request.
+#
+# When Claude Code's `/compact` command runs (manually or auto-triggered
+# at context-pressure), it issues an internal /v1/messages POST whose
+# last user message is the compaction prompt. The prompt is a fixed
+# preamble defined in
+# `vendor/claude-code-src/full/services/compact/prompt.ts` and is
+# identical across all three variants — BASE_COMPACT_PROMPT (line 61),
+# PARTIAL_COMPACT_PROMPT (line 145), PARTIAL_COMPACT_UP_TO_PROMPT
+# (line 208) — they all open with this exact phrase.
+#
+# We match the OPENING phrase, not the whole prompt, because:
+#   * The prompt body changes across the three variants.
+#   * Claude Code's `getCompactPrompt()` (prompt.ts:293) prepends a
+#     `NO_TOOLS_PREAMBLE` only when called without tools — so the
+#     leading-bytes shape is "[optional preamble][stable phrase]".
+#     A loose contains-match handles both.
+#   * Future changes upstream are far more likely to edit the body
+#     (analysis tag wording, structure prompts) than the opening
+#     scaffold. The opening phrase is the most stable anchor.
+#
+# We deliberately do NOT match `<analysis>` or `<summary>` — those are
+# response-side artefacts that arrive after the request lands. The
+# whole point of the request-shape sniff is to KNOW the response will
+# be a compaction summary BEFORE any bytes stream back, so we can
+# tag the turn at startTurn() time and prevent the UI from rendering
+# the raw XML tags during the synthesis.
+_COMPACT_PROMPT_SIGNATURE_RE = re.compile(
+    r"Your task is to create a detailed summary"
+)
+
+
+# How many characters of the last user message we inspect when running
+# the compaction-prompt regex. The signature phrase appears within the
+# first ~150 chars of every variant. 400 is generous headroom that
+# still bounds the per-event memory cost.
+_COMPACT_MESSAGE_PROBE_CHARS = 400
+
+
 def _filter_headers(raw):
     """Filter mitmproxy's request.headers down to the allowlist.
 
@@ -133,6 +172,54 @@ def _messages_total_chars(messages):
                     if isinstance(text, str):
                         total += len(text)
     return total
+
+
+def _detect_compaction_synthesis(messages):
+    """Detect whether this /v1/messages call is Claude Code's compact
+    synthesis turn.
+
+    Claude Code constructs the compaction request by appending a single
+    user message with the fixed compact prompt to the existing
+    conversation (see vendor/claude-code-src/full/services/compact/
+    compact.ts:441 `createUserMessage({content: compactPrompt})`).
+    The PROMPT is the last user message, not a system block.
+
+    We probe only the LAST message instead of scanning all of them
+    because:
+      * Real Claude Code turns can carry hundreds of messages; full
+        scans cost O(n) for zero benefit — the marker is always last.
+      * A user might legitimately type "Your task is to create a
+        detailed summary…" earlier in the conversation and we don't
+        want to mis-flag that as compaction.
+      * The compact code path injects exactly one trailing user
+        message, so last-message is the precise anchor.
+
+    Returns False on any uncertainty (missing array, non-user role,
+    non-string content, regex miss). The flag is purely additive —
+    "true" means we are CONFIDENT it's compaction; "false" never
+    suppresses other behaviour.
+    """
+    if not isinstance(messages, list) or not messages:
+        return False
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "user":
+        return False
+    content = last.get("content")
+    # Compact prompt is always sent as a plain string (createUserMessage
+    # in vendored source wraps a string), but be defensive about the
+    # blocks-array shape — if Claude Code ever switches to the typed
+    # block form, peek block[0].text.
+    if isinstance(content, str):
+        probe = content[:_COMPACT_MESSAGE_PROBE_CHARS]
+    elif isinstance(content, list) and content:
+        first = content[0]
+        if isinstance(first, dict) and isinstance(first.get("text"), str):
+            probe = first["text"][:_COMPACT_MESSAGE_PROBE_CHARS]
+        else:
+            return False
+    else:
+        return False
+    return bool(_COMPACT_PROMPT_SIGNATURE_RE.search(probe))
 
 
 def _system_total_chars(sys_field):
@@ -193,6 +280,16 @@ def _extract_request_shape(content: bytes):
                                   call type but is invaluable for
                                   correlating bundle traffic to the
                                   parent process.
+      * compaction_synthesis    — True when the last user message
+                                  matches Claude Code's fixed compact
+                                  prompt preamble. Lets cc-shell tag
+                                  the resulting turn at startTurn()
+                                  time so the renderer can show a
+                                  "Compacting…" placeholder instead of
+                                  the raw <analysis>/<summary> XML
+                                  that streams back. See
+                                  _detect_compaction_synthesis above
+                                  for the source-of-truth rationale.
 
     Tolerance rules (carried forward from the original):
       * non-JSON or non-object body         -> None  (no signal at all)
@@ -265,6 +362,8 @@ def _extract_request_shape(content: bytes):
         if match:
             attribution_entrypoint = match.group(1).strip()
 
+    compaction_synthesis = _detect_compaction_synthesis(messages)
+
     return {
         "max_tokens": max_tokens,
         "message_count": message_count,
@@ -274,6 +373,7 @@ def _extract_request_shape(content: bytes):
         "system_total_chars": system_total_chars,
         "messages_total_chars": messages_total_chars,
         "attribution_entrypoint": attribution_entrypoint,
+        "compaction_synthesis": compaction_synthesis,
     }
 
 

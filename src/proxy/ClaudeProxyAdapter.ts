@@ -116,6 +116,15 @@ export type ProxyTransportEvent = {
      *  call type but lets bundle tooling correlate traffic back to
      *  the parent process. */
     attribution_entrypoint?: string | null
+    /** Renderer-relevant: true when the last user message matches
+     *  Claude Code's fixed compaction prompt preamble (see
+     *  `_detect_compaction_synthesis` in `mitmAddon.py`). Threaded
+     *  through to `SemanticTurnStartedEvent.isCompactionSynthesis`
+     *  so the renderer can swap raw <analysis>/<summary> streaming
+     *  for a "Compacting…" placeholder. Distinct from the sidecar
+     *  predicate — compaction turns are real user-initiated work
+     *  that we WANT to surface, just with different UI. */
+    compaction_synthesis?: boolean | null
   }
   /** Final buffered body on `response`. Not consumed by this adapter —
    *  chunks are the single source of truth for streaming. Kept as
@@ -301,6 +310,22 @@ type ParsedRequestShape = {
    *  contained no text blocks; null only when the request body
    *  itself was missing. */
   systemPrefixes: string[] | null
+  /** True when the request body's LAST user message starts with
+   *  Claude Code's fixed compact-prompt preamble. Forwarded from
+   *  the mitm addon's `request_shape.compaction_synthesis` flag,
+   *  with the fallback `parseRequestBody` path computing the same
+   *  bit inline for back-compat with addons that pre-date the
+   *  pre-extracted field.
+   *
+   *  Read by the message_start handler to tag the resulting
+   *  semantic turn so renderers can swap the raw
+   *  `<analysis>/<summary>` stream for a "Compacting…" placeholder.
+   *  Intentionally NOT consumed by `isSidecarFlow`: compaction is a
+   *  real user-initiated turn (the resulting `compact_boundary` +
+   *  `isCompactSummary` JSONL entries are user-facing artefacts),
+   *  so demoting it would silently break the UI. Treated as a UI
+   *  hint, not a routing decision. */
+  isCompactionSynthesis: boolean
 }
 
 type FlowState = {
@@ -927,11 +952,20 @@ export class ClaudeProxyAdapter {
         }
 
         if (isActive && !state.turnStarted) {
+          // Forward the compaction-synthesis flag from the request
+          // shape (sniffed at /v1/messages request time by the mitm
+          // addon's last-user-message regex; see ParsedRequestShape
+          // .isCompactionSynthesis). The flag lets the renderer swap
+          // the raw <analysis>/<summary> XML stream for a placeholder.
+          // Only attach when truthy so non-compaction turns keep their
+          // event payload byte-identical for the golden fixture tests.
+          const isCompactionSynthesis = state.requestShape?.isCompactionSynthesis === true
           this.channel.startTurn({
             turnId: ev.messageId,
             role: 'assistant',
             source,
             confidence,
+            ...(isCompactionSynthesis ? { isCompactionSynthesis: true } : {}),
           })
           state.turnStarted = true
 
@@ -1442,7 +1476,16 @@ export class ClaudeProxyAdapter {
       return null
     }
 
-    return { maxTokens, messageCount, systemPrefixes }
+    // Older addons (pre-2026-05-11) don't emit `compaction_synthesis`,
+    // so coerce a missing value to `false` rather than letting it
+    // propagate as undefined. Conservative default — if we're wrong
+    // and this WAS a compaction turn, the worst case is the legacy
+    // behaviour where the raw <analysis>/<summary> XML leaks; an
+    // incorrect `true` would hide a real turn behind the placeholder.
+    const rawCompaction = obj.compaction_synthesis
+    const isCompactionSynthesis = rawCompaction === true
+
+    return { maxTokens, messageCount, systemPrefixes, isCompactionSynthesis }
   }
 
   /** Decode and minimally parse the addon-supplied request body so the
@@ -1504,7 +1547,34 @@ export class ClaudeProxyAdapter {
       }
     }
 
-    return { maxTokens, messageCount, systemPrefixes }
+    // Compaction sniff for the legacy body_b64 path. Mirrors
+    // `_detect_compaction_synthesis` in mitmAddon.py — kept in sync
+    // by hand because this code path only runs against older addons
+    // that don't pre-extract the flag. The fixed signature phrase is
+    // the same one written into the addon's `_COMPACT_PROMPT_SIGNATURE_RE`;
+    // see the comment there for the source-of-truth rationale.
+    let isCompactionSynthesis = false
+    if (messages && messages.length > 0) {
+      const last = messages[messages.length - 1] as
+        | { role?: string; content?: unknown }
+        | undefined
+      if (last && last.role === 'user') {
+        let probe: string | null = null
+        if (typeof last.content === 'string') {
+          probe = last.content.slice(0, 400)
+        } else if (Array.isArray(last.content) && last.content.length > 0) {
+          const first = last.content[0] as { text?: unknown } | null | undefined
+          if (first && typeof first.text === 'string') {
+            probe = first.text.slice(0, 400)
+          }
+        }
+        if (probe) {
+          isCompactionSynthesis = probe.includes('Your task is to create a detailed summary')
+        }
+      }
+    }
+
+    return { maxTokens, messageCount, systemPrefixes, isCompactionSynthesis }
   }
 
   /** Whether the given flow looks like a sidecar (auxiliary) call rather
