@@ -372,6 +372,47 @@ export class HeadlessTerminal extends EventEmitter {
   }
 
   // ---------------------------------------------------------------------------
+  //
+  // KNOWN ISSUE: the 'screen' event can stall under synchronized output
+  //
+  // Claude's TUI uses the synchronized-output protocol heavily — every
+  // composer redraw is wrapped in `\x1b[?2026h … \x1b[?2026l` so the
+  // terminal renders the new frame atomically. `@xterm/headless` parses
+  // those sequences correctly into the buffer, but its `write(data, cb)`
+  // callback timing is influenced by them: under sustained sync-output
+  // pressure the per-chunk callbacks can land in a way that leaves
+  // `pendingWrites` > 0 indefinitely, so `scheduleFlush()` is never
+  // re-armed and consumers stop receiving 'screen' events even though
+  // the buffer is being updated correctly.
+  //
+  // We discovered this building the paste-submit reproduction harness
+  // at cc-shell's `vendor/in_progress/paste-submit-repro/`. The
+  // harness's PTY trace showed Claude continuously emitting render
+  // chunks, the buffer contained the up-to-date input box (verified by
+  // polling `snapshotPlain()` directly), yet the 'screen' listener
+  // went silent after the cold-boot banner. Polling on a wall-clock
+  // interval gave us the same data this event was supposed to surface,
+  // without the stall.
+  //
+  // What this means for consumers:
+  //   * If you only need a periodic snapshot for diagnostics or
+  //     parsing, prefer a fixed-interval poll of `snapshotPlain()` /
+  //     `snapshotMarkdown()` over subscribing to 'screen'. The poll is
+  //     cheap (synchronous read from the xterm buffer) and is the same
+  //     approach cc-shell's in-app HTML Debug Panel uses.
+  //   * If you DO subscribe to 'screen' for low-latency reaction
+  //     (e.g. waiting for `[Pasted text #N]` before sending submit),
+  //     you MUST also have a wall-clock timeout fallback because the
+  //     event may never fire in this session.
+  //
+  // A real fix would be either: drop the pendingWrites counter and
+  // schedule a flush on every `pty.onData` (cheap, more events but no
+  // stalls); or replace the @xterm/headless callback mechanism with
+  // our own write→parse barrier. Neither change is in scope for the
+  // current paste-submit work; this comment exists so the next person
+  // who notices the stall doesn't re-rediscover the bug from scratch.
+  //
+  // ---------------------------------------------------------------------------
 
   private scheduleFlush(): void {
     if (this.flushPending) return
