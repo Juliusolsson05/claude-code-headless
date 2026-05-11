@@ -204,7 +204,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private readonly resumeSessionId: string | null
   private stopJsonlTail: (() => Promise<void>) | null = null
   private lastActivity: string | null = null
-  // Debounce timer for idle.
+  // Debounce timer for `idle`.
   //
   // CC redraws the spinner cell every frame, but in practice there are
   // *long* windows (multi-second) where the spinner row is replaced by
@@ -213,7 +213,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
   // returns null even though CC is clearly still working. With the
   // previous 250ms threshold the indicator flashed green for a
   // quarter-second per turn and snapped back to "idle" almost
-  // immediately. The user reports this directly: "it sometimes flashes
+  // immediately. The user reported this directly: "it sometimes flashes
   // green for a quarter of a second, then it goes back to inactive."
   //
   // 2500ms is empirically wide enough to bridge the longest spinner
@@ -221,6 +221,42 @@ export class ClaudeCodeHeadless extends EventEmitter {
   // cycles ~1.5s), without introducing perceptible lag at the end of a
   // turn — the user finishes reading the assistant block before the
   // green pip drops.
+  //
+  // ---------------------------------------------------------------------------
+  // FALSE NEGATIVES WHEN USED AS A "DID THIS SUBMIT?" SIGNAL
+  // ---------------------------------------------------------------------------
+  //
+  // Do NOT use the `'activity'` event as a binary verdict for "did
+  // Claude accept and start processing my submit?" The 2500ms debounce
+  // makes flashing less painful, but it does NOT make the underlying
+  // SPINNER_VERB_RE walk reliable: there are real windows in the TUI
+  // where the spinner row is wholly replaced (Bash() preview, tool
+  // result chrome) and the regex returns null mid-turn.
+  //
+  // We learned this the hard way while building the paste-submit
+  // reproduction harness at cc-shell's
+  // `vendor/in_progress/paste-submit-repro/`. With the verdict logic
+  // gated on "did `'activity'` fire after `\r`?", scenarios 01 and 04
+  // both landed on exactly 8/10 at N=10. Iteration positions where
+  // the verdict said FAIL were indistinguishable from PASS by every
+  // other signal — Claude HAD submitted, the composer HAD cleared, a
+  // JSONL entry landed shortly after — but the spinner row at the
+  // moment we sampled showed a transient header, the regex matched
+  // nothing, and `'activity'` never fired for that window. Switching
+  // the verdict to "did the `[Pasted text #N]` placeholder clear from
+  // the composer?" pushed both scenarios to 10/10.
+  //
+  // If you need to verify a submit succeeded, prefer one of:
+  //   * "the composer's `[Pasted text #N]` placeholder is gone" —
+  //     reliable, screen-truth; what cc-shell's harness ended up using
+  //   * "a new JSONL assistant entry appeared on the committed
+  //     channel" — authoritative, but lags submit by several seconds
+  //   * any combination of the above — "submit succeeded if EITHER
+  //     screen cleared OR committed channel saw an entry" is the
+  //     forgiving combination for UX features that just need a coarse
+  //     "are we working now?" signal
+  //
+  // ---------------------------------------------------------------------------
   private idleDebounceTimer: ReturnType<typeof setTimeout> | null = null
   private trustDialogState: TrustDialogState = { visible: false }
   private lastTrustKey: string | null = null
@@ -1166,6 +1202,81 @@ export class ClaudeCodeHeadless extends EventEmitter {
     } else {
       this.write(text + '\r')
     }
+  }
+
+  /**
+   * Poll the live screen snapshot for Claude's `[Pasted text #N]`
+   * placeholder. Resolves as soon as the placeholder is visible, or
+   * after `timeoutMs` if it never materializes.
+   *
+   * WHY this method exists:
+   *   The paste-submit-repro harness at cc-shell's
+   *   `vendor/in_progress/paste-submit-repro/` characterized the
+   *   "paste-then-Enter sometimes does nothing" bug as follows:
+   *   Claude's TUI runs a paste accumulator between
+   *   `\x1b[200~`...`\x1b[201~` markers; an Enter that arrives BEFORE
+   *   the accumulator commits is absorbed as more paste content
+   *   instead of being treated as submit. The visible signal that
+   *   Claude has committed the paste is the `[Pasted text #N]`
+   *   placeholder appearing in the composer row.
+   *
+   *   cc-shell's production fix was a 125 ms wall-clock delay between
+   *   the paste payload and `\r`. The harness shows the window can
+   *   stretch past 1 s under load (scenario 03 with a 1000 ms delay
+   *   STILL races 2/3 of the time), so any wall-clock value is wrong
+   *   in kind, not in magnitude. Polling the visible placeholder is
+   *   load-independent.
+   *
+   * WHY a timeout fallback is mandatory:
+   *   Claude's future UI revisions could rename the placeholder,
+   *   change its format, or remove it entirely. Without a bound the
+   *   caller would hang forever. 2000 ms is ~10x the observed
+   *   maximum wait in the harness sample (~100 ms p95) — large
+   *   enough that a real placeholder appearance always wins, small
+   *   enough that the timeout-fallback path doesn't make a real
+   *   submit feel laggy.
+   *
+   * WHY 10 ms polling:
+   *   The harness measured placeholder appearances at p50 ~50 ms and
+   *   p95 ~108 ms. 10 ms keeps the worst-case latency between
+   *   placeholder appearance and our resolution under one frame.
+   *
+   * WHY this lives on the headless class:
+   *   `snapshotPlain()` is a synchronous read from the in-process
+   *   xterm buffer. Polling it from the consumer (cc-shell renderer)
+   *   would require an IPC round trip every 10 ms — 100 IPC messages
+   *   per second to avoid a single race. Doing the poll in-process
+   *   reduces the cost to one IPC after the placeholder is visible.
+   *
+   * KNOWN CAVEAT — see the comment block above `scheduleFlush` in
+   * `terminal/HeadlessTerminal.ts`: under heavy synchronized-output
+   * pressure, the package's `'screen'` event can stall. THIS METHOD
+   * SIDESTEPS THAT BUG by polling `snapshotPlain()` directly, which
+   * reads the live xterm buffer regardless of whether `'screen'`
+   * fires. Do not refactor to subscribe to `'screen'` — it would
+   * reintroduce the stall.
+   */
+  awaitPastePlaceholder(
+    opts: { timeoutMs?: number; pollIntervalMs?: number } = {},
+  ): Promise<{ kind: 'appeared'; waitedMs: number } | { kind: 'timeout' }> {
+    const timeoutMs = opts.timeoutMs ?? 2_000
+    const pollIntervalMs = opts.pollIntervalMs ?? 10
+    const startedAt = Date.now()
+    return new Promise(resolve => {
+      const tick = (): void => {
+        const plain = this.terminal.snapshotPlain()
+        if (/\[Pasted text #\d+/.test(plain)) {
+          resolve({ kind: 'appeared', waitedMs: Date.now() - startedAt })
+          return
+        }
+        if (Date.now() - startedAt >= timeoutMs) {
+          resolve({ kind: 'timeout' })
+          return
+        }
+        setTimeout(tick, pollIntervalMs)
+      }
+      tick()
+    })
   }
 
   /** Resize both the PTY and the headless terminal. */
