@@ -162,6 +162,20 @@ export type SemanticTurnStartedEvent = {
   source: SemanticSource
   confidence: SemanticConfidence
   ts: number
+  /** True when this assistant turn is Claude Code's compaction
+   *  synthesis call — the model is being asked to produce a summary
+   *  of the prior conversation, and its response will be
+   *  `<analysis>…</analysis><summary>…</summary>` XML rather than
+   *  user-visible text. Set by the proxy adapter when the request-shape
+   *  sniff in the mitm addon detected the compact-prompt signature on
+   *  the last user message. Renderers should show a "Compacting…"
+   *  placeholder instead of streaming the raw XML body — the actual
+   *  summary text reaches the JSONL as a `type: 'user',
+   *  isCompactSummary: true` entry later, which the renderer already
+   *  knows how to display via `CompactSummaryRow`. Optional and
+   *  defaulted-false so older proxy adapters / non-Claude sources
+   *  don't have to opt in. */
+  isCompactionSynthesis?: boolean
 }
 
 export type SemanticTurnDeltaEvent = {
