@@ -261,7 +261,7 @@ function caseRealSonnetPasses(): void {
     flowId: 'sonnet-conv-flow',
     messageId: 'msg_sonnet_conv_001',
     model: 'claude-sonnet-4-6',
-    text: 'cc-shell is an Electron app.',
+    text: 'Agent Code is an Electron app.',
   })
 
   assert(
@@ -276,7 +276,7 @@ function caseRealSonnetPasses(): void {
   )
   assert(
     'block_completed text matches what the model produced',
-    cap.blockCompletedTexts.includes('cc-shell is an Electron app.'),
+    cap.blockCompletedTexts.includes('Agent Code is an Electron app.'),
     `got block texts: ${JSON.stringify(cap.blockCompletedTexts)}`,
   )
 }
@@ -347,7 +347,7 @@ function caseSequentialBundleReplay(): void {
     flowId: 'flow-real',
     messageId: 'msg_013XgVGm_real',
     model: 'claude-opus-4-7',
-    text: '**cc-shell** is an Electron-based agent-first editor.',
+    text: '**Agent Code** is an Electron-based agent-first editor.',
   })
 
   assert(

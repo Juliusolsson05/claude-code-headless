@@ -35,7 +35,7 @@ import { listSessionsForCwd, type SessionInfo } from './transcript/SessionList.j
 // `claude.semantic` if they only want JIT markdown rendering, or just
 // `claude.screen` if they are mirroring the PTY. The old flat
 // `'event' | 'screen' | 'activity' | …` surface still fires for
-// backwards compatibility with existing cc-shell consumers.
+// backwards compatibility with existing Agent Code consumers.
 import { CommittedChannel } from './channels/CommittedChannel.js'
 import { ScreenChannel } from './channels/ScreenChannel.js'
 import { SemanticChannel } from './channels/SemanticChannel.js'
@@ -174,7 +174,7 @@ export type ClaudeCodeHeadlessEvents = {
   // the owner. Diagnostic-only — consumers that render a
   // ProxyDebugPanel can subscribe to watch live-turn authority
   // change hands. NOT wired through the `event` union because the
-  // reducer in cc-shell doesn't need a new branch for this.
+  // reducer in Agent Code doesn't need a new branch for this.
   'live-owner-change': [LiveOwnerDecision]
 }
 
@@ -234,7 +234,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
   // result chrome) and the regex returns null mid-turn.
   //
   // We learned this the hard way while building the paste-submit
-  // reproduction harness at cc-shell's
+  // reproduction harness at Agent Code's
   // `vendor/in_progress/paste-submit-repro/`. With the verdict logic
   // gated on "did `'activity'` fire after `\r`?", scenarios 01 and 04
   // both landed on exactly 8/10 at N=10. Iteration positions where
@@ -248,7 +248,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
   //
   // If you need to verify a submit succeeded, prefer one of:
   //   * "the composer's `[Pasted text #N]` placeholder is gone" —
-  //     reliable, screen-truth; what cc-shell's harness ended up using
+  //     reliable, screen-truth; what Agent Code's harness ended up using
   //   * "a new JSONL assistant entry appeared on the committed
   //     channel" — authoritative, but lags submit by several seconds
   //   * any combination of the above — "submit succeeded if EITHER
@@ -273,7 +273,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
   //
   // These channels are the new public contract (see docs/channels).
   // They run IN ADDITION TO the existing flat event surface so we
-  // don't break cc-shell today. The split lets consumers treat live
+  // don't break Agent Code today. The split lets consumers treat live
   // semantic text, visible terminal state, and committed transcript
   // history as three independent streams instead of reverse-engineering
   // which is which from a blended event list.
@@ -297,10 +297,10 @@ export class ClaudeCodeHeadless extends EventEmitter {
    *  all screen-sourced startTurn/applyDelta/finishTurn calls here
    *  instead of onto `semantic`.
    *
-   *  The channel is public so the cc-shell debug panel and the
+   *  The channel is public so the Agent Code debug panel and the
    *  headless testing harness can still observe screen-fallback
    *  activity. The point is that the RENDERER does not subscribe to
-   *  this channel — cc-shell's assistant rendering path consumes only
+   *  this channel — Agent Code's assistant rendering path consumes only
    *  `semantic`, which means it will no longer see screen-derived
    *  content even when proxy is absent. That is deliberate: the user
    *  has explicitly accepted degraded live UX for Claude-without-
@@ -525,7 +525,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // Semantic fallback via the SHADOW channel.
       //
       // Screen-derived live text does NOT land on `this.semantic` —
-      // the cc-shell renderer subscribes to the authoritative
+      // the Agent Code renderer subscribes to the authoritative
       // channel and we do not want screen content driving assistant
       // rendering. See the class-level note on `semanticShadow` and
       // the 2026-04-18 redesign plan for the rule.
@@ -589,7 +589,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // are debounced (see idleDebounceTimer field) so a single
       // spinner-less snapshot between frames can't flip the UI.
       //
-      // Previously cc-shell also subscribed to a caffeinate-based
+      // Previously Agent Code also subscribed to a caffeinate-based
       // ProcessInspector, which either over-reported (idle sessions
       // still had caffeinate from parent shells) or under-reported
       // (CC didn't always spawn one for quick turns). We ripped it
@@ -1210,7 +1210,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
    * after `timeoutMs` if it never materializes.
    *
    * WHY this method exists:
-   *   The paste-submit-repro harness at cc-shell's
+   *   The paste-submit-repro harness at Agent Code's
    *   `vendor/in_progress/paste-submit-repro/` characterized the
    *   "paste-then-Enter sometimes does nothing" bug as follows:
    *   Claude's TUI runs a paste accumulator between
@@ -1220,7 +1220,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
    *   Claude has committed the paste is the `[Pasted text #N]`
    *   placeholder appearing in the composer row.
    *
-   *   cc-shell's production fix was a 125 ms wall-clock delay between
+   *   Agent Code's production fix was a 125 ms wall-clock delay between
    *   the paste payload and `\r`. The harness shows the window can
    *   stretch past 1 s under load (scenario 03 with a 1000 ms delay
    *   STILL races 2/3 of the time), so any wall-clock value is wrong
@@ -1243,7 +1243,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
    *
    * WHY this lives on the headless class:
    *   `snapshotPlain()` is a synchronous read from the in-process
-   *   xterm buffer. Polling it from the consumer (cc-shell renderer)
+   *   xterm buffer. Polling it from the consumer (Agent Code renderer)
    *   would require an IPC round trip every 10 ms — 100 IPC messages
    *   per second to avoid a single race. Doing the poll in-process
    *   reduces the cost to one IPC after the placeholder is visible.

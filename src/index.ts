@@ -119,7 +119,7 @@ export {
 // Subscribe to `claude.semantic`, `claude.screen`, and
 // `claude.committed` on a ClaudeCodeHeadless instance for the new
 // split surface. The old flat `'event' | 'screen' | …` events still
-// fire so existing cc-shell consumers keep working while they migrate.
+// fire so existing Agent Code consumers keep working while they migrate.
 export {
   SemanticChannel,
   type SemanticChannelEvents,
@@ -135,7 +135,7 @@ export {
 // NOTE: the top-level `ScreenEvent` below (from channels/types) is
 // exported under an alias — the legacy flat-surface `ScreenEvent`
 // exported by ClaudeCodeHeadless.ts already occupies that name for
-// existing cc-shell consumers. Alias keeps both surfaces co-existing
+// existing Agent Code consumers. Alias keeps both surfaces co-existing
 // until the legacy name is deprecated.
 export type {
   // Turn-level aggregate (backward compatible)
@@ -210,7 +210,7 @@ export {
 //
 // This is the runtime that spawns `mitmdump` and surfaces its addon
 // events over a JSONL file. Used end-to-end by the proxy-testing
-// harness and by downstream apps (cc-shell) that want a production
+// harness and by downstream apps (Agent Code) that want a production
 // proxy-driven session. Marked experimental because mitmproxy is an
 // external dependency the caller must have installed; see
 // `bootstrapProxyRuntime` for a convenience installer.

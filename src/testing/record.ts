@@ -7,14 +7,16 @@
  *
  * Usage:
  *   npx tsx src/testing/record.ts                       # interactive
- *   CC_SHELL_SCRIPT=src/testing/scripts/hello.json \    # scripted
+ *   CLAUDE_HEADLESS_SCRIPT=src/testing/scripts/hello.json \ # scripted
  *     npx tsx src/testing/record.ts
  *
  * Env vars:
- *   CC_SHELL_CWD           — override working directory
- *   CC_SHELL_CLAUDE_BINARY — override binary (default: `claude`)
- *   CC_SHELL_SCRIPT        — path to a JSON script for headless mode
- *   CC_SHELL_RESUME_FIXTURE — path to a JSONL fixture to resume from
+ *   CLAUDE_HEADLESS_CWD            — override working directory
+ *   CLAUDE_HEADLESS_BINARY         — override binary (default: `claude`)
+ *   CLAUDE_HEADLESS_SCRIPT         — path to a JSON script for headless mode
+ *   CLAUDE_HEADLESS_RESUME_FIXTURE — path to a JSONL fixture to resume from
+ *
+ * The old CC_SHELL_* names are still accepted as compatibility aliases.
  *
  * Outputs:
  *   recordings/<ts>/meta.json
@@ -55,17 +57,21 @@ async function loadScript(path: string): Promise<Script> {
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
 async function main(): Promise<void> {
-  const scriptPath = process.env.CC_SHELL_SCRIPT
+  const scriptPath = process.env.CLAUDE_HEADLESS_SCRIPT ?? process.env.CC_SHELL_SCRIPT
   const scripted = !!scriptPath
   const script: Script | null = scripted ? await loadScript(scriptPath!) : null
-  const resumeFixture = process.env.CC_SHELL_RESUME_FIXTURE || null
+  const resumeFixture = process.env.CLAUDE_HEADLESS_RESUME_FIXTURE
+    ?? process.env.CC_SHELL_RESUME_FIXTURE
+    ?? null
 
   const ts = new Date().toISOString().replace(/[:.]/g, '-')
   const recordingDir = join('recordings', ts)
   await mkdir(recordingDir, { recursive: true })
 
-  const cwd = process.env.CC_SHELL_CWD || process.cwd()
-  const binary = process.env.CC_SHELL_CLAUDE_BINARY || 'claude'
+  const cwd = process.env.CLAUDE_HEADLESS_CWD ?? process.env.CC_SHELL_CWD ?? process.cwd()
+  const binary = process.env.CLAUDE_HEADLESS_BINARY
+    ?? process.env.CC_SHELL_CLAUDE_BINARY
+    ?? 'claude'
   const cols = process.stdout.columns ?? 120
   const rows = process.stdout.rows ?? 40
 

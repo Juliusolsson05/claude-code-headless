@@ -386,7 +386,7 @@ export class HeadlessTerminal extends EventEmitter {
   // the buffer is being updated correctly.
   //
   // We discovered this building the paste-submit reproduction harness
-  // at cc-shell's `vendor/in_progress/paste-submit-repro/`. The
+  // at Agent Code's `vendor/in_progress/paste-submit-repro/`. The
   // harness's PTY trace showed Claude continuously emitting render
   // chunks, the buffer contained the up-to-date input box (verified by
   // polling `snapshotPlain()` directly), yet the 'screen' listener
@@ -399,7 +399,7 @@ export class HeadlessTerminal extends EventEmitter {
   //     parsing, prefer a fixed-interval poll of `snapshotPlain()` /
   //     `snapshotMarkdown()` over subscribing to 'screen'. The poll is
   //     cheap (synchronous read from the xterm buffer) and is the same
-  //     approach cc-shell's in-app HTML Debug Panel uses.
+  //     approach Agent Code's in-app HTML Debug Panel uses.
   //   * If you DO subscribe to 'screen' for low-latency reaction
   //     (e.g. waiting for `[Pasted text #N]` before sending submit),
   //     you MUST also have a wall-clock timeout fallback because the
