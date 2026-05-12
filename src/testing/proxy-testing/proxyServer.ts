@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events'
 import { access, mkdir, readFile, writeFile } from 'fs/promises'
 import { constants as fsConstants } from 'fs'
-import { homedir, tmpdir } from 'os'
+import { tmpdir } from 'os'
 import { dirname, join, resolve } from 'path'
 import { spawn, type ChildProcess } from 'child_process'
 
@@ -30,6 +30,27 @@ export type CreateProxyServerOptions = {
   /** Explicit root for ad-hoc experiments. When set, createProxyServer
    *  behaves like the old implementation and writes under this path. */
   baseDir?: string
+  /** Host-owned root for generated proxy runtime folders.
+   *
+   *  WHY this is an option instead of a package constant:
+   *    This package is intended to be embeddable outside any one app. The
+   *    caller owns retention, disk quotas, backups, and "where does app
+   *    state live on this OS?" decisions. The headless package only needs
+   *    a writable root so it can produce logs and mitmproxy state. */
+  storageRoot?: string
+  /** Exact runtime directory. Useful for tests or callers that already
+   *  allocated a per-session debug folder. */
+  runDir?: string
+  /** Exact mitmproxy confdir. Callers should use this when several proxy
+   *  instances need to share one CA across sessions. */
+  confDir?: string
+  /** Exact JSONL file for captured proxy events. If omitted, a
+   *  `proxy-events.jsonl` file is created inside the runtime directory. */
+  eventsFile?: string
+  /** Exact mitmdump executable path. */
+  mitmDumpPath?: string
+  /** Exact mitmproxy addon path. */
+  addonPath?: string
   /** Human-facing project identity for app-owned storage layout. */
   cwd?: string
   /** Stable label such as a resumed conversation id or the shell
@@ -83,7 +104,7 @@ export class ProxyServer extends EventEmitter {
 
     // WHY a missing shared CA is a critical section:
     //
-    // cc-shell often restores several Claude panes at once. If the shared
+    // Agent Code often restores several Claude panes at once. If the shared
     // mitmproxy confdir has just been deleted as part of a debug-storage
     // cleanup, every restored pane can start `mitmdump` in the same second.
     // mitmproxy lazily creates its CA on startup, so concurrent first starts
@@ -95,7 +116,7 @@ export class ProxyServer extends EventEmitter {
     //   "SSL certificate verification failed. Check your proxy..."
     //
     // Serialising only the bootstrap case keeps normal proxy startup cheap
-    // while making "delete ~/.config/cc-shell/proxy and restore many panes"
+    // while making "delete the app proxy cache and restore many panes"
     // deterministic. Once the CA file exists, later proxies can safely start
     // in parallel because they all read the same persisted CA material.
     if (!caAlreadyExists) {
@@ -284,10 +305,11 @@ export async function createProxyServer(
   const workDir = await createWorkDir(opts)
   const confDir = await resolveConfDir(opts, workDir)
   await mkdir(confDir, { recursive: true })
-  const mitmDumpPath = await resolveMitmDumpPath(opts.baseDir)
-  const addonPath = await resolveAddonPath()
+  const mitmDumpPath = await resolveMitmDumpPath(opts)
+  const addonPath = await resolveAddonPath(opts)
   const proxyPort = await getFreePort()
-  const eventsFile = join(workDir, 'proxy-events.jsonl')
+  const eventsFile = opts.eventsFile ? resolve(opts.eventsFile) : join(workDir, 'proxy-events.jsonl')
+  await mkdir(dirname(eventsFile), { recursive: true })
   const proxyUrl = `http://127.0.0.1:${proxyPort}`
   const caCertPath = join(confDir, 'mitmproxy-ca-cert.pem')
 
@@ -307,7 +329,16 @@ async function resolveConfDir(
   options: CreateProxyServerOptions,
   workDir: string,
 ): Promise<string> {
+  if (options.confDir) {
+    return resolve(options.confDir)
+  }
   if (options.baseDir) {
+    return join(workDir, 'mitmproxy-conf')
+  }
+  if (options.storageRoot) {
+    return join(resolve(options.storageRoot), '_shared-conf')
+  }
+  if (options.runDir || options.eventsFile) {
     return join(workDir, 'mitmproxy-conf')
   }
   // App sessions should share one stable mitmproxy CA/config.
@@ -317,10 +348,17 @@ async function resolveConfDir(
   // also turns any mitmdump startup hiccup into a "proxy startup
   // failed" timeout. Keep per-run logs in `workDir`, but reuse one
   // shared confdir for the CA material itself.
-  return join(homedir(), '.config', 'cc-shell', 'proxy', '_shared-conf')
+  // WHY tmpdir and not a branded app path:
+  //   A library default must not claim a host application's storage namespace.
+  //   Production embedders should pass `storageRoot`/`confDir`; this fallback
+  //   keeps standalone tests usable without coupling the package to a host app.
+  return join(defaultStorageRoot(), '_shared-conf')
 }
 
-async function resolveAddonPath(): Promise<string> {
+async function resolveAddonPath(options: CreateProxyServerOptions): Promise<string> {
+  if (options.addonPath) {
+    return resolve(options.addonPath)
+  }
   const here = dirname(new URL(import.meta.url).pathname)
   const candidates = [
     join(here, 'mitmAddon.py'),
@@ -358,8 +396,12 @@ async function createWorkDir(options: CreateProxyServerOptions): Promise<string>
   let root: string
   let dir: string
 
-  if (options.baseDir) {
-    root = options.baseDir
+  if (options.runDir) {
+    dir = resolve(options.runDir)
+  } else if (options.eventsFile) {
+    dir = dirname(resolve(options.eventsFile))
+  } else if (options.baseDir) {
+    root = resolve(options.baseDir)
     dir = join(root, timestamp)
   } else {
     // WHY default to hidden app state instead of cwd / tmp:
@@ -368,14 +410,16 @@ async function createWorkDir(options: CreateProxyServerOptions): Promise<string>
     // debugging artifacts that are operationally useful but absolutely not
     // project files. Letting the caller's cwd become the storage root made
     // normal app usage spray timestamped folders into the user's repo. The
-    // app-facing default is therefore a conventional hidden state location:
-    //   ~/.config/cc-shell/proxy/<sanitized-cwd>/<session-key>/<timestamp>/
+    // app-facing shape is therefore "caller passes a storage root"; the
+    // package fallback is temp state so standalone harnesses work without
+    // accidentally imposing one app's filesystem convention on every embedder:
+    //   <storageRoot>/<sanitized-cwd>/<session-key>/<timestamp>/
     //
     // This mirrors the broader "session artifacts live in hidden state dirs"
     // convention used by Claude/Codex transcript storage, while keeping the
     // path readable enough to map back to the originating workspace +
     // session/conversation.
-    root = join(homedir(), '.config', 'cc-shell', 'proxy')
+    root = resolve(options.storageRoot ?? defaultStorageRoot())
     const cwdSegment = options.cwd
       ? sanitizeSegment(await canonicalizePath(options.cwd))
       : 'unknown-project'
@@ -403,29 +447,30 @@ async function createWorkDir(options: CreateProxyServerOptions): Promise<string>
   return dir
 }
 
-async function resolveMitmDumpPath(baseDir?: string): Promise<string> {
-  const envPath = process.env.CC_PROXY_TEST_MITMDUMP
+function defaultStorageRoot(): string {
+  return join(tmpdir(), 'claude-code-headless', 'proxy')
+}
+
+async function resolveMitmDumpPath(options: CreateProxyServerOptions): Promise<string> {
+  if (options.mitmDumpPath) {
+    return resolve(options.mitmDumpPath)
+  }
+  const envPath = process.env.CLAUDE_HEADLESS_MITMDUMP ?? process.env.CC_PROXY_TEST_MITMDUMP
   if (envPath) return envPath
 
   // Candidate lookup order:
-  //   1. explicit `baseDir` passed by the caller (the canonical path
-  //      when cc-shell is embedding this package).
+  //   1. explicit storage root/baseDir passed by the caller.
   //   2. `./.proxy-testing/venv/bin/mitmdump` under cwd — covers the
   //      case where this package is the process root (running the
   //      proxy harness directly via `npm run proxy-test-bootstrap`).
   //   3. `./packages/claude-code-headless/.proxy-testing/...` under
-  //      cwd — the cc-shell monorepo layout post tree-reshape
-  //      (Phase 5 moved the submodule from the repo root into
-  //      `packages/`). Keep this AHEAD of the pre-reshape candidate
-  //      so cc-shell checkouts find the binary without re-running
-  //      the bootstrap script.
+  //      cwd — monorepos that keep this package under packages/.
   //   4. `./claude-code-headless/.proxy-testing/...` under cwd — the
-  //      pre-reshape cc-shell layout. Kept for backwards compat with
-  //      any older checkouts still on a branch that hasn't merged
-  //      the monorepo reshape yet.
+  //      older sibling checkout layout.
   //   5+. homebrew / /usr/local fallback.
+  const callerRoot = options.baseDir ?? options.storageRoot
   const candidates = [
-    join(baseDir ?? process.cwd(), '.proxy-testing', 'venv', 'bin', 'mitmdump'),
+    join(callerRoot ?? process.cwd(), '.proxy-testing', 'venv', 'bin', 'mitmdump'),
     join(process.cwd(), '.proxy-testing', 'venv', 'bin', 'mitmdump'),
     join(process.cwd(), 'packages', 'claude-code-headless', '.proxy-testing', 'venv', 'bin', 'mitmdump'),
     join(process.cwd(), 'claude-code-headless', '.proxy-testing', 'venv', 'bin', 'mitmdump'),
@@ -441,7 +486,7 @@ async function resolveMitmDumpPath(baseDir?: string): Promise<string> {
     }
   }
   throw new Error(
-    'Unable to find mitmdump. Run `npm run proxy-test-bootstrap` first or set CC_PROXY_TEST_MITMDUMP.',
+    'Unable to find mitmdump. Run `npm run proxy-test-bootstrap` first or set CLAUDE_HEADLESS_MITMDUMP.',
   )
 }
 

@@ -81,7 +81,7 @@ export class CommittedChannel extends EventEmitter {
    *
    * The mapping lives HERE (not in the app) because "turn committed"
    * is a provider-level concept that should not be reinvented by every
-   * consumer. cc-shell used to compute this on its side, which caused
+   * consumer. Agent Code used to compute this on its side, which caused
    * subtle drift as Claude's transcript format evolved.
    */
   publishEntry(entry: Entry, file: string): void {

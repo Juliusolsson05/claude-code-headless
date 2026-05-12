@@ -282,7 +282,7 @@ def _extract_request_shape(content: bytes):
                                   parent process.
       * compaction_synthesis    — True when the last user message
                                   matches Claude Code's fixed compact
-                                  prompt preamble. Lets cc-shell tag
+                                  prompt preamble. Lets Agent Code tag
                                   the resulting turn at startTurn()
                                   time so the renderer can show a
                                   "Compacting…" placeholder instead of

@@ -437,7 +437,7 @@ const MAX_TOKENS_SIDECAR_THRESHOLD = 1024
 /** Companion to `MAX_TOKENS_SIDECAR_THRESHOLD`. Auxiliary calls are
  *  invoked with synthetic conversations that contain 1 or 2
  *  messages — a single user-role description, occasionally preceded
- *  by an assistant-role priming message. Real cc-shell conversations
+ *  by an assistant-role priming message. Real Agent Code conversations
  *  reach this count only on the very first turn, but they also
  *  always include cache-priming or attachment messages above the
  *  raw user input, so the realistic floor for a real turn is ≥ 4.

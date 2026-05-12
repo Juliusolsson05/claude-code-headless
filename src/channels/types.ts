@@ -608,7 +608,7 @@ export type SemanticFlowIgnoredEvent = {
 //
 // WHY this does NOT appear in the `SemanticEvent` union:
 //
-// The union is what cc-shell's reducer folds. Adding lifecycle
+// The union is what Agent Code's reducer folds. Adding lifecycle
 // violations to the reducer would force a renderer decision on what
 // to do with them, which is not where policy belongs today. Keeping
 // the event as a channel-only emission (`semantic.on('lifecycle_
@@ -644,7 +644,7 @@ export type SemanticLifecycleViolationEvent = {
 //
 // The minimal state the upstream Claude Code client tracks as `streamMode`
 // in `utils/messages.ts`' handleMessageFromStream. We emit it as a
-// first-class channel event so downstream renderers (cc-shell, future
+// first-class channel event so downstream renderers (Agent Code, future
 // consumers) don't have to re-fold the per-block event stream into a
 // phase label.
 //
@@ -654,7 +654,7 @@ export type SemanticLifecycleViolationEvent = {
 //   - `responding`   — a `text` / `connector_text` block is active.
 //   - `tool-input`   — a `tool_use` block is accumulating input_json_delta.
 //   - `tool-use`     — Claude Code's post-`message_stop` bucket. In
-//                      practice, the cc-shell UX renders this for the
+//                      practice, the Agent Code UX renders this for the
 //                      narrow window between `message_stop` and the first
 //                      tool_result; after `content_block_stop` on the last
 //                      tool_use block the adapter transitions to
@@ -662,7 +662,7 @@ export type SemanticLifecycleViolationEvent = {
 //                      is visually distinct from "Claude is thinking".
 //   - `awaiting-tool`— tool call completed input accumulation; waiting on
 //                      the tool runtime to return. Extension beyond Claude
-//                      Code's vocabulary because for cc-shell this is a
+//                      Code's vocabulary because for Agent Code this is a
 //                      dominant wall-clock phase, not a punctuation.
 //   - `idle`         — nothing in flight. Also the terminal state after a
 //                      successful `finishTurn` or an error.

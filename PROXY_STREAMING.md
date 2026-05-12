@@ -41,7 +41,7 @@ finished.
 ## Scope
 
 This document is specifically about proxy behavior for Claude Code as observed
-through the upstream Claude source included in the `cc-shell` workspace and the
+through the upstream Claude source included in the Agent Code workspace and the
 experimental work in `claude-code-headless`.
 
 Relevant upstream source areas:
