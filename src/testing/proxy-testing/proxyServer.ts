@@ -37,6 +37,35 @@ export type CreateProxyServerOptions = {
   sessionKey?: string
 }
 
+const caBootstrapLocks = new Map<string, Promise<void>>()
+
+async function canReadFile(path: string): Promise<boolean> {
+  try {
+    await access(path, fsConstants.R_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function withCaBootstrapLock(confDir: string, action: () => Promise<void>): Promise<void> {
+  const prior = caBootstrapLocks.get(confDir) ?? Promise.resolve()
+  const current = prior.catch(() => {
+    // The lock protects future callers from overlapping startup; it must not
+    // permanently poison the queue if an earlier mitmdump fails before writing
+    // the CA. The caller that failed still receives its original error from
+    // its own awaited promise, while the next caller gets a fresh attempt.
+  }).then(action)
+
+  caBootstrapLocks.set(confDir, current.finally(() => {
+    if (caBootstrapLocks.get(confDir) === current) {
+      caBootstrapLocks.delete(confDir)
+    }
+  }))
+
+  await current
+}
+
 export class ProxyServer extends EventEmitter {
   private child: ChildProcess | null = null
   private watcherTimer: ReturnType<typeof setInterval> | null = null
@@ -50,6 +79,34 @@ export class ProxyServer extends EventEmitter {
   }
 
   async start(): Promise<void> {
+    const caAlreadyExists = await canReadFile(this.info.caCertPath)
+
+    // WHY a missing shared CA is a critical section:
+    //
+    // cc-shell often restores several Claude panes at once. If the shared
+    // mitmproxy confdir has just been deleted as part of a debug-storage
+    // cleanup, every restored pane can start `mitmdump` in the same second.
+    // mitmproxy lazily creates its CA on startup, so concurrent first starts
+    // race through CA generation. The losing shape is nasty: one live proxy
+    // can keep an in-memory CA/cert pair while a different generated CA wins
+    // on disk. Claude then receives NODE_EXTRA_CA_CERTS pointing at the disk
+    // winner, connects through the live proxy using the in-memory loser, and
+    // reports:
+    //   "SSL certificate verification failed. Check your proxy..."
+    //
+    // Serialising only the bootstrap case keeps normal proxy startup cheap
+    // while making "delete ~/.config/cc-shell/proxy and restore many panes"
+    // deterministic. Once the CA file exists, later proxies can safely start
+    // in parallel because they all read the same persisted CA material.
+    if (!caAlreadyExists) {
+      await withCaBootstrapLock(this.info.confDir, () => this.startUnlocked())
+      return
+    }
+
+    await this.startUnlocked()
+  }
+
+  private async startUnlocked(): Promise<void> {
     const env = {
       ...process.env,
       MITMPROXY_SSLKEYLOGFILE: join(this.info.workDir, 'sslkeylog.log'),
