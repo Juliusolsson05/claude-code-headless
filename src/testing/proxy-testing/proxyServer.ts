@@ -4,6 +4,7 @@ import { constants as fsConstants } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join, resolve } from 'path'
 import { spawn, type ChildProcess } from 'child_process'
+import { fileURLToPath } from 'url'
 
 import { canonicalizePath, sanitizePath } from '../../transcript/ProjectDir.js'
 
@@ -78,11 +79,18 @@ async function withCaBootstrapLock(confDir: string, action: () => Promise<void>)
     // its own awaited promise, while the next caller gets a fresh attempt.
   }).then(action)
 
-  caBootstrapLocks.set(confDir, current.finally(() => {
+  // Store the same promise object we compare against in cleanup. A previous
+  // shape used `current.finally(...)` for storage and `=== current` for the
+  // identity check; those are two different Promise instances, so the entry
+  // never matched and never got deleted — a slow leak of resolved promises
+  // keyed by confDir. Now the map holds `current` directly and the .finally
+  // is attached separately for the cleanup side-effect.
+  caBootstrapLocks.set(confDir, current)
+  current.finally(() => {
     if (caBootstrapLocks.get(confDir) === current) {
       caBootstrapLocks.delete(confDir)
     }
-  }))
+  })
 
   await current
 }
@@ -100,31 +108,47 @@ export class ProxyServer extends EventEmitter {
   }
 
   async start(): Promise<void> {
-    const caAlreadyExists = await canReadFile(this.info.caCertPath)
+    try {
+      const caAlreadyExists = await canReadFile(this.info.caCertPath)
 
-    // WHY a missing shared CA is a critical section:
-    //
-    // Agent Code often restores several Claude panes at once. If the shared
-    // mitmproxy confdir has just been deleted as part of a debug-storage
-    // cleanup, every restored pane can start `mitmdump` in the same second.
-    // mitmproxy lazily creates its CA on startup, so concurrent first starts
-    // race through CA generation. The losing shape is nasty: one live proxy
-    // can keep an in-memory CA/cert pair while a different generated CA wins
-    // on disk. Claude then receives NODE_EXTRA_CA_CERTS pointing at the disk
-    // winner, connects through the live proxy using the in-memory loser, and
-    // reports:
-    //   "SSL certificate verification failed. Check your proxy..."
-    //
-    // Serialising only the bootstrap case keeps normal proxy startup cheap
-    // while making "delete the app proxy cache and restore many panes"
-    // deterministic. Once the CA file exists, later proxies can safely start
-    // in parallel because they all read the same persisted CA material.
-    if (!caAlreadyExists) {
-      await withCaBootstrapLock(this.info.confDir, () => this.startUnlocked())
-      return
+      // WHY a missing shared CA is a single-process critical section:
+      //
+      // Agent Code restores several Claude panes at once from a single Node
+      // main process — `createProxyServer` is invoked from `ClaudeSession` in
+      // the Electron main, so every concurrent pane shares this module's
+      // global state. If the shared mitmproxy confdir has just been deleted
+      // as part of a debug-storage cleanup, every restored pane can start
+      // `mitmdump` in the same second. mitmproxy lazily creates its CA on
+      // startup, so concurrent first starts race through CA generation. The
+      // losing shape is nasty: one live proxy can keep an in-memory CA/cert
+      // pair while a different generated CA wins on disk. Claude then
+      // receives NODE_EXTRA_CA_CERTS pointing at the disk winner, connects
+      // through the live proxy using the in-memory loser, and reports:
+      //   "SSL certificate verification failed. Check your proxy..."
+      //
+      // The serialization is therefore a module-scoped Promise queue, not a
+      // filesystem lock — that's intentional because the race we observe is
+      // intra-process. Multiple Agent Code app instances racing against the
+      // same confdir is not a scenario this guard covers (and it would have
+      // larger problems anyway, e.g. workspace.json contention). If the
+      // headless package ever grows a multi-process spawner that targets the
+      // same confdir, replace this with a real `mkdir`/`open('wx')`
+      // filesystem lock and recheck the CA inside it.
+      //
+      // Serialising only the bootstrap case keeps normal proxy startup cheap
+      // while making "delete the app proxy cache and restore many panes"
+      // deterministic. Once the CA file exists, later proxies can safely start
+      // in parallel because they all read the same persisted CA material.
+      if (!caAlreadyExists) {
+        await withCaBootstrapLock(this.info.confDir, () => this.startUnlocked())
+        return
+      }
+
+      await this.startUnlocked()
+    } catch (error) {
+      await this.writeStartupError(error)
+      throw error
     }
-
-    await this.startUnlocked()
   }
 
   private async startUnlocked(): Promise<void> {
@@ -250,6 +274,40 @@ export class ProxyServer extends EventEmitter {
     }
   }
 
+  private async writeStartupError(error: unknown): Promise<void> {
+    // WHY write a sidecar file instead of relying on stderr:
+    //
+    // The production Electron app is usually launched via Finder/open, so the
+    // main-process stderr stream is not something the user naturally has in a
+    // terminal scrollback. The renderer only receives a normalized spawn error
+    // and proxy event logs are not created when TLS fails before mitmproxy sees
+    // an HTTP request. This file sits beside `session-meta.json`, giving the
+    // app and future debugging agents a durable, per-session answer to "did the
+    // proxy fail to start, and what did mitmdump say?" without dumping request
+    // bodies or auth-bearing headers.
+    await writeFile(
+      join(this.info.workDir, 'startup-error.json'),
+      JSON.stringify(
+        {
+          createdAt: new Date().toISOString(),
+          message: error instanceof Error ? error.message : String(error),
+          mitmDumpPath: this.info.mitmDumpPath,
+          addonPath: this.info.addonPath,
+          confDir: this.info.confDir,
+          caCertPath: this.info.caCertPath,
+          stderrTail: this.stderrTail.join('').trim(),
+          childExitCode: this.childExitCode,
+          childExitSignal: this.childExitSignal,
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    ).catch(() => {
+      // Diagnostics must never mask the original startup failure.
+    })
+  }
+
   private startPollingEvents(): void {
     this.watcherTimer = setInterval(async () => {
       try {
@@ -303,26 +361,47 @@ export async function createProxyServer(
 ): Promise<ProxyServer> {
   const opts = typeof options === 'string' ? { baseDir: options } : (options ?? {})
   const workDir = await createWorkDir(opts)
-  const confDir = await resolveConfDir(opts, workDir)
-  await mkdir(confDir, { recursive: true })
-  const mitmDumpPath = await resolveMitmDumpPath(opts)
-  const addonPath = await resolveAddonPath(opts)
-  const proxyPort = await getFreePort()
-  const eventsFile = opts.eventsFile ? resolve(opts.eventsFile) : join(workDir, 'proxy-events.jsonl')
-  await mkdir(dirname(eventsFile), { recursive: true })
-  const proxyUrl = `http://127.0.0.1:${proxyPort}`
-  const caCertPath = join(confDir, 'mitmproxy-ca-cert.pem')
+  try {
+    const confDir = await resolveConfDir(opts, workDir)
+    await mkdir(confDir, { recursive: true })
+    const mitmDumpPath = await resolveMitmDumpPath(opts)
+    const addonPath = await resolveAddonPath(opts)
+    const proxyPort = await getFreePort()
+    const eventsFile = opts.eventsFile ? resolve(opts.eventsFile) : join(workDir, 'proxy-events.jsonl')
+    await mkdir(dirname(eventsFile), { recursive: true })
+    const proxyUrl = `http://127.0.0.1:${proxyPort}`
+    const caCertPath = join(confDir, 'mitmproxy-ca-cert.pem')
 
-  return new ProxyServer({
-    workDir,
-    confDir,
-    mitmDumpPath,
-    proxyPort,
-    proxyUrl,
-    addonPath,
-    eventsFile,
-    caCertPath,
-  })
+    return new ProxyServer({
+      workDir,
+      confDir,
+      mitmDumpPath,
+      proxyPort,
+      proxyUrl,
+      addonPath,
+      eventsFile,
+      caCertPath,
+    })
+  } catch (error) {
+    // Same durability rationale as ProxyServer.writeStartupError: failures in
+    // path discovery happen before a ProxyServer object exists, but they are
+    // exactly the packaged-app failures users cannot inspect from stdout.
+    await writeFile(
+      join(workDir, 'startup-error.json'),
+      JSON.stringify(
+        {
+          createdAt: new Date().toISOString(),
+          message: error instanceof Error ? error.message : String(error),
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    ).catch(() => {
+      // Preserve the original error.
+    })
+    throw error
+  }
 }
 
 async function resolveConfDir(
@@ -359,7 +438,17 @@ async function resolveAddonPath(options: CreateProxyServerOptions): Promise<stri
   if (options.addonPath) {
     return resolve(options.addonPath)
   }
-  const here = dirname(new URL(import.meta.url).pathname)
+  // WHY fileURLToPath and not `new URL(...).pathname`:
+  //
+  // Packaged Electron apps routinely live in paths with spaces, for example
+  // `/Applications/Agent Code.app/...`. URL.pathname keeps those bytes escaped
+  // as `%20`, so the old resolver looked for
+  // `/Applications/Agent%20Code.app/.../mitmAddon.py` and failed even though
+  // electron-builder had correctly unpacked the addon beside app.asar. This is
+  // exactly the kind of packaged-only failure that makes dev mode look healthy
+  // while Finder-launched builds cannot start Claude proxy. fileURLToPath is
+  // Node's canonical conversion from module URL to real filesystem path.
+  const here = dirname(fileURLToPath(import.meta.url))
   const candidates = [
     join(here, 'mitmAddon.py'),
     resolve(here, '../../../src/testing/proxy-testing/mitmAddon.py'),

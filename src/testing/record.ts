@@ -16,8 +16,6 @@
  *   CLAUDE_HEADLESS_SCRIPT         — path to a JSON script for headless mode
  *   CLAUDE_HEADLESS_RESUME_FIXTURE — path to a JSONL fixture to resume from
  *
- * The old CC_SHELL_* names are still accepted as compatibility aliases.
- *
  * Outputs:
  *   recordings/<ts>/meta.json
  *   recordings/<ts>/raw.txt
@@ -57,21 +55,21 @@ async function loadScript(path: string): Promise<Script> {
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
 async function main(): Promise<void> {
-  const scriptPath = process.env.CLAUDE_HEADLESS_SCRIPT ?? process.env.CC_SHELL_SCRIPT
+  const scriptPath = process.env.CLAUDE_HEADLESS_SCRIPT
   const scripted = !!scriptPath
   const script: Script | null = scripted ? await loadScript(scriptPath!) : null
-  const resumeFixture = process.env.CLAUDE_HEADLESS_RESUME_FIXTURE
-    ?? process.env.CC_SHELL_RESUME_FIXTURE
-    ?? null
+  const resumeFixture = process.env.CLAUDE_HEADLESS_RESUME_FIXTURE ?? null
 
   const ts = new Date().toISOString().replace(/[:.]/g, '-')
   const recordingDir = join('recordings', ts)
   await mkdir(recordingDir, { recursive: true })
 
-  const cwd = process.env.CLAUDE_HEADLESS_CWD ?? process.env.CC_SHELL_CWD ?? process.cwd()
-  const binary = process.env.CLAUDE_HEADLESS_BINARY
-    ?? process.env.CC_SHELL_CLAUDE_BINARY
-    ?? 'claude'
+  // These recording scripts are developer tooling, not user data migration
+  // code. After the compatibility-removal PR, accepting retired env names here
+  // would keep a hidden behavior surface alive and make fixtures depend on
+  // whatever aliases happen to be exported in the caller's shell.
+  const cwd = process.env.CLAUDE_HEADLESS_CWD ?? process.cwd()
+  const binary = process.env.CLAUDE_HEADLESS_BINARY ?? 'claude'
   const cols = process.stdout.columns ?? 120
   const rows = process.stdout.rows ?? 40
 
