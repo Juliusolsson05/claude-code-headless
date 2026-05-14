@@ -162,14 +162,10 @@ export class CommittedChannel extends EventEmitter {
       // the wrong turnId is only a reconciliation hint, not a
       // correctness issue.
       if (entry.type === 'user' && Array.isArray(entry.message.content)) {
-        const parentEntry = entry as unknown as {
-          uuid: string
-          parentUuid?: string
-        }
         const parentTurnId =
-          typeof parentEntry.parentUuid === 'string' && parentEntry.parentUuid
-            ? parentEntry.parentUuid
-            : parentEntry.uuid
+          typeof entry.parentUuid === 'string' && entry.parentUuid
+            ? entry.parentUuid
+            : entry.uuid
         for (const block of entry.message.content) {
           if (block.type !== 'tool_result') continue
           const content =

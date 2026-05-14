@@ -7,8 +7,9 @@ import { spawn, type ChildProcess } from 'child_process'
 import { fileURLToPath } from 'url'
 
 import { canonicalizePath, sanitizePath } from '../transcript/ProjectDir.js'
+import type { ProxyTransportEvent } from './ClaudeProxyAdapter.js'
 
-export type ProxyCapturedEvent = Record<string, unknown>
+export type ProxyCapturedEvent = ProxyTransportEvent
 
 export type ProxyServerInfo = {
   workDir: string

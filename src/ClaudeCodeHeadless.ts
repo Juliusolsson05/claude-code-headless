@@ -25,7 +25,7 @@ import {
   tailSessionFile,
   type JsonlEntry,
 } from './transcript/JsonlTailer.js'
-import { isConversationEntry, type Entry } from './transcript/TranscriptTypes.js'
+import { type Entry, isConversationEntry } from './transcript/TranscriptTypes.js'
 import { getProjectDirForCwd } from './transcript/ProjectDir.js'
 import { listSessionsForCwd, type SessionInfo } from './transcript/SessionList.js'
 
@@ -1063,14 +1063,13 @@ export class ClaudeCodeHeadless extends EventEmitter {
     // finalising. That's the cleanest way to let late subscribers
     // see the authoritative text even though the live stream came
     // from the screen extractor.
-    const onJsonlEntry = (entry: JsonlEntry, filePath: string) => {
+    const onJsonlEntry = (entry: Entry, filePath: string) => {
       this.emit('jsonl-entry', entry, filePath)
       this.emit('event', {
         type: 'jsonl_entry', ts: Date.now(), entry, file: filePath,
       })
 
-      const typed = entry as unknown as Entry
-      this.committed.publishEntry(typed, filePath)
+      this.committed.publishEntry(entry, filePath)
 
       // Tool_result extraction used to happen here, bridging committed
       // results onto the SEMANTIC channel as a synthetic `tool_result`
@@ -1118,10 +1117,10 @@ export class ClaudeCodeHeadless extends EventEmitter {
       if (
         this.liveOwner.kind === 'screen' &&
         this.liveSemanticTurnId &&
-        isConversationEntry(typed) &&
-        typed.type === 'assistant'
+        isConversationEntry(entry) &&
+        entry.type === 'assistant'
       ) {
-        const msg = typed.message
+        const msg = entry.message
         let text = ''
         if (typeof msg.content === 'string') {
           text = msg.content
@@ -1159,7 +1158,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
 
     if (this.resumeSessionId) {
       const filePath = join(projectDir, `${this.resumeSessionId}.jsonl`)
-      const stop = tailSessionFile(
+      const stop = tailSessionFile<Entry>(
         filePath,
         (entry) => onJsonlEntry(entry, filePath),
         onJsonlError,
@@ -1169,7 +1168,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       )
       this.stopJsonlTail = stop
     } else {
-      this.stopJsonlTail = await tailNewSessionFile(
+      this.stopJsonlTail = await tailNewSessionFile<Entry>(
         projectDir,
         onJsonlEntry,
         onJsonlError,

@@ -473,6 +473,23 @@ const AUXILIARY_MESSAGE_COUNT_THRESHOLD = 3
 // streaming, which would corrupt the live feed for the user.
 const STALE_ACTIVE_FLOW_MS = 30_000
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function finiteNumberField(record: Record<string, unknown>, key: string): number | null {
+  const value = record[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function textFromUnknownBlock(value: unknown): string | null {
+  const block = asRecord(value)
+  const text = block?.text
+  return typeof text === 'string' && text.length > 0 ? text : null
+}
+
 // ---------------------------------------------------------------------------
 // Adapter.
 // ---------------------------------------------------------------------------
@@ -1448,16 +1465,11 @@ export class ClaudeProxyAdapter {
    *  rules mirror parseRequestBody: any malformed field collapses to
    *  null, never to a real-turn-looking value. */
   private normalizeRequestShape(raw: unknown): ParsedRequestShape | null {
-    if (!raw || typeof raw !== 'object') return null
-    const obj = raw as Record<string, unknown>
+    const obj = asRecord(raw)
+    if (!obj) return null
 
-    const rawMax = obj.max_tokens
-    const maxTokens =
-      typeof rawMax === 'number' && Number.isFinite(rawMax) ? rawMax : null
-
-    const rawCount = obj.message_count
-    const messageCount =
-      typeof rawCount === 'number' && Number.isFinite(rawCount) ? rawCount : null
+    const maxTokens = finiteNumberField(obj, 'max_tokens')
+    const messageCount = finiteNumberField(obj, 'message_count')
 
     // We trust the addon to have already capped each prefix at the
     // ~200-char window described in parseRequestBody; we only filter
@@ -1510,13 +1522,10 @@ export class ClaudeProxyAdapter {
     } catch {
       return null
     }
-    if (!json || typeof json !== 'object') return null
-    const obj = json as Record<string, unknown>
+    const obj = asRecord(json)
+    if (!obj) return null
 
-    const maxTokens =
-      typeof obj.max_tokens === 'number' && Number.isFinite(obj.max_tokens)
-        ? obj.max_tokens
-        : null
+    const maxTokens = finiteNumberField(obj, 'max_tokens')
 
     const messages = Array.isArray(obj.messages) ? obj.messages : null
     const messageCount = messages ? messages.length : null
@@ -1540,10 +1549,8 @@ export class ClaudeProxyAdapter {
       systemPrefixes.push(sys.slice(0, 200))
     } else if (Array.isArray(sys)) {
       for (const block of sys) {
-        const b = block as { type?: string; text?: string } | null | undefined
-        if (b && typeof b.text === 'string' && b.text.length > 0) {
-          systemPrefixes.push(b.text.slice(0, 200))
-        }
+        const text = textFromUnknownBlock(block)
+        if (text) systemPrefixes.push(text.slice(0, 200))
       }
     }
 
@@ -1555,18 +1562,14 @@ export class ClaudeProxyAdapter {
     // see the comment there for the source-of-truth rationale.
     let isCompactionSynthesis = false
     if (messages && messages.length > 0) {
-      const last = messages[messages.length - 1] as
-        | { role?: string; content?: unknown }
-        | undefined
-      if (last && last.role === 'user') {
+      const last = asRecord(messages[messages.length - 1])
+      if (last?.role === 'user') {
         let probe: string | null = null
         if (typeof last.content === 'string') {
           probe = last.content.slice(0, 400)
         } else if (Array.isArray(last.content) && last.content.length > 0) {
-          const first = last.content[0] as { text?: unknown } | null | undefined
-          if (first && typeof first.text === 'string') {
-            probe = first.text.slice(0, 400)
-          }
+          const firstText = textFromUnknownBlock(last.content[0])
+          if (firstText) probe = firstText.slice(0, 400)
         }
         if (probe) {
           isCompactionSynthesis = probe.includes('Your task is to create a detailed summary')
@@ -1950,10 +1953,9 @@ function tryParseJson(raw: string): {
 } {
   if (!raw) return { parsed: {} }
   try {
-    const v = JSON.parse(raw)
-    if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
-      return { parsed: v as Record<string, unknown> }
-    }
+    const value: unknown = JSON.parse(raw)
+    const parsed = asRecord(value)
+    if (parsed) return { parsed }
     return { parsed: undefined, parseError: 'tool input is not a JSON object' }
   } catch (err) {
     return {
@@ -1963,26 +1965,11 @@ function tryParseJson(raw: string): {
   }
 }
 
-/** Base64 → Uint8Array. Using Buffer when available so Node's
- *  native implementation wins; falling back to atob for browser/
- *  worker contexts. */
+/** Base64 → Uint8Array. This adapter is packaged for the Node-side
+ *  headless runtime, so use the imported Node Buffer directly instead
+ *  of probing `globalThis`. The old probe needed double-unknown casts
+ *  and implied a browser execution path that no longer exists for this
+ *  transport adapter. */
 function base64ToBytes(b64: string): Uint8Array {
-  if (
-    typeof globalThis !== 'undefined' &&
-    (globalThis as unknown as { Buffer?: { from(s: string, enc: string): Uint8Array } })
-      .Buffer
-  ) {
-    const Buf = (globalThis as unknown as {
-      Buffer: { from(s: string, enc: string): Uint8Array }
-    }).Buffer
-    return Buf.from(b64, 'base64')
-  }
-  // Browser path — atob yields a binary string; convert to Uint8Array.
-  const atobFn = (globalThis as unknown as { atob?: (s: string) => string })
-    .atob
-  if (!atobFn) throw new Error('no base64 decoder available')
-  const binary = atobFn(b64)
-  const out = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
-  return out
+  return Buffer.from(b64, 'base64')
 }
