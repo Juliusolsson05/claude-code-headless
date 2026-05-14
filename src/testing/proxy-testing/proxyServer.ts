@@ -79,11 +79,18 @@ async function withCaBootstrapLock(confDir: string, action: () => Promise<void>)
     // its own awaited promise, while the next caller gets a fresh attempt.
   }).then(action)
 
-  caBootstrapLocks.set(confDir, current.finally(() => {
+  // Store the same promise object we compare against in cleanup. A previous
+  // shape used `current.finally(...)` for storage and `=== current` for the
+  // identity check; those are two different Promise instances, so the entry
+  // never matched and never got deleted — a slow leak of resolved promises
+  // keyed by confDir. Now the map holds `current` directly and the .finally
+  // is attached separately for the cleanup side-effect.
+  caBootstrapLocks.set(confDir, current)
+  current.finally(() => {
     if (caBootstrapLocks.get(confDir) === current) {
       caBootstrapLocks.delete(confDir)
     }
-  }))
+  })
 
   await current
 }
@@ -104,18 +111,29 @@ export class ProxyServer extends EventEmitter {
     try {
       const caAlreadyExists = await canReadFile(this.info.caCertPath)
 
-      // WHY a missing shared CA is a critical section:
+      // WHY a missing shared CA is a single-process critical section:
       //
-      // Agent Code often restores several Claude panes at once. If the shared
-      // mitmproxy confdir has just been deleted as part of a debug-storage
-      // cleanup, every restored pane can start `mitmdump` in the same second.
-      // mitmproxy lazily creates its CA on startup, so concurrent first starts
-      // race through CA generation. The losing shape is nasty: one live proxy
-      // can keep an in-memory CA/cert pair while a different generated CA wins
-      // on disk. Claude then receives NODE_EXTRA_CA_CERTS pointing at the disk
-      // winner, connects through the live proxy using the in-memory loser, and
-      // reports:
+      // Agent Code restores several Claude panes at once from a single Node
+      // main process — `createProxyServer` is invoked from `ClaudeSession` in
+      // the Electron main, so every concurrent pane shares this module's
+      // global state. If the shared mitmproxy confdir has just been deleted
+      // as part of a debug-storage cleanup, every restored pane can start
+      // `mitmdump` in the same second. mitmproxy lazily creates its CA on
+      // startup, so concurrent first starts race through CA generation. The
+      // losing shape is nasty: one live proxy can keep an in-memory CA/cert
+      // pair while a different generated CA wins on disk. Claude then
+      // receives NODE_EXTRA_CA_CERTS pointing at the disk winner, connects
+      // through the live proxy using the in-memory loser, and reports:
       //   "SSL certificate verification failed. Check your proxy..."
+      //
+      // The serialization is therefore a module-scoped Promise queue, not a
+      // filesystem lock — that's intentional because the race we observe is
+      // intra-process. Multiple Agent Code app instances racing against the
+      // same confdir is not a scenario this guard covers (and it would have
+      // larger problems anyway, e.g. workspace.json contention). If the
+      // headless package ever grows a multi-process spawner that targets the
+      // same confdir, replace this with a real `mkdir`/`open('wx')`
+      // filesystem lock and recheck the CA inside it.
       //
       // Serialising only the bootstrap case keeps normal proxy startup cheap
       // while making "delete the app proxy cache and restore many panes"
