@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'path'
 import { spawn, type ChildProcess } from 'child_process'
 import { fileURLToPath } from 'url'
 
-import { canonicalizePath, sanitizePath } from '../../transcript/ProjectDir.js'
+import { canonicalizePath, sanitizePath } from '../transcript/ProjectDir.js'
 
 export type ProxyCapturedEvent = Record<string, unknown>
 
@@ -449,13 +449,18 @@ async function resolveAddonPath(options: CreateProxyServerOptions): Promise<stri
   // while Finder-launched builds cannot start Claude proxy. fileURLToPath is
   // Node's canonical conversion from module URL to real filesystem path.
   const here = dirname(fileURLToPath(import.meta.url))
+  // mitmAddon.py is shipped beside this file (src/proxy/ in source,
+  // dist/proxy/ after build — the package `build` script copies it
+  // there). Candidate 1 is the path that fires in dev and in the
+  // packaged app; the rest are defensive fallbacks for callers running
+  // from an unexpected cwd.
   const candidates = [
     join(here, 'mitmAddon.py'),
-    resolve(here, '../../../src/testing/proxy-testing/mitmAddon.py'),
-    resolve(here, '../../../../../packages/claude-code-headless/src/testing/proxy-testing/mitmAddon.py'),
-    resolve(process.cwd(), 'packages/claude-code-headless/src/testing/proxy-testing/mitmAddon.py'),
-    resolve(process.cwd(), 'packages/claude-code-headless/dist/testing/proxy-testing/mitmAddon.py'),
-    resolve(process.cwd(), 'claude-code-headless/src/testing/proxy-testing/mitmAddon.py'),
+    resolve(here, '../../src/proxy/mitmAddon.py'),
+    resolve(here, '../../../../packages/claude-code-headless/src/proxy/mitmAddon.py'),
+    resolve(process.cwd(), 'packages/claude-code-headless/src/proxy/mitmAddon.py'),
+    resolve(process.cwd(), 'packages/claude-code-headless/dist/proxy/mitmAddon.py'),
+    resolve(process.cwd(), 'claude-code-headless/src/proxy/mitmAddon.py'),
   ]
   for (const candidate of candidates) {
     const filesystemPath = unpackAsarPath(candidate)
@@ -466,7 +471,7 @@ async function resolveAddonPath(options: CreateProxyServerOptions): Promise<stri
       // try next
     }
   }
-  throw new Error('Unable to locate mitmAddon.py for proxy-testing')
+  throw new Error('Unable to locate mitmAddon.py')
 }
 
 function unpackAsarPath(path: string): string {

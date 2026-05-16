@@ -209,22 +209,20 @@ export {
 // --- Proxy runtime (mitmproxy launcher) ---
 //
 // This is the runtime that spawns `mitmdump` and surfaces its addon
-// events over a JSONL file. Used end-to-end by the proxy-testing
-// harness and by downstream apps (Agent Code) that want a production
-// proxy-driven session. Marked experimental because mitmproxy is an
-// external dependency the caller must have installed; see
-// `bootstrapProxyRuntime` for a convenience installer.
+// events over a JSONL file. Used by downstream apps (Agent Code) that
+// want a production proxy-driven session. The caller must have
+// mitmproxy installed — it is an external dependency, not bundled.
 export {
   ProxyServer,
   createProxyServer,
   type ProxyServerInfo,
   type ProxyServerEvents,
   type ProxyCapturedEvent,
-} from './testing/proxy-testing/proxyServer.js'
+} from './proxy/proxyServer.js'
 export {
   spawnClaudeWithProxy,
   type SpawnClaudeWithProxyOptions,
-} from './testing/proxy-testing/spawnClaudeWithProxy.js'
+} from './proxy/spawnClaudeWithProxy.js'
 
 export {
   parseAnthropicEventsFromSse,
