@@ -1,0 +1,12 @@
+{
+  "_comment": "Source of truth for the Claude Code CLI version this package has explicitly accepted as supported. The upstream-watch workflow compares npm's `latest` dist-tag against `accepted`; a human bumps `accepted` only after a compatibility review. Never edited by automation. See support/README.md.",
+  "providers": {
+    "claude": {
+      "label": "Claude Code",
+      "pkg": "@anthropic-ai/claude-code",
+      "changelog": "https://github.com/anthropics/claude-code/releases",
+      "accepted": "2.1.143",
+      "checkedAt": "2026-05-16"
+    }
+  }
+}
