@@ -271,9 +271,9 @@ export type JsonlEntry = Record<string, unknown>
  * Returns a stop() function that tears down both the directory watcher
  * and the file tailer.
  */
-export async function tailNewSessionFile(
+export async function tailNewSessionFile<T extends JsonlEntry = JsonlEntry>(
   projectDir: string,
-  onEntry: (entry: JsonlEntry, file: string) => void,
+  onEntry: (entry: T, file: string) => void,
   onError?: (err: Error) => void,
 ): Promise<() => Promise<void>> {
   // Ensure the directory exists. CC creates it on first write but we want
@@ -292,7 +292,7 @@ export async function tailNewSessionFile(
     onError?.(err as Error)
   }
 
-  let tailer: FileTailer<JsonlEntry> | null = null
+  let tailer: FileTailer<T> | null = null
 
   const dirWatcher = watch(projectDir, {
     persistent: true,
@@ -306,7 +306,7 @@ export async function tailNewSessionFile(
     if (!name.endsWith('.jsonl')) return
     if (existing.has(name)) return
     if (tailer) return // Already tailing the first new session file
-    tailer = new FileTailer<JsonlEntry>(
+    tailer = new FileTailer<T>(
       filePath,
       entry => onEntry(entry, filePath),
       onError,
@@ -325,15 +325,15 @@ export async function tailNewSessionFile(
  * Convenience for tailing a specific session file by absolute path
  * (when the file is already known).
  */
-export function tailSessionFile(
+export function tailSessionFile<T extends JsonlEntry = JsonlEntry>(
   filePath: string,
-  onEntry: (entry: JsonlEntry) => void,
+  onEntry: (entry: T) => void,
   onError?: (err: Error) => void,
   options?: {
     bootstrapTailLines?: number
   },
 ): () => Promise<void> {
-  const tailer = new FileTailer<JsonlEntry>(filePath, onEntry, onError, options)
+  const tailer = new FileTailer<T>(filePath, onEntry, onError, options)
   return async () => {
     await tailer.close()
   }
