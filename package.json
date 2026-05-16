@@ -7,12 +7,7 @@
   "types": "dist/index.d.ts",
   "files": ["dist"],
   "scripts": {
-    "build": "tsc && cp src/testing/proxy-testing/mitmAddon.py dist/testing/proxy-testing/mitmAddon.py",
-    "test": "tsx src/testing/verify.ts",
-    "record": "tsx src/testing/record.ts",
-    "replay": "tsx src/testing/replay.ts",
-    "proxy-test": "tsx src/testing/proxy-testing/run.ts",
-    "proxy-test-bootstrap": "tsx src/testing/proxy-testing/bootstrap.ts"
+    "build": "tsc && cp src/proxy/mitmAddon.py dist/proxy/mitmAddon.py"
   },
   "dependencies": {
     "@xterm/headless": "^5.5.0",
