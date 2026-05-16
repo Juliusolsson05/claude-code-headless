@@ -7,7 +7,8 @@
   "types": "dist/index.d.ts",
   "files": ["dist"],
   "scripts": {
-    "build": "tsc && cp src/proxy/mitmAddon.py dist/proxy/mitmAddon.py"
+    "build": "tsc && cp src/proxy/mitmAddon.py dist/proxy/mitmAddon.py",
+    "upstream:check": "node scripts/check-upstream.mjs"
   },
   "dependencies": {
     "@xterm/headless": "^5.5.0",
