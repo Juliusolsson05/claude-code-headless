@@ -866,6 +866,37 @@ export class ClaudeProxyAdapter {
     }
   }
 
+  private closeTurnAfterTerminalApiError(
+    state: FlowState,
+    source: SemanticSource,
+    confidence: SemanticConfidence,
+  ): void {
+    if (!state.turnStarted || state.turnStopped || !state.turnId) return
+
+    // API `error` frames are terminal for the Anthropic SSE stream, but
+    // they can arrive after `message_start` and partial deltas. Releasing
+    // only the transport lock would let the next retry promote while the
+    // SemanticChannel still believes the failed turn is active, causing a
+    // `start_while_active` lifecycle violation and dropping the retry's
+    // `turn_started`. Close the semantic turn here for the same reason
+    // `onEnd` and the stale-flow watchdog synthesize a stop: once this
+    // stream has failed, there is no valid future frame that can complete
+    // the active turn for us.
+    this.channel.publishTurnStopped({
+      turnId: state.turnId,
+      stopReason: null,
+      source,
+      confidence,
+    })
+    state.turnStopped = true
+    this.channel.finishTurn({
+      turnId: state.turnId,
+      fullText: state.fullText || undefined,
+      source,
+      confidence,
+    })
+  }
+
   // -----------------------------------------------------------------------
   // Anthropic event routing.
   // -----------------------------------------------------------------------
@@ -899,6 +930,7 @@ export class ClaudeProxyAdapter {
         // state because the failure happened BEFORE we got whatever
         // tool results would have arrived.
         this.publishPhase(state, 'idle')
+        this.closeTurnAfterTerminalApiError(state, source, confidence)
         // Release the stream lock immediately on provider-level SSE
         // errors. The normal happy path frees `activeStreamingFlowId`
         // in `onEnd`, but the overloaded-error incident that exposed
