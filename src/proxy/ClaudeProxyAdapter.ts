@@ -899,6 +899,21 @@ export class ClaudeProxyAdapter {
         // state because the failure happened BEFORE we got whatever
         // tool results would have arrived.
         this.publishPhase(state, 'idle')
+        // Release the stream lock immediately on provider-level SSE
+        // errors. The normal happy path frees `activeStreamingFlowId`
+        // in `onEnd`, but the overloaded-error incident that exposed
+        // this bug did not produce a useful follow-up end event before
+        // the user retried. That left the failed flow holding the
+        // active slot, so every later real turn was emitted as
+        // `flow_ignored: concurrent with active flow ...` even though
+        // the network and proxy were healthy again. An Anthropic
+        // `error` event is terminal for this stream by contract; after
+        // we surface it and put the UI phase back to idle, keeping the
+        // lock buys nothing and poisons the session.
+        this.flows.delete(state.flowId)
+        if (this.activeStreamingFlowId === state.flowId) {
+          this.activeStreamingFlowId = null
+        }
         return
       }
 
