@@ -132,6 +132,50 @@ _COMPACT_PROMPT_SIGNATURE_RE = re.compile(
 _COMPACT_MESSAGE_PROBE_CHARS = 400
 
 
+# Signature for Claude Code's prompt-suggestion fork.
+#
+# When prompt suggestions are enabled (vendor services/PromptSuggestion/
+# promptSuggestion.ts), Claude Code issues an internal /v1/messages call
+# whose conversation is the FULL parent turn (cache-safe — identical
+# model/tools/system/max_tokens) PLUS one appended user message carrying
+# the fixed SUGGESTION_PROMPT. That prompt opens with this exact bracketed
+# sentinel (promptSuggestion.ts:258). Because the fork reuses the parent's
+# cache params, NONE of the title-gen/compaction discriminators
+# (max_tokens, tools_count, system prefix) differ from a real turn — this
+# seed user message is the only wire signal.
+#
+# Unlike compaction (last-message-only), we scan EVERY user message: the
+# fork is an agent loop, and on a tool-denied retry the last message is a
+# tool_result while the SUGGESTION_PROMPT remains earlier in the array as
+# the loop seed. Scanning all user messages catches every request in the
+# fork. The sentinel is not something a real user types, so a full scan is
+# false-positive-safe.
+_SUGGESTION_PROMPT_SENTINEL = "[SUGGESTION MODE:"
+
+
+def _detect_prompt_suggestion(messages):
+    """True iff any user-role message's text starts with the suggestion
+    sentinel. Tolerant: returns False on any non-list / non-string shape."""
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        text = None
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list) and content:
+            first = content[0]
+            if isinstance(first, dict) and isinstance(first.get("text"), str):
+                text = first["text"]
+        if isinstance(text, str) and text.lstrip().startswith(
+            _SUGGESTION_PROMPT_SENTINEL
+        ):
+            return True
+    return False
+
+
 def _filter_headers(raw):
     """Filter mitmproxy's request.headers down to the allowlist.
 
@@ -363,6 +407,7 @@ def _extract_request_shape(content: bytes):
             attribution_entrypoint = match.group(1).strip()
 
     compaction_synthesis = _detect_compaction_synthesis(messages)
+    prompt_suggestion = _detect_prompt_suggestion(messages)
 
     return {
         "max_tokens": max_tokens,
@@ -374,6 +419,7 @@ def _extract_request_shape(content: bytes):
         "messages_total_chars": messages_total_chars,
         "attribution_entrypoint": attribution_entrypoint,
         "compaction_synthesis": compaction_synthesis,
+        "prompt_suggestion": prompt_suggestion,
     }
 
 

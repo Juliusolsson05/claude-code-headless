@@ -590,6 +590,27 @@ export type SemanticFlowIgnoredEvent = {
   ts: number
 }
 
+/** A prompt-suggestion the model offered for the user's NEXT input. This is
+ *  NOT a conversation turn — it is an ephemeral, clickable hint surfaced by
+ *  the renderer near the composer and discarded when the next real turn
+ *  starts. Emitted by ClaudeProxyAdapter when it detects Claude Code's
+ *  prompt-suggestion fork (see ParsedRequestShape.isPromptSuggestion) and
+ *  the streamed text survives `shouldFilterSuggestion`. It must never be
+ *  folded into the turn/feed history. */
+export type SemanticPromptSuggestionEvent = {
+  type: 'prompt_suggestion'
+  /** The flow that produced it (diagnostics / dedupe). */
+  flowId: string
+  /** Anthropic message id of the suggestion flow (diagnostics only). */
+  turnId: string | null
+  /** The suggestion text, trimmed and already passed through
+   *  shouldFilterSuggestion. Non-empty by construction. */
+  text: string
+  source: SemanticSource
+  confidence: SemanticConfidence
+  ts: number
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle-violation diagnostic.
 // ---------------------------------------------------------------------------
@@ -727,6 +748,7 @@ export type SemanticEvent =
   | SemanticApiErrorEvent
   | SemanticFlowSelectedEvent
   | SemanticFlowIgnoredEvent
+  | SemanticPromptSuggestionEvent
   | SemanticStreamPhaseEvent
 
 // ---------------------------------------------------------------------------
