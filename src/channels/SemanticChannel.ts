@@ -12,6 +12,7 @@ import type {
   SemanticFlowIgnoredEvent,
   SemanticFlowSelectedEvent,
   SemanticLifecycleViolationEvent,
+  SemanticPromptSuggestionEvent,
   SemanticSignatureEvent,
   SemanticSource,
   SemanticSourceChangedEvent,
@@ -129,6 +130,10 @@ export type SemanticChannelEvents = {
   // Attribution diagnostics
   flow_selected: [SemanticFlowSelectedEvent]
   flow_ignored: [SemanticFlowIgnoredEvent]
+
+  // Ephemeral next-prompt suggestion (issue #174). NOT a turn — routed to
+  // a composer chip, never folded into history.
+  prompt_suggestion: [SemanticPromptSuggestionEvent]
 
   // Upstream stream-phase derivation. Mirrors Claude Code's
   // `streamMode` state machine (utils/messages.ts:2929). Emitted by the
@@ -764,6 +769,30 @@ export class SemanticChannel extends EventEmitter {
       ts: Date.now(),
     }
     this.emit('flow_ignored', ev)
+    this.emit('event', ev)
+  }
+
+  /** Publish an ephemeral prompt suggestion. See
+   *  SemanticPromptSuggestionEvent — this is deliberately NOT a turn and
+   *  must never be folded into history. Emitted to both the named channel
+   *  and the catch-all `event` emitter so the IPC forwarder picks it up. */
+  publishPromptSuggestion(params: {
+    flowId: string
+    turnId: string | null
+    text: string
+    source: SemanticSource
+    confidence?: SemanticConfidence
+  }): void {
+    const ev: SemanticPromptSuggestionEvent = {
+      type: 'prompt_suggestion',
+      flowId: params.flowId,
+      turnId: params.turnId,
+      text: params.text,
+      source: params.source,
+      confidence: params.confidence ?? this.defaultConfidence(params.source),
+      ts: Date.now(),
+    }
+    this.emit('prompt_suggestion', ev)
     this.emit('event', ev)
   }
 

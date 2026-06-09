@@ -35,6 +35,7 @@ import type { SemanticChannel } from '../channels/SemanticChannel.js'
 import type {
   SemanticBlockKind,
   SemanticConfidence,
+  SemanticSource,
   StreamPhase,
 } from '../channels/types.js'
 import {
@@ -43,6 +44,7 @@ import {
   type AnthropicUsage,
 } from './anthropicEvents.js'
 import { IncrementalSseParser } from './sseFraming.js'
+import { shouldFilterSuggestion } from './suggestionFilter.js'
 
 // ---------------------------------------------------------------------------
 // Transport event shape (matches mitmAddon.py JSONL output).
@@ -125,6 +127,15 @@ export type ProxyTransportEvent = {
      *  predicate — compaction turns are real user-initiated work
      *  that we WANT to surface, just with different UI. */
     compaction_synthesis?: boolean | null
+    /** Renderer-relevant: true when ANY user message in the body starts
+     *  with Claude Code's `[SUGGESTION MODE:` sentinel — i.e. this flow is
+     *  the prompt-suggestion fork (see `_detect_prompt_suggestion` in
+     *  mitmAddon.py). Unlike the sidecar signals this is model-/tools-
+     *  independent because the fork reuses the parent's cache params; the
+     *  seed user message is the only wire tell. Threaded to
+     *  `ParsedRequestShape.isPromptSuggestion` and consumed at
+     *  message_start to route the flow OUT of the visible turn stream. */
+    prompt_suggestion?: boolean | null
   }
   /** Final buffered body on `response`. Not consumed by this adapter —
    *  chunks are the single source of truth for streaming. Kept as
@@ -326,6 +337,14 @@ type ParsedRequestShape = {
    *  so demoting it would silently break the UI. Treated as a UI
    *  hint, not a routing decision. */
   isCompactionSynthesis: boolean
+  /** True when the request body is Claude Code's prompt-suggestion fork.
+   *  Forwarded from the addon's `request_shape.prompt_suggestion`, with the
+   *  legacy `parseRequestBody` path computing the same bit inline. Read by
+   *  the message_start handler to route the flow to a `prompt_suggestion`
+   *  semantic event instead of `startTurn`. Distinct from the sidecar
+   *  predicate: a suggestion fork runs on the user's PRIMARY model with the
+   *  full tools array, so isSidecarFlow can never catch it. */
+  isPromptSuggestion: boolean
 }
 
 type FlowState = {
@@ -355,6 +374,15 @@ type FlowState = {
    *  and fall back to the existing model-name heuristic — never as
    *  evidence that a flow is real. */
   requestShape: ParsedRequestShape | null
+  /** True once message_start confirmed this flow is the prompt-suggestion
+   *  fork (requestShape.isPromptSuggestion). When set, the flow is kept OUT
+   *  of the visible turn stream — no startTurn, no text deltas to the feed.
+   *  We still accumulate its text into `promptSuggestionText` and emit a
+   *  `prompt_suggestion` event at message_stop. */
+  isPromptSuggestionFlow: boolean
+  /** Accumulated assistant text for a suggestion flow. Empty for every
+   *  normal flow. */
+  promptSuggestionText: string
   /** Set to true once we've emitted `turn_started` for this flow, so
    *  repeated message_start events (shouldn't happen, but defensive)
    *  don't fire a second start. */
@@ -663,6 +691,8 @@ export class ClaudeProxyAdapter {
       fullText: '',
       usage: {},
       requestShape: null,
+      isPromptSuggestionFlow: false,
+      promptSuggestionText: '',
       turnStarted: false,
       turnStopped: false,
       pendingToolUses: [],
@@ -990,6 +1020,46 @@ export class ClaudeProxyAdapter {
         // would let a concurrent real-turn flow promote during the
         // sidecar's tail and produce two competing 'active'
         // attributions for the same wall-clock window.
+        // Prompt-suggestion routing. The fork reuses the parent's cache
+        // params (same model/tools/system/max_tokens), so isSidecarFlow
+        // can't see it — the only tell is requestShape.isPromptSuggestion,
+        // sniffed from the seed user message at request time. We keep the
+        // flow OUT of the visible turn stream: clear the spinner we emitted
+        // on first-chunk, flip to 'secondary' so every later text_delta /
+        // message_stop falls through the isActive gates, and record the
+        // flag. We do NOT call startTurn — that call is what ghosts the
+        // suggestion into the transcript (#174), and Claude Code marks the
+        // fork skipTranscript so the committed channel never supersedes it.
+        // We still accumulate the streamed text (see the text-delta handler)
+        // and emit a `prompt_suggestion` event at message_stop.
+        //
+        // KNOWN GAP — speculation. Claude Code can pre-execute the suggested
+        // prompt (vendor .../PromptSuggestion/speculation.ts) via another
+        // skipTranscript fork. That fork sends the suggestion TEXT itself as
+        // the user message (speculation.ts:458) with a client-side
+        // querySource:'speculation' that never reaches the wire — so its
+        // request body is byte-indistinguishable from a real user turn and
+        // we cannot detect it here. It is gated behind a separate
+        // isSpeculationEnabled() flag. If a speculation fork streams while no
+        // real turn holds the active lock, its output can still leak as a
+        // phantom turn. Catching it would require a response-side or
+        // lock-timing heuristic; tracked as follow-up, out of scope for #174.
+        if (isActive && state.requestShape?.isPromptSuggestion === true) {
+          state.isPromptSuggestionFlow = true
+          this.publishPhase(state, 'idle')
+          state.attribution = 'secondary'
+          this.channel.publishFlowIgnored({
+            flowId: state.flowId,
+            reason: 'prompt_suggestion',
+            source,
+            confidence,
+          })
+          this.onDiagnostic(
+            `flow ${state.flowId} routed as prompt_suggestion (model=${ev.model})`,
+          )
+          return
+        }
+
         if (isActive && this.isSidecarFlow(state, ev.model)) {
           // Clear the spinner BEFORE flipping attribution. `publishPhase`
           // early-returns when attribution !== 'active' (so that
@@ -1154,6 +1224,15 @@ export class ClaudeProxyAdapter {
       }
 
       case 'text_delta': {
+        // Suggestion flows are 'secondary' (so they never publish to the
+        // feed) and may not have tracked blocks. Accumulate their text
+        // here, independent of the block bookkeeping and the isActive gate,
+        // then short-circuit — the chip is built from the concatenated
+        // deltas and emitted at message_stop.
+        if (state.isPromptSuggestionFlow) {
+          state.promptSuggestionText += ev.text
+          return
+        }
         const block = state.blocks.get(ev.index)
         if (!block || block.kind !== 'text') {
           this.softError(
@@ -1481,6 +1560,23 @@ export class ClaudeProxyAdapter {
       }
 
       case 'message_stop':
+        if (state.isPromptSuggestionFlow) {
+          // Emit the captured suggestion if it survives the same quality
+          // filter Claude Code itself applies (shouldFilterSuggestion). We
+          // do this at message_stop, not on each delta, so the chip only
+          // appears once the suggestion is complete. No startTurn ran, so
+          // there is nothing to finish here.
+          const text = state.promptSuggestionText.trim()
+          if (!shouldFilterSuggestion(text)) {
+            this.channel.publishPromptSuggestion({
+              flowId: state.flowId,
+              turnId: state.turnId,
+              text,
+              source,
+            })
+          }
+          return
+        }
         // Terminal marker. We've already fired `turn_stopped` on
         // `message_delta`; nothing to do here.
         return
@@ -1543,8 +1639,9 @@ export class ClaudeProxyAdapter {
     // incorrect `true` would hide a real turn behind the placeholder.
     const rawCompaction = obj.compaction_synthesis
     const isCompactionSynthesis = rawCompaction === true
+    const isPromptSuggestion = obj.prompt_suggestion === true
 
-    return { maxTokens, messageCount, systemPrefixes, isCompactionSynthesis }
+    return { maxTokens, messageCount, systemPrefixes, isCompactionSynthesis, isPromptSuggestion }
   }
 
   /** Decode and minimally parse the addon-supplied request body so the
@@ -1624,7 +1721,30 @@ export class ClaudeProxyAdapter {
       }
     }
 
-    return { maxTokens, messageCount, systemPrefixes, isCompactionSynthesis }
+    // Prompt-suggestion sniff for the legacy body_b64 path. Mirrors
+    // `_detect_prompt_suggestion` in mitmAddon.py. We scan EVERY user
+    // message (not just the last like compaction) because the fork's
+    // tool-denied retries push a tool_result to the last slot while the
+    // SUGGESTION_PROMPT seed stays earlier in the array.
+    let isPromptSuggestion = false
+    if (messages) {
+      for (const m of messages) {
+        const rec = asRecord(m)
+        if (rec?.role !== 'user') continue
+        let text: string | null = null
+        if (typeof rec.content === 'string') {
+          text = rec.content
+        } else if (Array.isArray(rec.content) && rec.content.length > 0) {
+          text = textFromUnknownBlock(rec.content[0])
+        }
+        if (text && text.trimStart().startsWith('[SUGGESTION MODE:')) {
+          isPromptSuggestion = true
+          break
+        }
+      }
+    }
+
+    return { maxTokens, messageCount, systemPrefixes, isCompactionSynthesis, isPromptSuggestion }
   }
 
   /** Whether the given flow looks like a sidecar (auxiliary) call rather
