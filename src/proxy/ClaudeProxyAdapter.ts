@@ -35,6 +35,7 @@ import type { SemanticChannel } from '../channels/SemanticChannel.js'
 import type {
   SemanticBlockKind,
   SemanticConfidence,
+  SemanticSource,
   StreamPhase,
 } from '../channels/types.js'
 import {
