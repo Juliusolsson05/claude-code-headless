@@ -12,6 +12,7 @@ import type {
   SemanticFlowIgnoredEvent,
   SemanticFlowSelectedEvent,
   SemanticLifecycleViolationEvent,
+  SemanticProviderSessionObservedEvent,
   SemanticPromptSuggestionEvent,
   SemanticSignatureEvent,
   SemanticSource,
@@ -130,6 +131,7 @@ export type SemanticChannelEvents = {
   // Attribution diagnostics
   flow_selected: [SemanticFlowSelectedEvent]
   flow_ignored: [SemanticFlowIgnoredEvent]
+  provider_session_observed: [SemanticProviderSessionObservedEvent]
 
   // Ephemeral next-prompt suggestion (issue #174). NOT a turn — routed to
   // a composer chip, never folded into history.
@@ -769,6 +771,26 @@ export class SemanticChannel extends EventEmitter {
       ts: Date.now(),
     }
     this.emit('flow_ignored', ev)
+    this.emit('event', ev)
+  }
+
+  publishProviderSessionObserved(params: {
+    provider: 'claude'
+    providerSessionId: string
+    flowId: string
+    source: SemanticSource
+    confidence?: SemanticConfidence
+  }): void {
+    const ev: SemanticProviderSessionObservedEvent = {
+      type: 'provider_session_observed',
+      provider: params.provider,
+      providerSessionId: params.providerSessionId,
+      flowId: params.flowId,
+      source: params.source,
+      confidence: params.confidence ?? this.defaultConfidence(params.source),
+      ts: Date.now(),
+    }
+    this.emit('provider_session_observed', ev)
     this.emit('event', ev)
   }
 

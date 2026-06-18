@@ -586,6 +586,7 @@ export class ClaudeProxyAdapter {
   private readonly policy: AttributionPolicy
   private readonly onDiagnostic: (message: string) => void
   private readonly flows = new Map<string, FlowState>()
+  private readonly observedProviderSessionIds = new Set<string>()
   /** The id of the flow currently holding the "active streaming"
    *  lock. Null when no flow is streaming. A new candidate flow's
    *  first chunk promotes it to 'active' iff this is null; otherwise
@@ -652,6 +653,7 @@ export class ClaudeProxyAdapter {
    *  process inherits a clean slate. */
   dispose(): void {
     this.flows.clear()
+    this.observedProviderSessionIds.clear()
     this.activeStreamingFlowId = null
   }
 
@@ -660,6 +662,8 @@ export class ClaudeProxyAdapter {
   // -----------------------------------------------------------------------
 
   private onRequest(flowId: string, event: ProxyTransportEvent): void {
+    this.publishProviderSessionFromHeaders(flowId, event.headers)
+
     const decision = this.policy.classify({
       flowId,
       method: event.method,
@@ -722,6 +726,32 @@ export class ClaudeProxyAdapter {
       )
     this.flows.set(flowId, state)
     this.onDiagnostic(`flow ${flowId} accepted as candidate`)
+  }
+
+  private publishProviderSessionFromHeaders(
+    flowId: string,
+    headers: Record<string, string> | undefined,
+  ): void {
+    const providerSessionId = headerValue(headers, 'x-claude-code-session-id')
+    if (!providerSessionId) return
+    if (this.observedProviderSessionIds.has(providerSessionId)) return
+    this.observedProviderSessionIds.add(providerSessionId)
+    // WHY this fires before attribution filtering:
+    //
+    // The session UUID is a process/session property, not a visible-turn
+    // property. Claude attaches it to auth/warmup/eval flows as well as
+    // /v1/messages, and those incidental flows are exactly the earliest place
+    // we can learn identity when the committed JSONL file never appears. We
+    // still leave history durability to the committed channel; this event only
+    // says "the provider claims this session id exists."
+    this.channel.publishProviderSessionObserved({
+      provider: 'claude',
+      providerSessionId,
+      flowId,
+      source: 'proxy',
+      confidence: 'high',
+    })
+    this.onDiagnostic(`provider session ${providerSessionId} observed on flow ${flowId}`)
   }
 
   private onChunk(flowId: string, event: ProxyTransportEvent): void {
@@ -2112,6 +2142,20 @@ function coerceUsageForPublish(u: AnthropicUsage) {
         }
       : undefined,
   }
+}
+
+function headerValue(
+  headers: Record<string, string> | undefined,
+  name: string,
+): string | null {
+  if (!headers) return null
+  const direct = headers[name]
+  if (typeof direct === 'string' && direct.length > 0) return direct
+  const lowerName = name.toLowerCase()
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === lowerName && value.length > 0) return value
+  }
+  return null
 }
 
 function tryParseJson(raw: string): {

@@ -590,6 +590,29 @@ export type SemanticFlowIgnoredEvent = {
   ts: number
 }
 
+/** Provider session identity observed outside the committed transcript.
+ *
+ * WHY this exists on the semantic/diagnostic channel:
+ *
+ * Claude Code exposes its durable session UUID in the
+ * `x-claude-code-session-id` request header before Agent Code has any
+ * guarantee that the sibling `<session-id>.jsonl` file exists. The committed
+ * JSONL channel remains the durability source of truth, but treating JSONL as
+ * the only identity source leaves fresh panes with no providerSessionId when
+ * upstream fails to write the root transcript. Emitting this as a proxy-sourced
+ * diagnostic lets consumers persist a PROVISIONAL identity while keeping
+ * history-loadability gated on the committed transcript path.
+ */
+export type SemanticProviderSessionObservedEvent = {
+  type: 'provider_session_observed'
+  provider: 'claude'
+  providerSessionId: string
+  flowId: string
+  source: SemanticSource
+  confidence: SemanticConfidence
+  ts: number
+}
+
 /** A prompt-suggestion the model offered for the user's NEXT input. This is
  *  NOT a conversation turn — it is an ephemeral, clickable hint surfaced by
  *  the renderer near the composer and discarded when the next real turn
@@ -748,6 +771,7 @@ export type SemanticEvent =
   | SemanticApiErrorEvent
   | SemanticFlowSelectedEvent
   | SemanticFlowIgnoredEvent
+  | SemanticProviderSessionObservedEvent
   | SemanticPromptSuggestionEvent
   | SemanticStreamPhaseEvent
 
