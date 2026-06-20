@@ -9,7 +9,7 @@ import {
   watchFile,
 } from 'fs'
 import { mkdir, readdir } from 'fs/promises'
-import { basename } from 'path'
+import { basename, join } from 'path'
 
 // Node-only (chokidar + fs). Used by downstream applications that need
 // to tail CC's transcript files. NOT importable from browser contexts.
@@ -275,24 +275,75 @@ export async function tailNewSessionFile<T extends JsonlEntry = JsonlEntry>(
   projectDir: string,
   onEntry: (entry: T, file: string) => void,
   onError?: (err: Error) => void,
+  options?: {
+    /**
+     * Fresh Claude sessions can create their root transcript before
+     * this watcher is fully armed because the caller must already
+     * have an IPty before it can construct ClaudeCodeHeadless. When
+     * provided, files whose mtime/ctime land after this timestamp are
+     * treated as candidates for "the session we just spawned" even if
+     * they already existed by the time our initial directory snapshot
+     * ran.
+     */
+    freshSinceMs?: number
+  },
 ): Promise<() => Promise<void>> {
-  // Ensure the directory exists. CC creates it on first write but we want
-  // to attach the watcher BEFORE CC is spawned so we can't miss the create
-  // event. mkdir -p is harmless if it already exists.
+  // Ensure the directory exists. CC creates it on first write, but we
+  // need a stable directory before we can arm either the watcher or
+  // the timestamp-based recovery path below. mkdir -p is harmless if
+  // it already exists.
   await mkdir(projectDir, { recursive: true })
 
-  // Snapshot the existing files so we can ignore them and only pick up
-  // a NEW jsonl produced by the session we're about to start.
+  // Snapshot the existing files so we can ignore old transcripts and
+  // only pick up the JSONL produced by the session we're about to
+  // start.
+  //
+  // WHY the timestamp escape hatch exists:
+  //
+  // The public invariant sounds simple: "attach the tailer before the
+  // terminal mirror starts processing PTY data." That is true, but it
+  // is not strong enough. The PTY process itself is already alive by
+  // the time ClaudeCodeHeadless can exist, and Claude can create
+  // `<sessionId>.jsonl` in the narrow spawn -> tailer window. The old
+  // code put that file into `existing` and then ignored it forever,
+  // leaving the app with proxy/semantic events but no committed
+  // transcript and no providerSessionId capture. A timestamp taken
+  // immediately before spawning the PTY lets us distinguish "old
+  // transcript from last week" from "fresh transcript created while
+  // we were still wiring the tailer."
   const existing = new Set<string>()
+  const freshCandidates: string[] = []
   try {
     for (const name of await readdir(projectDir)) {
-      if (name.endsWith('.jsonl')) existing.add(name)
+      if (!name.endsWith('.jsonl')) continue
+      existing.add(name)
+      if (typeof options?.freshSinceMs === 'number') {
+        const filePath = join(projectDir, name)
+        try {
+          const stat = statSync(filePath)
+          const changedAt = Math.max(stat.mtimeMs, stat.ctimeMs)
+          if (changedAt >= options.freshSinceMs) {
+            freshCandidates.push(filePath)
+          }
+        } catch (err) {
+          onError?.(err as Error)
+        }
+      }
     }
   } catch (err) {
     onError?.(err as Error)
   }
 
   let tailer: FileTailer<T> | null = null
+
+  const attach = (filePath: string) => {
+    if (tailer) return
+    tailer = new FileTailer<T>(
+      filePath,
+      entry => onEntry(entry, filePath),
+      onError,
+    )
+  }
 
   const dirWatcher = watch(projectDir, {
     persistent: true,
@@ -305,15 +356,27 @@ export async function tailNewSessionFile<T extends JsonlEntry = JsonlEntry>(
     const name = basename(filePath)
     if (!name.endsWith('.jsonl')) return
     if (existing.has(name)) return
-    if (tailer) return // Already tailing the first new session file
-    tailer = new FileTailer<T>(
-      filePath,
-      entry => onEntry(entry, filePath),
-      onError,
-    )
+    attach(filePath)
   })
 
   dirWatcher.on('error', err => onError?.(err as Error))
+
+  // Attach after the watcher is registered so that, if our timestamp
+  // candidate was not actually the right file and Claude creates the
+  // real root transcript a moment later, the normal add path is still
+  // active. In the pathological case we are fixing, this immediately
+  // opens the already-created fresh file and emits its initial lines,
+  // which also gives the renderer the providerSessionId it persists.
+  freshCandidates
+    .sort((a, b) => {
+      try {
+        return statSync(b).mtimeMs - statSync(a).mtimeMs
+      } catch {
+        return 0
+      }
+    })
+    .slice(0, 1)
+    .forEach(attach)
 
   return async () => {
     await dirWatcher.close()

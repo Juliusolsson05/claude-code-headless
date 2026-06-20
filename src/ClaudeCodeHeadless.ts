@@ -77,6 +77,11 @@ export type ClaudeCodeHeadlessOptions = {
   /** If set, tail the existing session file instead of waiting for
    *  CC to create a new one. Used for --resume flows. */
   resumeSessionId?: string
+  /** Timestamp captured by the consumer immediately before spawning
+   *  the Claude PTY for a fresh session. This lets the fresh-session
+   *  tailer recover if Claude creates `<sessionId>.jsonl` before the
+   *  directory watcher is fully armed. */
+  freshSessionStartedAtMs?: number
   /** Optional proxy integration. When present, a `ClaudeProxyAdapter`
    *  is created and exposed on `this.proxy`. The consumer owns the
    *  proxy runtime (mitmproxy or otherwise) and pipes transport
@@ -202,6 +207,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private readonly terminal: HeadlessTerminal
   private readonly cwd: string
   private readonly resumeSessionId: string | null
+  private readonly freshSessionStartedAtMs: number | null
   private stopJsonlTail: (() => Promise<void>) | null = null
   private lastActivity: string | null = null
   // Debounce timer for `idle`.
@@ -370,6 +376,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
     super()
     this.cwd = options.cwd
     this.resumeSessionId = options.resumeSessionId ?? null
+    this.freshSessionStartedAtMs = options.freshSessionStartedAtMs ?? null
 
     this.terminal = new HeadlessTerminal({
       pty: options.pty,
@@ -1172,6 +1179,9 @@ export class ClaudeCodeHeadless extends EventEmitter {
         projectDir,
         onJsonlEntry,
         onJsonlError,
+        this.freshSessionStartedAtMs === null
+          ? undefined
+          : { freshSinceMs: this.freshSessionStartedAtMs },
       )
     }
 
