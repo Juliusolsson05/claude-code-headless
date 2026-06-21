@@ -77,6 +77,12 @@ export {
 } from './parsers/SlashPickerParser.js'
 
 export {
+  detectAskUserQuestion,
+  type AskUserQuestionState,
+  type AskUserQuestionOption,
+} from './parsers/AskUserQuestionParser.js'
+
+export {
   diffLines,
   type DiffLine,
 } from './parsers/LineDiff.js'

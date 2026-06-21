@@ -19,6 +19,10 @@ import {
   type PermissionPromptState,
 } from './parsers/PermissionPromptParser.js'
 import { detectSlashPicker, type SlashPickerState } from './parsers/SlashPickerParser.js'
+import {
+  detectAskUserQuestion,
+  type AskUserQuestionState,
+} from './parsers/AskUserQuestionParser.js'
 import { detectTrustDialog, type TrustDialogState, TRUST_DIALOG_ACCEPT_KEYS } from './parsers/TrustDialogParser.js'
 import {
   tailNewSessionFile,
@@ -145,6 +149,14 @@ export type CompactionStateEvent = {
   type: 'compaction_state'; ts: number; state: CompactionState
 }
 export type SlashPickerEvent = { type: 'slash_picker'; ts: number; state: SlashPickerState }
+// `state` is null when no AskUserQuestion picker is on screen — the null IS
+// the signal (picker dismissed / interrupted / answered), which is exactly
+// what the renderer's stale-render gate keys off. We never emit a "hidden"
+// object the way the slash picker does (`{visible:false}`) because the
+// AskUserQuestion parser returns null rather than a hidden sentinel.
+export type AskUserQuestionEvent = {
+  type: 'ask_user_question'; ts: number; state: AskUserQuestionState | null
+}
 export type ExitEvent = { type: 'exit'; ts: number; exitCode: number; signal?: number }
 
 export type HeadlessEvent =
@@ -157,6 +169,7 @@ export type HeadlessEvent =
   | PermissionPromptEvent
   | CompactionStateEvent
   | SlashPickerEvent
+  | AskUserQuestionEvent
   | ExitEvent
 
 export type ClaudeCodeHeadlessEvents = {
@@ -172,6 +185,8 @@ export type ClaudeCodeHeadlessEvents = {
   'permission-prompt': [PermissionPromptState]
   'compaction-state': [CompactionState]
   'slash-picker': [SlashPickerState]
+  // null payload = picker not on screen (see AskUserQuestionEvent note).
+  'ask-user-question': [AskUserQuestionState | null]
   exit: [{ exitCode: number; signal?: number }]
 
   // Live-owner decision stream. Fires whenever an ownership helper
@@ -274,6 +289,11 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private lastCompactionKey: string | null = null
   private pickerState: SlashPickerState = { visible: false, items: [] }
   private lastPickerKey: string | null = null
+  // null = no AskUserQuestion picker on screen. We keep the last-emitted
+  // key to dedupe identical frames (CC redraws its TUI ~60Hz), same as the
+  // slash picker.
+  private askUserQuestionState: AskUserQuestionState | null = null
+  private lastAskUserQuestionKey: string | null = null
 
   // --- Three-channel truth surface ---------------------------------------
   //
@@ -513,6 +533,16 @@ export class ClaudeCodeHeadless extends EventEmitter {
       const picker = detectSlashPicker(this.terminal.getTerminal())
       const pickerKey = picker.visible ? JSON.stringify(picker) : null
       this.pickerState = picker
+
+      // AskUserQuestion picker. Runs on the same xterm grid as the slash
+      // picker (cell-accurate live truth) rather than `snap.plain`, because
+      // the parser anchors on the `❯` cursor glyph + numbered rows and we
+      // want the exact same grid the other cursor-sensitive parsers read.
+      // A null result is the "picker dismissed" signal the renderer's
+      // stale-render gate depends on — see AskUserQuestionParser header.
+      const askUserQuestion = detectAskUserQuestion(this.terminal.getTerminal())
+      const askUserQuestionKey = askUserQuestion ? JSON.stringify(askUserQuestion) : null
+      this.askUserQuestionState = askUserQuestion
 
       // Forward raw screen (legacy flat surface).
       this.emit('screen', snap)
@@ -799,6 +829,22 @@ export class ClaudeCodeHeadless extends EventEmitter {
         this.emit('slash-picker', picker)
         this.screen.publishSlashPicker(picker)
         this.emit('event', { type: 'slash_picker', ts: Date.now(), state: picker })
+      }
+
+      // AskUserQuestion detection. Emits on every transition INCLUDING the
+      // transition to null (picker dismissed) — that null edge is the whole
+      // point: it's what tells the renderer to stop drawing the picker the
+      // instant CC removes it from the screen (interrupted / answered in the
+      // terminal / turn moved on). Without firing on null, the renderer
+      // would never learn the picker left and the ghost-render bug stays.
+      if (askUserQuestionKey !== this.lastAskUserQuestionKey) {
+        this.lastAskUserQuestionKey = askUserQuestionKey
+        this.emit('ask-user-question', askUserQuestion)
+        this.emit('event', {
+          type: 'ask_user_question',
+          ts: Date.now(),
+          state: askUserQuestion,
+        })
       }
     })
 
@@ -1327,6 +1373,14 @@ export class ClaudeCodeHeadless extends EventEmitter {
 
   getSlashPickerState(): SlashPickerState {
     return this.pickerState
+  }
+
+  // Latest AskUserQuestion picker state, or null when no picker is on
+  // screen. Read by claudeSession when assembling each `screen` snapshot so
+  // the renderer always has the current value even between transition
+  // events — exactly how `getSlashPickerState` feeds `snap.picker`.
+  getAskUserQuestionState(): AskUserQuestionState | null {
+    return this.askUserQuestionState
   }
 
   getTrustDialogState(): TrustDialogState {
