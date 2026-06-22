@@ -51,6 +51,9 @@ export {
   type ConditionAction,
   type ConditionPtyAction,
   type ConditionCustomAction,
+  type AskUserQuestionAnswer,
+  type AskUserQuestionResolvePayload,
+  type DriveResult,
 } from './conditions/index.js'
 
 // --- Terminal ---

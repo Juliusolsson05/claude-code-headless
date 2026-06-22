@@ -7,12 +7,12 @@
 //   SEMANTIC tool input (`block.parsedInput`), NOT from terminal paint —
 //   that path is brittle. But two things the semantic input cannot tell us,
 //   and only the live screen can:
-//     1. Is the picker actually ON SCREEN RIGHT NOW? An unanswered
-//        AskUserQuestion (interrupted, or the user moved on) leaves the
-//        tool_use block unresolved in the transcript forever, so the feed
-//        would keep rendering a dead picker many messages later (the
-//        "ghost render" bug). The PRESENCE of this parser's result is the
-//        authoritative "picker is live" signal that gates the row.
+//     1. Is the picker actually ON SCREEN RIGHT NOW? The feed still renders
+//        from the semantic tool block (`resultAt` is the transcript-backed
+//        dismissal), never from this screen parse. This parser's presence is a
+//        secondary answerability signal: if the picker is positively gone, the
+//        row disables its buttons so a late click cannot send a stray digit to
+//        whatever prompt follows.
 //     2. The live cursor / per-option toggle state (needed for the LATER
 //        multi-select / free-text answering PR). We capture it now so the
 //        payload is already complete when that PR lands; this PR only

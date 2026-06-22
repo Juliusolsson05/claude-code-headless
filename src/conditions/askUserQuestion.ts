@@ -39,6 +39,10 @@ import type {
   ClaudeConditionInputs,
   ClaudeAskUserQuestionCondition,
 } from './types.js'
+import {
+  resolveAskUserQuestionAction,
+  type AskUserQuestionResolveCtx,
+} from './askUserQuestionDriver.js'
 import type { AskUserQuestionState } from '../parsers/AskUserQuestionParser.js'
 
 // Build the answer keystrokes from the LIVE parsed state.
@@ -101,7 +105,8 @@ function buildAskUserQuestionActions(state: AskUserQuestionState): ConditionActi
 export const askUserQuestionModule = defineModule<
   'claude.ask-user-question',
   ClaudeConditionInputs,
-  AskUserQuestionState
+  AskUserQuestionState,
+  AskUserQuestionResolveCtx
 >({
   kind: 'claude.ask-user-question',
   detect: (inputs) => inputs.askUserQuestion,
@@ -110,10 +115,11 @@ export const askUserQuestionModule = defineModule<
   // static-template modules we build the array fresh from state each call, so the
   // freshness is inherent; `buildAskUserQuestionActions` always allocates anew.
   actions: (state) => buildAskUserQuestionActions(state),
-  // NOTE: `resolve` is intentionally ABSENT in this PR. The multi-step answering
-  // driver (`sendThenReparse`) that fills this slot lands with PR-5; until then
-  // single-select answers via the atomic pty actions above and the renderer's
-  // existing keystroke path, and multi-select/free-text stay read-only.
+  // PR-5: structured answering lives behind `resolve`, not more renderer
+  // keystroke guesses. The renderer knows the semantic answer the user chose;
+  // this resolver maps that answer onto the LIVE numbered TUI rows, sends one
+  // key, reparses, and repeats until Claude advances or closes the picker.
+  resolve: resolveAskUserQuestionAction,
 })
 
 // Convenience builder mirroring the other `buildClaude*Condition` helpers, for a

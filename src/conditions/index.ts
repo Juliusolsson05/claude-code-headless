@@ -21,6 +21,12 @@ export {
   askUserQuestionModule,
   buildClaudeAskUserQuestionCondition,
 } from './askUserQuestion.js'
+export type {
+  AskUserQuestionAnswer,
+  AskUserQuestionResolvePayload,
+  AskUserQuestionResolveCtx,
+  DriveResult,
+} from './askUserQuestionDriver.js'
 export { CLAUDE_MODULES } from './modules.js'
 
 // Re-export the generic headless evaluator from the vendored core, exactly as

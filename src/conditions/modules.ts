@@ -57,6 +57,7 @@ import type { ClaudeConditionInputs } from './types.js'
 export const CLAUDE_MODULES: readonly ConditionModule<
   string,
   ClaudeConditionInputs,
+  any,
   any
 >[] = [
   trustDialogModule,
