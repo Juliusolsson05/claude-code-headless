@@ -159,6 +159,14 @@ function sameQuestion(
       (stateQuestion.length >= 12 && answerQuestion.startsWith(stateQuestion)) ||
       (answerQuestion.length >= 12 && stateQuestion.startsWith(answerQuestion))
     if (!questionMatches) return false
+    // If the question text itself identifies the current screen, do not let a
+    // noisy multi-question nav header veto it. Claude can render sibling tabs in
+    // the same header row ("Season  ☐ Relax"), while the semantic payload only
+    // carries the active answer's header ("Season"). The question text is the
+    // stronger invariant: applying "Spring" to a different visible question is
+    // unsafe, but accepting the exact visible question despite extra nav chrome
+    // is the intended multi-question path.
+    if (stateQuestion === answerQuestion) return true
     return (
       !answer.header ||
       !state.header ||
