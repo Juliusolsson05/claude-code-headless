@@ -19,8 +19,37 @@ export {
   type PermissionPromptEvent,
   type CompactionStateEvent,
   type SlashPickerEvent,
+  type ConditionsEvent,
   type ExitEvent,
 } from './ClaudeCodeHeadless.js'
+
+// --- Conditions framework (PR-3) ---
+// The ordered module registry, the generic evaluator, and the typed snapshot
+// shapes. Exported from the package index exactly as codex-headless exports
+// CODEX_MODULES + makeEvaluator, so the host app (and any other consumer) can
+// drive Claude conditions through the registry. ClaudeConditionSnapshot is the
+// wire type claudeSession forwards to the renderer relay.
+export {
+  CLAUDE_MODULES,
+  makeEvaluator,
+  trustDialogModule,
+  permissionPromptModule,
+  resumePromptModule,
+  compactionModule,
+  buildClaudeTrustDialogCondition,
+  buildClaudePermissionPromptCondition,
+  buildClaudeResumePromptCondition,
+  buildClaudeCompactionCondition,
+  type ConditionEvaluator,
+  type ClaudeCondition,
+  type ClaudeConditionInputs,
+  type ClaudeConditionKind,
+  type ClaudeConditionMap,
+  type ClaudeConditionSnapshot,
+  type ConditionAction,
+  type ConditionPtyAction,
+  type ConditionCustomAction,
+} from './conditions/index.js'
 
 // --- Terminal ---
 export {
