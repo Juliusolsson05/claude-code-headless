@@ -20,6 +20,20 @@ import {
 } from './parsers/PermissionPromptParser.js'
 import { detectSlashPicker, type SlashPickerState } from './parsers/SlashPickerParser.js'
 import { detectTrustDialog, type TrustDialogState, TRUST_DIALOG_ACCEPT_KEYS } from './parsers/TrustDialogParser.js'
+// Conditions framework (PR-3). The long-lived evaluator + ordered module
+// registry that produce the unified `claude` conditions snapshot. Importing from
+// the conditions barrel (not ./conditions/core directly) mirrors how CodexHeadless
+// imports its evaluator + CODEX_MODULES. See publishConditionSnapshot below for
+// WHY this exists: it RESTORES Claude's dead trust/permission/resume/compaction
+// modals by finally emitting the snapshot the renderer's onSessionConditions
+// path already consumes.
+import {
+  CLAUDE_MODULES,
+  makeEvaluator,
+  type ClaudeConditionInputs,
+  type ClaudeConditionSnapshot,
+  type ConditionEvaluator,
+} from './conditions/index.js'
 import {
   tailNewSessionFile,
   tailSessionFile,
@@ -145,6 +159,10 @@ export type CompactionStateEvent = {
   type: 'compaction_state'; ts: number; state: CompactionState
 }
 export type SlashPickerEvent = { type: 'slash_picker'; ts: number; state: SlashPickerState }
+// Conditions snapshot event (PR-3). Carries the FULL unified snapshot, mirroring
+// codex-headless's CodexConditionsEvent. This is the `event`-union mirror of the
+// dedicated `conditions` channel emit; both fire from publishConditionSnapshot.
+export type ConditionsEvent = { type: 'conditions'; ts: number; snapshot: ClaudeConditionSnapshot }
 export type ExitEvent = { type: 'exit'; ts: number; exitCode: number; signal?: number }
 
 export type HeadlessEvent =
@@ -157,6 +175,7 @@ export type HeadlessEvent =
   | PermissionPromptEvent
   | CompactionStateEvent
   | SlashPickerEvent
+  | ConditionsEvent
   | ExitEvent
 
 export type ClaudeCodeHeadlessEvents = {
@@ -172,6 +191,11 @@ export type ClaudeCodeHeadlessEvents = {
   'permission-prompt': [PermissionPromptState]
   'compaction-state': [CompactionState]
   'slash-picker': [SlashPickerState]
+  // Conditions snapshot channel (PR-3). The dedicated stream claudeSession
+  // forwards to the renderer's generic `onSessionConditions` relay. Carries the
+  // SAME snapshot as the `event`-union ConditionsEvent; both fire together from
+  // publishConditionSnapshot. Mirrors codex-headless's `conditions` event.
+  conditions: [ClaudeConditionSnapshot]
   exit: [{ exitCode: number; signal?: number }]
 
   // Live-owner decision stream. Fires whenever an ownership helper
@@ -274,6 +298,32 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private lastCompactionKey: string | null = null
   private pickerState: SlashPickerState = { visible: false, items: [] }
   private lastPickerKey: string | null = null
+
+  // --- Conditions snapshot (PR-3) ----------------------------------------
+  //
+  // WHY THIS EXISTS — IT RESTORES DEAD MODALS.
+  // Until this PR, ClaudeCodeHeadless emitted NO conditions snapshot, so the
+  // renderer's generic `onSessionConditions` → `applyConditionSnapshot` → the
+  // Claude branch (CLAUDE_VIEWS) never fired. The trust/permission/resume/
+  // compaction modals were built (PR-1) but dead. The long-lived evaluator +
+  // publishConditionSnapshot below finally emit that snapshot, lighting up the
+  // already-wired renderer path. This mirrors CodexHeadless exactly.
+  //
+  // The public snapshot is seeded to an empty map with `provider: 'claude'`,
+  // matching CodexHeadless's seeded `{ provider, conditions: {}, ts }`.
+  private conditionSnapshot: ClaudeConditionSnapshot = {
+    provider: 'claude',
+    conditions: {},
+    ts: Date.now(),
+  }
+  // The long-lived generic evaluator. It OWNS the dedupe latch (seeded to '{}'
+  // internally so the first empty snapshot is correctly a no-change). Built once
+  // per instance with the ordered CLAUDE_MODULES registry and the real wall
+  // clock. Same shape as CodexHeadless.conditionEvaluator.
+  private readonly conditionEvaluator: ConditionEvaluator<
+    'claude',
+    ClaudeConditionInputs
+  > = makeEvaluator('claude', CLAUDE_MODULES, () => Date.now())
 
   // --- Three-channel truth surface ---------------------------------------
   //
@@ -800,6 +850,18 @@ export class ClaudeCodeHeadless extends EventEmitter {
         this.screen.publishSlashPicker(picker)
         this.emit('event', { type: 'slash_picker', ts: Date.now(), state: picker })
       }
+
+      // PR-3: publish the unified conditions snapshot on the SAME screen-tick,
+      // AFTER every per-condition state has been (re)stored above
+      // (trustDialogState / permissionPromptState / resumePromptState /
+      // compactionState). The evaluator reads those fields via the getters, so it
+      // must run after they're current for this frame. Its own dedupe latch means
+      // an unchanged frame emits nothing — so calling it every tick is cheap. This
+      // is the call that RESTORES the dead trust/permission/resume/compaction
+      // modals (see publishConditionSnapshot). slash-picker is intentionally NOT
+      // part of the snapshot this PR (out of scope) — it stays on the per-event
+      // path emitted just above.
+      this.publishConditionSnapshot()
     })
 
     this.terminal.on('exit', ({ exitCode, signal }) => {
@@ -1337,8 +1399,70 @@ export class ClaudeCodeHeadless extends EventEmitter {
     return this.resumePromptState
   }
 
+  // getPermissionPromptState — ADDED in PR-3. It was MISSING (trust/resume/
+  // compaction had getters; permission did not), yet permissionPromptModule's
+  // detect needs the current permission state. We reconstruct it the same way
+  // the per-event `permission-prompt` emission does: return the last
+  // `permissionPromptState` the screen-tick handler stored from
+  // `detectPermissionPrompt(snap.plain)`. That field is the single source of
+  // truth for permission state, so this getter and the legacy emission read the
+  // exact same value — no new detection, no drift.
+  getPermissionPromptState(): PermissionPromptState {
+    return this.permissionPromptState
+  }
+
   getCompactionState(): CompactionState {
     return this.compactionState
+  }
+
+  // getConditionSnapshot — the latest unified snapshot. Always reflects the most
+  // recent `ts` (publishConditionSnapshot assigns it before the dedupe early
+  // return), matching CodexHeadless.getConditionSnapshot.
+  getConditionSnapshot(): ClaudeConditionSnapshot {
+    return this.conditionSnapshot
+  }
+
+  // publishConditionSnapshot — assemble + dedupe + emit the unified conditions
+  // snapshot. EXACT mirror of CodexHeadless.publishConditionSnapshot.
+  //
+  // WHY THIS IS THE HEART OF PR-3: this is the call that RESTORES the dead
+  // modals. The renderer's generic relay (sessionManager `conditions` →
+  // forwarder → `onSessionConditions` → applyConditionSnapshot → CLAUDE_VIEWS)
+  // was fully built but never fed for Claude because nothing emitted a snapshot.
+  // This method, called on the same screen-tick where the per-event detection
+  // runs, finally feeds it.
+  //
+  // WHY ADDITIVE (the old per-event emissions stay): the per-event
+  // trust-dialog/resume-prompt/permission-prompt/compaction-state emits and the
+  // slash-picker `snap.picker` path are KEPT untouched. Deleting them is a later
+  // cleanup PR. Running both in parallel is safe — they are independent event
+  // names; consumers that already listen to the old events keep working while
+  // the snapshot path lights up the modals.
+  private publishConditionSnapshot(): void {
+    // Build the input bundle from the getters (each returns the field the
+    // screen-tick handler last stored). The cast narrows the evaluator's generic
+    // snapshot to the Claude-typed one; the runtime value is identical (only the
+    // `conditions` map's static type is narrowed).
+    const snap = this.conditionEvaluator.evaluate({
+      trustDialog: this.trustDialogState,
+      permissionPrompt: this.permissionPromptState,
+      resumePrompt: this.resumePromptState,
+      compaction: this.compactionState,
+    }) as ClaudeConditionSnapshot
+    // ALWAYS update the public snapshot, even when unchanged — getConditionSnapshot
+    // must reflect the latest `ts`. Assigned BEFORE the dedupe early-return, exactly
+    // as CodexHeadless does.
+    this.conditionSnapshot = snap
+    // Dedupe on the evaluator's latch (keyOf == JSON.stringify of the conditions
+    // map, ts excluded, insertion order preserved). `changed` returns false and
+    // short-circuits when the conditions are byte-identical to the last emission.
+    if (!this.conditionEvaluator.changed(this.conditionEvaluator.keyOf(snap)))
+      return
+    // Emit BOTH the dedicated channel (what claudeSession forwards to the
+    // renderer relay) and the `event`-union mirror (for aggregated consumers),
+    // exactly like CodexHeadless.
+    this.emit('conditions', snap)
+    this.emit('event', { type: 'conditions', ts: snap.ts, snapshot: snap })
   }
 
   /** List resumable sessions for this cwd. */
