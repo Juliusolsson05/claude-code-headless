@@ -34,6 +34,10 @@ export type AskUserQuestionAnswer = {
   question: string
   header?: string
   multiSelect?: boolean
+  selectedOptions?: Array<{
+    label: string
+    number?: number
+  }>
   selectedLabels?: string[]
   text?: string
 }
@@ -46,7 +50,12 @@ export type DriveResult =
   | { ok: true; state: AskUserQuestionState | null }
   | {
       ok: false
-      reason: 'timeout' | 'aborted' | 'invalid-payload' | 'option-not-found'
+      reason:
+        | 'timeout'
+        | 'aborted'
+        | 'invalid-payload'
+        | 'option-not-found'
+        | 'no-resolver'
       lastState: AskUserQuestionState | null
       failedAtStep: string
     }
@@ -81,16 +90,52 @@ function isPayload(value: unknown): value is AskUserQuestionResolvePayload {
       (!Array.isArray(a.selectedLabels) ||
         !a.selectedLabels.every(label => typeof label === 'string'))
     ) return false
+    if (
+      a.selectedOptions !== undefined &&
+      (!Array.isArray(a.selectedOptions) ||
+        !a.selectedOptions.every(option => {
+          if (!option || typeof option !== 'object') return false
+          const o = option as Record<string, unknown>
+          if (typeof o.label !== 'string') return false
+          return o.number === undefined || typeof o.number === 'number'
+        }))
+    ) return false
     return true
   })
 }
 
-function optionByLabel(
+type AnswerSelection = {
+  label: string
+  number?: number
+}
+
+function answerSelections(answer: AskUserQuestionAnswer): AnswerSelection[] {
+  if (answer.selectedOptions?.length) return answer.selectedOptions
+  return (answer.selectedLabels ?? []).map(label => ({ label }))
+}
+
+function optionBySelection(
   state: AskUserQuestionState,
-  label: string,
+  selection: AnswerSelection,
 ): AskUserQuestionOption | null {
-  const wanted = normalizeLabel(label)
-  return state.options.find(option => normalizeLabel(option.label) === wanted) ?? null
+  const wanted = normalizeLabel(selection.label)
+  if (selection.number !== undefined) {
+    const byNumber = state.options.find(option => option.number === selection.number)
+    if (!byNumber) return null
+    // WHY verify the label even when the renderer sends a number:
+    // the number is only safe for the CURRENT live picker. If the user already
+    // answered in the raw terminal and the TUI advanced, "2" may now mean an
+    // entirely different option. Pairing number with label lets us use the number
+    // to disambiguate duplicate labels without blindly trusting stale semantics.
+    return normalizeLabel(byNumber.label) === wanted ? byNumber : null
+  }
+
+  const matches = state.options.filter(option => normalizeLabel(option.label) === wanted)
+  // Legacy payloads only carried labels. A single match remains supported, but
+  // duplicate labels must fail closed: choosing the first duplicate is worse than
+  // asking the user to retry through the terminal because it silently submits the
+  // wrong row.
+  return matches.length === 1 ? matches[0] : null
 }
 
 function optionToggled(
@@ -108,11 +153,61 @@ function sameQuestion(
 ): boolean {
   const stateQuestion = state.question ? normalizeLabel(state.question) : ''
   const answerQuestion = normalizeLabel(answer.question)
-  if (stateQuestion && stateQuestion !== answerQuestion) return false
+  if (stateQuestion) {
+    const questionMatches =
+      stateQuestion === answerQuestion ||
+      (stateQuestion.length >= 12 && answerQuestion.startsWith(stateQuestion)) ||
+      (answerQuestion.length >= 12 && stateQuestion.startsWith(answerQuestion))
+    if (!questionMatches) return false
+    return (
+      !answer.header ||
+      !state.header ||
+      normalizeLabel(answer.header) === normalizeLabel(state.header)
+    )
+  }
   if (answer.header && state.header) {
     return normalizeLabel(answer.header) === normalizeLabel(state.header)
   }
-  return true
+  // The parser can legitimately return `question: null` for some Claude
+  // layouts. That is not enough identity to drive a structured answer. Returning
+  // false keeps the resolver from applying "Yes"/"No" meant for one question to
+  // a later, indistinguishable prompt after the user has interacted manually.
+  return false
+}
+
+function sameScreenQuestion(
+  current: AskUserQuestionState,
+  previous: AskUserQuestionState,
+): boolean {
+  const currentQuestion = current.question ? normalizeLabel(current.question) : ''
+  const previousQuestion = previous.question ? normalizeLabel(previous.question) : ''
+  if (currentQuestion || previousQuestion) {
+    return currentQuestion === previousQuestion
+  }
+  const currentHeader = current.header ? normalizeLabel(current.header) : ''
+  const previousHeader = previous.header ? normalizeLabel(previous.header) : ''
+  if (currentHeader || previousHeader) {
+    return currentHeader === previousHeader
+  }
+  return (
+    current.options.map(o => normalizeLabel(o.label)).join('\u0000') ===
+    previous.options.map(o => normalizeLabel(o.label)).join('\u0000')
+  )
+}
+
+function sanitizeFreeText(value: string): string {
+  return value
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+    .trim()
+}
+
+function singleDigitForOption(option: AskUserQuestionOption): string | null {
+  return singleDigitForNumber(option.number)
+}
+
+function singleDigitForNumber(number: number): string | null {
+  return number >= 1 && number <= 9 ? String(number) : null
 }
 
 async function sendThenReparse(
@@ -153,24 +248,58 @@ async function waitForAdvance(
   ctx: AskUserQuestionResolveCtx,
   previous: AskUserQuestionState,
   step: string,
+  allowClose: boolean,
 ): Promise<DriveResult> {
-  // WHY "changed question OR disappeared" is the settle condition:
+  // WHY "changed question" and "closed picker" are separated:
   // AskUserQuestion is transcript-backed in the feed, but the TUI only shows one
   // question at a time. After an answer, Claude either advances to the next
-  // question or closes the picker entirely. Waiting for either avoids hardcoding
-  // a question count into the screen driver and lets the parser remain the
-  // source of truth for what is physically live.
+  // question or closes the picker entirely. A transient blank frame parses as
+  // null during repaint, so null is only success when the semantic payload says
+  // this was the LAST answer. For non-last answers we require a positive next
+  // picker observation; otherwise a one-frame null would drop the remaining
+  // questions while reporting success.
   return sendThenReparse(
     ctx,
     '',
     state =>
-      state === null ||
-      state.question !== previous.question ||
-      state.header !== previous.header ||
-      state.options.map(o => o.label).join('\u0000') !==
-        previous.options.map(o => o.label).join('\u0000'),
+      allowClose
+        ? state === null || (state !== null && !sameScreenQuestion(state, previous))
+        : state !== null && !sameScreenQuestion(state, previous),
     { failedAtStep: step },
   )
+}
+
+async function waitForStableTextEntry(
+  ctx: AskUserQuestionResolveCtx,
+  keys: string,
+  step: string,
+): Promise<DriveResult> {
+  const timeoutMs = 900
+  const pollIntervalMs = 30
+  const startedAt = Date.now()
+  let nullReads = 0
+  let lastState: AskUserQuestionState | null = ctx.reparse()
+  ctx.write(keys)
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (ctx.signal.aborted) {
+      return { ok: false, reason: 'aborted', lastState, failedAtStep: step }
+    }
+    lastState = ctx.reparse()
+    if (lastState === null) {
+      nullReads += 1
+      // The text-entry surface is currently outside the AUQ parser's modeled
+      // state, so "stable absence" is the only screen proof we have. Require
+      // several consecutive null parses before writing user text; a single null
+      // is just as likely to be Claude repainting the numbered picker.
+      if (nullReads >= 3) return { ok: true, state: null }
+    } else {
+      nullReads = 0
+    }
+    await sleep(pollIntervalMs)
+  }
+
+  return { ok: false, reason: 'timeout', lastState, failedAtStep: step }
 }
 
 async function focusSubmit(
@@ -203,26 +332,35 @@ async function driveSingle(
   ctx: AskUserQuestionResolveCtx,
   state: AskUserQuestionState,
   answer: AskUserQuestionAnswer,
+  allowClose: boolean,
 ): Promise<DriveResult> {
   if (answer.text && state.otherNumber !== null) {
-    const opened = await sendThenReparse(
-      ctx,
-      String(state.otherNumber),
-      // Claude currently replaces the picker with a text-entry surface that the
-      // AUQ parser does not model. Treat either "picker disappeared" or "same
-      // picker no longer matches" as enough to write the text. This is bounded
-      // by timeout, so a future UI change degrades to a structured failure
-      // instead of spraying text into an unrelated prompt indefinitely.
-      next => next === null || !sameQuestion(next, answer),
-      { failedAtStep: 'open-free-text', timeoutMs: 700 },
-    )
+    const text = sanitizeFreeText(answer.text)
+    if (!text) {
+      return {
+        ok: false,
+        reason: 'invalid-payload',
+        lastState: state,
+        failedAtStep: 'free-text-empty',
+      }
+    }
+    const otherKey = singleDigitForNumber(state.otherNumber)
+    if (!otherKey) {
+      return {
+        ok: false,
+        reason: 'option-not-found',
+        lastState: state,
+        failedAtStep: 'free-text-option-number',
+      }
+    }
+    const opened = await waitForStableTextEntry(ctx, otherKey, 'open-free-text')
     if (!opened.ok) return opened
-    ctx.write(`${answer.text}\r`)
-    return waitForAdvance(ctx, state, 'submit-free-text')
+    ctx.write(`${text}\r`)
+    return waitForAdvance(ctx, state, 'submit-free-text', allowClose)
   }
 
-  const label = answer.selectedLabels?.[0]
-  if (!label) {
+  const selection = answerSelections(answer)[0]
+  if (!selection) {
     return {
       ok: false,
       reason: 'invalid-payload',
@@ -230,34 +368,69 @@ async function driveSingle(
       failedAtStep: 'single-missing-selection',
     }
   }
-  const option = optionByLabel(state, label)
+  const option = optionBySelection(state, selection)
   if (!option) {
     return {
       ok: false,
       reason: 'option-not-found',
       lastState: state,
-      failedAtStep: `single-option:${label}`,
+      failedAtStep: `single-option:${selection.label}`,
     }
   }
-  ctx.write(String(option.number))
-  return waitForAdvance(ctx, state, `single-answer:${label}`)
+  const key = singleDigitForOption(option)
+  if (!key) {
+    return {
+      ok: false,
+      reason: 'option-not-found',
+      lastState: state,
+      failedAtStep: `single-option-number:${option.number}`,
+    }
+  }
+  ctx.write(key)
+  return waitForAdvance(ctx, state, `single-answer:${selection.label}`, allowClose)
 }
 
 async function driveMulti(
   ctx: AskUserQuestionResolveCtx,
   state: AskUserQuestionState,
   answer: AskUserQuestionAnswer,
+  allowClose: boolean,
 ): Promise<DriveResult> {
-  const selected = new Set((answer.selectedLabels ?? []).map(normalizeLabel))
+  const selectedNumbers = new Set<number>()
+  const selectedLabels = new Set<string>()
+  for (const selection of answerSelections(answer)) {
+    const option = optionBySelection(state, selection)
+    if (!option) {
+      return {
+        ok: false,
+        reason: 'option-not-found',
+        lastState: state,
+        failedAtStep: `multi-option:${selection.label}`,
+      }
+    }
+    selectedNumbers.add(option.number)
+    selectedLabels.add(normalizeLabel(option.label))
+  }
   let current: AskUserQuestionState | null = state
   for (const option of state.options) {
     if (state.otherNumber !== null && option.number === state.otherNumber) continue
-    const desired = selected.has(normalizeLabel(option.label))
+    const desired =
+      selectedNumbers.has(option.number) ||
+      selectedLabels.has(normalizeLabel(option.label))
     const actual = optionToggled(current ?? state, option.number)
     if (actual === desired) continue
+    const key = singleDigitForOption(option)
+    if (!key) {
+      return {
+        ok: false,
+        reason: 'option-not-found',
+        lastState: current,
+        failedAtStep: `toggle-option-number:${option.number}`,
+      }
+    }
     const toggled = await sendThenReparse(
       ctx,
-      String(option.number),
+      key,
       next => optionToggled(next ?? state, option.number) === desired,
       { failedAtStep: `toggle:${option.label}` },
     )
@@ -266,21 +439,34 @@ async function driveMulti(
   }
 
   if (answer.text && state.otherNumber !== null) {
-    const opened = await sendThenReparse(
-      ctx,
-      String(state.otherNumber),
-      next => next === null || !sameQuestion(next, answer),
-      { failedAtStep: 'multi-open-free-text', timeoutMs: 700 },
-    )
+    const text = sanitizeFreeText(answer.text)
+    if (!text) {
+      return {
+        ok: false,
+        reason: 'invalid-payload',
+        lastState: current ?? state,
+        failedAtStep: 'multi-free-text-empty',
+      }
+    }
+    const otherKey = singleDigitForNumber(state.otherNumber)
+    if (!otherKey) {
+      return {
+        ok: false,
+        reason: 'option-not-found',
+        lastState: current ?? state,
+        failedAtStep: 'multi-free-text-option-number',
+      }
+    }
+    const opened = await waitForStableTextEntry(ctx, otherKey, 'multi-open-free-text')
     if (!opened.ok) return opened
-    ctx.write(`${answer.text}\r`)
-    return waitForAdvance(ctx, state, 'multi-submit-free-text')
+    ctx.write(`${text}\r`)
+    return waitForAdvance(ctx, state, 'multi-submit-free-text', allowClose)
   }
 
   const focused = await focusSubmit(ctx, current ?? state)
   if (!focused.ok) return focused
   ctx.write('\r')
-  return waitForAdvance(ctx, state, 'submit-multi')
+  return waitForAdvance(ctx, state, 'submit-multi', allowClose)
 }
 
 export function resolveAskUserQuestionAction(
@@ -305,26 +491,42 @@ async function resolveAskUserQuestionAnswer(
   }
 
   let state = ctx.reparse()
-  for (const answer of action.payload.answers) {
+  for (let index = 0; index < action.payload.answers.length; index++) {
+    const answer = action.payload.answers[index]
+    const isLastAnswer = index === action.payload.answers.length - 1
     if (ctx.signal.aborted) {
       return { ok: false, reason: 'aborted', lastState: state, failedAtStep: 'abort' }
     }
-    if (!state) return { ok: true, state }
+    if (!state) {
+      return {
+        ok: false,
+        reason: 'timeout',
+        lastState: state,
+        failedAtStep: `missing-picker:${answer.question}`,
+      }
+    }
     if (!sameQuestion(state, answer)) {
       const waited = await sendThenReparse(
         ctx,
         '',
-        next => next === null || sameQuestion(next, answer),
+        next => next !== null && sameQuestion(next, answer),
         { failedAtStep: `wait-question:${answer.question}` },
       )
       if (!waited.ok) return waited
       state = waited.state
-      if (!state) return { ok: true, state }
+      if (!state) {
+        return {
+          ok: false,
+          reason: 'timeout',
+          lastState: state,
+          failedAtStep: `wait-question-missing:${answer.question}`,
+        }
+      }
     }
     const driven =
       state.mode === 'multi' || answer.multiSelect
-        ? await driveMulti(ctx, state, answer)
-        : await driveSingle(ctx, state, answer)
+        ? await driveMulti(ctx, state, answer, isLastAnswer)
+        : await driveSingle(ctx, state, answer, isLastAnswer)
     if (!driven.ok) return driven
     state = driven.state
   }
