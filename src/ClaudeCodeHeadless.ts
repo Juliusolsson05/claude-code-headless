@@ -310,6 +310,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
   // the older conditions carry for backward compatibility.
   private askUserQuestionState: AskUserQuestionState | null = null
   private readonly conditionResolveAbort = new AbortController()
+  private conditionResolveInFlight = false
 
   // --- Conditions snapshot (PR-3) ----------------------------------------
   //
@@ -1446,6 +1447,14 @@ export class ClaudeCodeHeadless extends EventEmitter {
   }
 
   async resolveConditionAction(action: ConditionCustomAction): Promise<DriveResult> {
+    if (this.conditionResolveInFlight) {
+      return {
+        ok: false,
+        reason: 'aborted',
+        lastState: this.askUserQuestionState,
+        failedAtStep: 'resolver-in-flight',
+      }
+    }
     // WHY the context is assembled here, not inside the module:
     // modules should stay small and provider-specific, but they should not own
     // the headless instance. This boundary hands the resolver exactly the live
@@ -1453,19 +1462,29 @@ export class ClaudeCodeHeadless extends EventEmitter {
     // re-run the AUQ parser after each keystroke. That keeps the parser free to
     // use the real xterm grid while avoiding a hard dependency from a module
     // back onto the class that hosts it.
-    const result = await this.conditionEvaluator.resolveAction(action, {
-      write: (data: string) => this.write(data),
-      term: () => this.terminal.getTerminal(),
-      snapshotPlain: () => this.terminal.snapshotPlain(),
-      reparse: () => {
-        this.askUserQuestionState = detectAskUserQuestion(this.terminal.getTerminal())
-        return this.askUserQuestionState
-      },
-      signal: this.conditionResolveAbort.signal,
-    })
-    return (
-      result as DriveResult | undefined
-    ) ?? { ok: true, state: this.askUserQuestionState }
+    this.conditionResolveInFlight = true
+    try {
+      const result = await this.conditionEvaluator.resolveAction(action, {
+        write: (data: string) => this.write(data),
+        term: () => this.terminal.getTerminal(),
+        snapshotPlain: () => this.terminal.snapshotPlain(),
+        reparse: () => {
+          this.askUserQuestionState = detectAskUserQuestion(this.terminal.getTerminal())
+          return this.askUserQuestionState
+        },
+        signal: this.conditionResolveAbort.signal,
+      })
+      return (
+        result as DriveResult | undefined
+      ) ?? {
+        ok: false,
+        reason: 'no-resolver',
+        lastState: this.askUserQuestionState,
+        failedAtStep: action.name,
+      }
+    } finally {
+      this.conditionResolveInFlight = false
+    }
   }
 
   // publishConditionSnapshot — assemble + dedupe + emit the unified conditions

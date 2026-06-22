@@ -68,6 +68,12 @@ import {
   detectTrustDialog, TRUST_DIALOG_ACCEPT_KEYS,
   detectPermissionPrompt, PERMISSION_PROMPT_APPROVE_KEYS, PERMISSION_PROMPT_DENY_KEYS,
   detectCompaction, detectResumePrompt, detectSlashPicker,
+  CLAUDE_MODULES, makeEvaluator,
+  trustDialogModule, permissionPromptModule, resumePromptModule,
+  compactionModule, askUserQuestionModule, slashPickerModule,
+  buildClaudeTrustDialogCondition, buildClaudePermissionPromptCondition,
+  buildClaudeResumePromptCondition, buildClaudeCompactionCondition,
+  buildClaudeAskUserQuestionCondition, buildClaudeSlashPickerCondition,
   diffLines,
   // Transcript
   isConversationEntry, isCompactBoundaryEntry, isCompactSummaryEntry,
@@ -79,7 +85,9 @@ import {
 } from 'claude-code-headless'
 ```
 
-All TypeScript types (`ClaudeCodeHeadlessOptions`, `SemanticEvent`,
+All TypeScript types (`ClaudeCodeHeadlessOptions`, `ConditionsEvent`,
+`ClaudeConditionSnapshot`, `ConditionCustomAction`,
+`AskUserQuestionResolvePayload`, `DriveResult`, `SemanticEvent`,
 `ScreenSnapshot`, `Entry`, etc.) are exported alongside their runtime
 counterparts. The package is ESM (`"type": "module"`).
 
