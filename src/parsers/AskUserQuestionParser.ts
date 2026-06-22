@@ -207,6 +207,15 @@ export function detectAskUserQuestion(term: TerminalInstance): AskUserQuestionSt
     if (!raw.trim()) continue
 
     if (DIVIDER_RE.test(raw)) {
+      // Claude draws one horizontal rule ABOVE the AskUserQuestion body and
+      // another between answer rows and the "Chat about this" footer. Only the
+      // second one is semantic. The previous implementation flipped
+      // `dividerSeen` on the top rule, so every real option was classified as
+      // below-divider/footer and the emitted condition had `options: []` /
+      // `actions: []` even while the screen visibly showed numbered answers.
+      // Scope the footer divider to "after at least one numbered row" so the
+      // frame line can still exist without poisoning the option map.
+      if (!sawFirstOption) continue
       dividerSeen = true
       continue
     }
