@@ -17,6 +17,10 @@ export {
   buildClaudeResumePromptCondition,
 } from './resumePrompt.js'
 export { compactionModule, buildClaudeCompactionCondition } from './compaction.js'
+export {
+  askUserQuestionModule,
+  buildClaudeAskUserQuestionCondition,
+} from './askUserQuestion.js'
 export { CLAUDE_MODULES } from './modules.js'
 
 // Re-export the generic headless evaluator from the vendored core, exactly as
@@ -35,6 +39,7 @@ export type {
   ClaudePermissionPromptCondition,
   ClaudeResumePromptCondition,
   ClaudeCompactionCondition,
+  ClaudeAskUserQuestionCondition,
   ConditionAction,
   ConditionCustomAction,
   ConditionPtyAction,

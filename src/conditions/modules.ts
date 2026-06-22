@@ -41,12 +41,19 @@
 // site, erased only here where the list is heterogeneous.
 
 import type { ConditionModule } from './core/contract.js'
+import { askUserQuestionModule } from './askUserQuestion.js'
 import { compactionModule } from './compaction.js'
 import { permissionPromptModule } from './permissionPrompt.js'
 import { resumePromptModule } from './resumePrompt.js'
 import { trustDialogModule } from './trustDialog.js'
 import type { ClaudeConditionInputs } from './types.js'
 
+// Order recap (see the header for why order is a wire contract): trust →
+// permission → resume → compaction → ask-user-question. ask-user-question is
+// appended LAST because it joined after the original four; appending keeps the
+// existing four records' insertion order byte-identical, so any snapshot that
+// does NOT involve a live picker produces the exact same dedupe key it did
+// before this module existed (no spurious "changed" churn on the modal path).
 export const CLAUDE_MODULES: readonly ConditionModule<
   string,
   ClaudeConditionInputs,
@@ -56,4 +63,5 @@ export const CLAUDE_MODULES: readonly ConditionModule<
   permissionPromptModule,
   resumePromptModule,
   compactionModule,
+  askUserQuestionModule,
 ] as const

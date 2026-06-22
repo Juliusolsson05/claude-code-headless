@@ -13,6 +13,7 @@
 // sides depend on, so it is the cycle-free home. This is the identical structure
 // codex-headless arrived at after the same problem (see its types.ts header).
 
+import type { AskUserQuestionState } from '../parsers/AskUserQuestionParser.js'
 import type { CompactionState } from '../parsers/CompactionParser.js'
 import type { PermissionPromptState } from '../parsers/PermissionPromptParser.js'
 import type { ResumePromptState } from '../parsers/ResumePromptParser.js'
@@ -30,21 +31,29 @@ export type {
 
 // ── The input bundle ────────────────────────────────────────────────────────
 //
-// One field per MODAL condition this PR restores. Each is the LATEST parsed
-// state the screen-tick handler stored on the ClaudeCodeHeadless instance
+// One field per condition module. Each is the LATEST parsed state the
+// screen-tick handler stored on the ClaudeCodeHeadless instance
 // (trustDialogState / permissionPromptState / resumePromptState /
-// compactionState). The slash-picker is INTENTIONALLY ABSENT — it is NOT
-// migrated to the snapshot path in this PR (it keeps its existing `snap.picker`
-// / `slash-picker` event path untouched), so it has no field here.
+// compactionState / askUserQuestionState). The slash-picker is INTENTIONALLY
+// ABSENT — it is NOT migrated to the snapshot path yet (it keeps its existing
+// `snap.picker` / `slash-picker` event path untouched), so it has no field here.
 //
-// Every field is non-optional and carries the parser's own `{ visible: false }`
-// resting value when its condition isn't live, so a module's `detect` can gate
-// purely on `state.visible` without a presence check.
+// The four modal fields each carry the parser's own `{ visible: false }` resting
+// value when not live, so their `detect` can gate purely on `state.visible`.
+//
+// `askUserQuestion` is the ODD ONE OUT: it is `AskUserQuestionState | null`, not
+// a `{ visible: false }` sentinel, because the AskUserQuestionParser returns
+// `null` when no picker is on screen (there is no "inactive picker" state to
+// represent). So its module's `detect` gates on a null check rather than a
+// `.visible` flag. This asymmetry is intentional — we carry each parser's
+// natural shape rather than force a uniform sentinel that the parser doesn't
+// produce.
 export type ClaudeConditionInputs = {
   trustDialog: TrustDialogState
   permissionPrompt: PermissionPromptState
   resumePrompt: ResumePromptState
   compaction: CompactionState
+  askUserQuestion: AskUserQuestionState | null
 }
 
 // ── Typed condition records (mirrors the ClaudeCondition union app-side) ─────
@@ -81,15 +90,22 @@ export type ClaudeCompactionCondition = {
   actions: ConditionAction[]
 }
 
+export type ClaudeAskUserQuestionCondition = {
+  kind: 'claude.ask-user-question'
+  state: AskUserQuestionState
+  actions: ConditionAction[]
+}
+
 // NOTE: `claude.slash-picker` is deliberately NOT part of this union. It is OUT
-// OF SCOPE for PR-3 — it stays on its existing per-event `snap.picker` path and
-// is migrated to the snapshot in a later PR. Adding it here would imply a module
+// OF SCOPE — it stays on its existing per-event `snap.picker` path and is
+// migrated to the snapshot in a later PR. Adding it here would imply a module
 // that doesn't exist yet.
 export type ClaudeCondition =
   | ClaudeTrustDialogCondition
   | ClaudePermissionPromptCondition
   | ClaudeResumePromptCondition
   | ClaudeCompactionCondition
+  | ClaudeAskUserQuestionCondition
 
 export type ClaudeConditionKind = ClaudeCondition['kind']
 

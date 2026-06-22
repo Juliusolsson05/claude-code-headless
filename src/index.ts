@@ -36,10 +36,12 @@ export {
   permissionPromptModule,
   resumePromptModule,
   compactionModule,
+  askUserQuestionModule,
   buildClaudeTrustDialogCondition,
   buildClaudePermissionPromptCondition,
   buildClaudeResumePromptCondition,
   buildClaudeCompactionCondition,
+  buildClaudeAskUserQuestionCondition,
   type ConditionEvaluator,
   type ClaudeCondition,
   type ClaudeConditionInputs,
@@ -104,6 +106,12 @@ export {
   type SlashPickerState,
   type PickerItem,
 } from './parsers/SlashPickerParser.js'
+
+export {
+  detectAskUserQuestion,
+  type AskUserQuestionState,
+  type AskUserQuestionOption,
+} from './parsers/AskUserQuestionParser.js'
 
 export {
   diffLines,

@@ -55,6 +55,7 @@ export function buildClaudeCompactionCondition(
     permissionPrompt: { visible: false },
     resumePrompt: { visible: false },
     compaction: state,
+    askUserQuestion: null,
   })
   if (detected === null) return null
   return {

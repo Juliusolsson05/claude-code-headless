@@ -19,6 +19,10 @@ import {
   type PermissionPromptState,
 } from './parsers/PermissionPromptParser.js'
 import { detectSlashPicker, type SlashPickerState } from './parsers/SlashPickerParser.js'
+import {
+  detectAskUserQuestion,
+  type AskUserQuestionState,
+} from './parsers/AskUserQuestionParser.js'
 import { detectTrustDialog, type TrustDialogState, TRUST_DIALOG_ACCEPT_KEYS } from './parsers/TrustDialogParser.js'
 // Conditions framework (PR-3). The long-lived evaluator + ordered module
 // registry that produce the unified `claude` conditions snapshot. Importing from
@@ -298,6 +302,15 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private lastCompactionKey: string | null = null
   private pickerState: SlashPickerState = { visible: false, items: [] }
   private lastPickerKey: string | null = null
+  // AskUserQuestion picker (PR-4). The parser returns `AskUserQuestionState |
+  // null` (null = no picker on screen) rather than a `{ visible: false }`
+  // sentinel, so the resting value is `null` — see the `askUserQuestion` field
+  // note in conditions/types.ts for why this one is shaped differently from the
+  // four modal states above. There is no legacy per-event emission or `lastKey`
+  // latch for it: AskUserQuestion is born ON the snapshot path (the evaluator's
+  // own dedupe handles change detection), so it never had the per-event channel
+  // the older conditions carry for backward compatibility.
+  private askUserQuestionState: AskUserQuestionState | null = null
 
   // --- Conditions snapshot (PR-3) ----------------------------------------
   //
@@ -563,6 +576,17 @@ export class ClaudeCodeHeadless extends EventEmitter {
       const picker = detectSlashPicker(this.terminal.getTerminal())
       const pickerKey = picker.visible ? JSON.stringify(picker) : null
       this.pickerState = picker
+
+      // AskUserQuestion picker (PR-4). Reads the live xterm grid (NOT
+      // snap.plain) for the same reason the slash picker does: detection needs
+      // the cursor `❯` glyph and per-row layout that only survive on the real
+      // terminal buffer, and it must scan the VIEWPORT only (scrollback can hold
+      // a stale picker from an earlier turn — exactly the ghost-render failure
+      // this whole feature kills). No legacy per-event emit and no `lastKey`
+      // latch: this state only feeds the conditions snapshot, whose evaluator
+      // owns dedupe. We store it here so publishConditionSnapshot (below, same
+      // tick) can fold it into the unified snapshot.
+      this.askUserQuestionState = detectAskUserQuestion(this.terminal.getTerminal())
 
       // Forward raw screen (legacy flat surface).
       this.emit('screen', snap)
@@ -1415,6 +1439,15 @@ export class ClaudeCodeHeadless extends EventEmitter {
     return this.compactionState
   }
 
+  // getAskUserQuestionState (PR-4) — the last AskUserQuestion picker state the
+  // screen-tick handler parsed, or null when no picker is on screen. Returns the
+  // same field publishConditionSnapshot folds into the snapshot, so any external
+  // caller and the snapshot read the exact same value (no re-detection, no
+  // drift) — same discipline as the getters above.
+  getAskUserQuestionState(): AskUserQuestionState | null {
+    return this.askUserQuestionState
+  }
+
   // getConditionSnapshot — the latest unified snapshot. Always reflects the most
   // recent `ts` (publishConditionSnapshot assigns it before the dedupe early
   // return), matching CodexHeadless.getConditionSnapshot.
@@ -1448,6 +1481,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       permissionPrompt: this.permissionPromptState,
       resumePrompt: this.resumePromptState,
       compaction: this.compactionState,
+      askUserQuestion: this.askUserQuestionState,
     }) as ClaudeConditionSnapshot
     // ALWAYS update the public snapshot, even when unchanged — getConditionSnapshot
     // must reflect the latest `ts`. Assigned BEFORE the dedupe early-return, exactly
