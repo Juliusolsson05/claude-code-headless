@@ -62,6 +62,7 @@ export function buildClaudePermissionPromptCondition(
     resumePrompt: { visible: false },
     compaction: { visible: false },
     askUserQuestion: null,
+    slashPicker: { visible: false, items: [] },
   })
   if (detected === null) return null
   return {

@@ -164,7 +164,6 @@ export type PermissionPromptEvent = {
 export type CompactionStateEvent = {
   type: 'compaction_state'; ts: number; state: CompactionState
 }
-export type SlashPickerEvent = { type: 'slash_picker'; ts: number; state: SlashPickerState }
 // Conditions snapshot event (PR-3). Carries the FULL unified snapshot, mirroring
 // codex-headless's CodexConditionsEvent. This is the `event`-union mirror of the
 // dedicated `conditions` channel emit; both fire from publishConditionSnapshot.
@@ -180,7 +179,6 @@ export type HeadlessEvent =
   | ResumePromptEvent
   | PermissionPromptEvent
   | CompactionStateEvent
-  | SlashPickerEvent
   | ConditionsEvent
   | ExitEvent
 
@@ -196,7 +194,6 @@ export type ClaudeCodeHeadlessEvents = {
   'resume-prompt': [ResumePromptState]
   'permission-prompt': [PermissionPromptState]
   'compaction-state': [CompactionState]
-  'slash-picker': [SlashPickerState]
   // Conditions snapshot channel (PR-3). The dedicated stream claudeSession
   // forwards to the renderer's generic `onSessionConditions` relay. Carries the
   // SAME snapshot as the `event`-union ConditionsEvent; both fire together from
@@ -303,7 +300,6 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private compactionState: CompactionState = { visible: false }
   private lastCompactionKey: string | null = null
   private pickerState: SlashPickerState = { visible: false, items: [] }
-  private lastPickerKey: string | null = null
   // AskUserQuestion picker (PR-4). The parser returns `AskUserQuestionState |
   // null` (null = no picker on screen) rather than a `{ visible: false }`
   // sentinel, so the resting value is `null` — see the `askUserQuestion` field
@@ -577,7 +573,6 @@ export class ClaudeCodeHeadless extends EventEmitter {
       this.compactionState = compaction
 
       const picker = detectSlashPicker(this.terminal.getTerminal())
-      const pickerKey = picker.visible ? JSON.stringify(picker) : null
       this.pickerState = picker
 
       // AskUserQuestion picker (PR-4). Reads the live xterm grid (NOT
@@ -870,14 +865,6 @@ export class ClaudeCodeHeadless extends EventEmitter {
         })
       }
 
-      // Slash picker detection
-      if (pickerKey !== this.lastPickerKey) {
-        this.lastPickerKey = pickerKey
-        this.emit('slash-picker', picker)
-        this.screen.publishSlashPicker(picker)
-        this.emit('event', { type: 'slash_picker', ts: Date.now(), state: picker })
-      }
-
       // PR-3: publish the unified conditions snapshot on the SAME screen-tick,
       // AFTER every per-condition state has been (re)stored above
       // (trustDialogState / permissionPromptState / resumePromptState /
@@ -885,9 +872,9 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // must run after they're current for this frame. Its own dedupe latch means
       // an unchanged frame emits nothing — so calling it every tick is cheap. This
       // is the call that RESTORES the dead trust/permission/resume/compaction
-      // modals (see publishConditionSnapshot). slash-picker is intentionally NOT
-      // part of the snapshot this PR (out of scope) — it stays on the per-event
-      // path emitted just above.
+      // modals (see publishConditionSnapshot) and now carries slash-picker too,
+      // so the renderer has one condition snapshot rather than a parallel sticky
+      // picker event path.
       this.publishConditionSnapshot()
     })
 
@@ -1491,12 +1478,9 @@ export class ClaudeCodeHeadless extends EventEmitter {
   // This method, called on the same screen-tick where the per-event detection
   // runs, finally feeds it.
   //
-  // WHY ADDITIVE (the old per-event emissions stay): the per-event
-  // trust-dialog/resume-prompt/permission-prompt/compaction-state emits and the
-  // slash-picker `snap.picker` path are KEPT untouched. Deleting them is a later
-  // cleanup PR. Running both in parallel is safe — they are independent event
-  // names; consumers that already listen to the old events keep working while
-  // the snapshot path lights up the modals.
+  // Slash picker is now part of this same snapshot path. Keeping it out forced
+  // the renderer to preserve a sticky `runtime.picker` fallback, which is exactly
+  // the kind of bespoke per-overlay state the conditions framework replaces.
   private publishConditionSnapshot(): void {
     // Build the input bundle from the getters (each returns the field the
     // screen-tick handler last stored). The cast narrows the evaluator's generic
@@ -1508,6 +1492,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       resumePrompt: this.resumePromptState,
       compaction: this.compactionState,
       askUserQuestion: this.askUserQuestionState,
+      slashPicker: this.pickerState,
     }) as ClaudeConditionSnapshot
     // ALWAYS update the public snapshot, even when unchanged — getConditionSnapshot
     // must reflect the latest `ts`. Assigned BEFORE the dedupe early-return, exactly
