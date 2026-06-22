@@ -56,6 +56,7 @@ export function buildClaudeCompactionCondition(
     resumePrompt: { visible: false },
     compaction: state,
     askUserQuestion: null,
+    slashPicker: { visible: false, items: [] },
   })
   if (detected === null) return null
   return {

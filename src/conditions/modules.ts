@@ -29,10 +29,9 @@
 // exclusive screen states), so the cross-record ordering rarely matters at
 // runtime — but the dedupe key still depends on it, so we freeze it regardless.
 //
-// `claude.slash-picker` is INTENTIONALLY ABSENT: it is OUT OF SCOPE for PR-3. It
-// keeps its existing per-event `snap.picker` / `slash-picker` path; migrating it
-// onto a module + the snapshot is a later PR. Adding it here would imply a module
-// that doesn't exist.
+// Slash picker is appended after AskUserQuestion because it joined the snapshot
+// later. Appending preserves the insertion order (and therefore dedupe key) for
+// every snapshot that does not contain a live slash picker.
 //
 // `readonly` + `as const`: the order is load-bearing, so we freeze it at the type
 // level. The `ConditionModule<string, ClaudeConditionInputs, any>` element type
@@ -45,15 +44,12 @@ import { askUserQuestionModule } from './askUserQuestion.js'
 import { compactionModule } from './compaction.js'
 import { permissionPromptModule } from './permissionPrompt.js'
 import { resumePromptModule } from './resumePrompt.js'
+import { slashPickerModule } from './slashPicker.js'
 import { trustDialogModule } from './trustDialog.js'
 import type { ClaudeConditionInputs } from './types.js'
 
 // Order recap (see the header for why order is a wire contract): trust →
-// permission → resume → compaction → ask-user-question. ask-user-question is
-// appended LAST because it joined after the original four; appending keeps the
-// existing four records' insertion order byte-identical, so any snapshot that
-// does NOT involve a live picker produces the exact same dedupe key it did
-// before this module existed (no spurious "changed" churn on the modal path).
+// permission → resume → compaction → ask-user-question → slash-picker.
 export const CLAUDE_MODULES: readonly ConditionModule<
   string,
   ClaudeConditionInputs,
@@ -65,4 +61,5 @@ export const CLAUDE_MODULES: readonly ConditionModule<
   resumePromptModule,
   compactionModule,
   askUserQuestionModule,
+  slashPickerModule,
 ] as const

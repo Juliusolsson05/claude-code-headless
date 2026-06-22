@@ -17,6 +17,7 @@ import type { AskUserQuestionState } from '../parsers/AskUserQuestionParser.js'
 import type { CompactionState } from '../parsers/CompactionParser.js'
 import type { PermissionPromptState } from '../parsers/PermissionPromptParser.js'
 import type { ResumePromptState } from '../parsers/ResumePromptParser.js'
+import type { SlashPickerState } from '../parsers/SlashPickerParser.js'
 import type { TrustDialogState } from '../parsers/TrustDialogParser.js'
 import type { ConditionAction } from './core/contract.js'
 
@@ -34,9 +35,7 @@ export type {
 // One field per condition module. Each is the LATEST parsed state the
 // screen-tick handler stored on the ClaudeCodeHeadless instance
 // (trustDialogState / permissionPromptState / resumePromptState /
-// compactionState / askUserQuestionState). The slash-picker is INTENTIONALLY
-// ABSENT — it is NOT migrated to the snapshot path yet (it keeps its existing
-// `snap.picker` / `slash-picker` event path untouched), so it has no field here.
+// compactionState / askUserQuestionState / slashPickerState).
 //
 // The four modal fields each carry the parser's own `{ visible: false }` resting
 // value when not live, so their `detect` can gate purely on `state.visible`.
@@ -54,6 +53,7 @@ export type ClaudeConditionInputs = {
   resumePrompt: ResumePromptState
   compaction: CompactionState
   askUserQuestion: AskUserQuestionState | null
+  slashPicker: SlashPickerState
 }
 
 // ── Typed condition records (mirrors the ClaudeCondition union app-side) ─────
@@ -96,16 +96,19 @@ export type ClaudeAskUserQuestionCondition = {
   actions: ConditionAction[]
 }
 
-// NOTE: `claude.slash-picker` is deliberately NOT part of this union. It is OUT
-// OF SCOPE — it stays on its existing per-event `snap.picker` path and is
-// migrated to the snapshot in a later PR. Adding it here would imply a module
-// that doesn't exist yet.
+export type ClaudeSlashPickerCondition = {
+  kind: 'claude.slash-picker'
+  state: SlashPickerState
+  actions: ConditionAction[]
+}
+
 export type ClaudeCondition =
   | ClaudeTrustDialogCondition
   | ClaudePermissionPromptCondition
   | ClaudeResumePromptCondition
   | ClaudeCompactionCondition
   | ClaudeAskUserQuestionCondition
+  | ClaudeSlashPickerCondition
 
 export type ClaudeConditionKind = ClaudeCondition['kind']
 

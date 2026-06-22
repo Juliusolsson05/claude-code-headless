@@ -69,6 +69,7 @@ export function buildClaudeResumePromptCondition(
     resumePrompt: state,
     compaction: { visible: false },
     askUserQuestion: null,
+    slashPicker: { visible: false, items: [] },
   })
   if (detected === null) return null
   return {

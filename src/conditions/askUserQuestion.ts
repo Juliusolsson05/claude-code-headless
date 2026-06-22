@@ -134,6 +134,7 @@ export function buildClaudeAskUserQuestionCondition(
     resumePrompt: { visible: false },
     compaction: { visible: false },
     askUserQuestion: state,
+    slashPicker: { visible: false, items: [] },
   })
   if (detected === null) return null
   return {

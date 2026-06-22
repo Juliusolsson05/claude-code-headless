@@ -21,6 +21,7 @@ export {
   askUserQuestionModule,
   buildClaudeAskUserQuestionCondition,
 } from './askUserQuestion.js'
+export { slashPickerModule, buildClaudeSlashPickerCondition } from './slashPicker.js'
 export type {
   AskUserQuestionAnswer,
   AskUserQuestionResolvePayload,
@@ -46,6 +47,7 @@ export type {
   ClaudeResumePromptCondition,
   ClaudeCompactionCondition,
   ClaudeAskUserQuestionCondition,
+  ClaudeSlashPickerCondition,
   ConditionAction,
   ConditionCustomAction,
   ConditionPtyAction,
