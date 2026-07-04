@@ -51,10 +51,11 @@ const NEGATIVE_RE = /[\u23F5\u23F6]/ // ⏵ markers only appear in the main UI s
  *
  * Pure function — no IO, no side effects, no Node APIs.
  *
- * Performance note: this gets called on every screen snapshot (~60Hz)
- * during recording, so it has to be cheap. The early return on the first
- * missing marker keeps the common case (dialog NOT visible) to one
- * substring search.
+ * Performance note: this gets called on every screen snapshot (up to
+ * ~10Hz per session, and only on changed frames since the change gate
+ * in HeadlessTerminal.scheduleFlush), so it has to be cheap. The early
+ * return on the first missing marker keeps the common case (dialog NOT
+ * visible) to one substring search.
  */
 export function detectTrustDialog(screen: string): TrustDialogState {
   if (!screen) return { visible: false }

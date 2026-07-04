@@ -273,7 +273,8 @@ export class SemanticChannel extends EventEmitter {
    *
    *   * Same-turn snapshots with unchanged text and no explicit
    *     textDelta are still suppressed — this is a cadence optimization
-   *     (screen fires ~60Hz), not a lifecycle decision.
+   *     (screen fires up to ~10Hz on changed frames), not a lifecycle
+   *     decision.
    *
    *   * A same-turn source change still emits `source_changed`
    *     before the delta, so consumers that want to reset optimistic
