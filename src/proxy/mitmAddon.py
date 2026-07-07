@@ -91,6 +91,13 @@ _HEADER_ALLOWLIST = frozenset({
 # (cli vs sdk-cli vs mcp vs claude-code-github-action) without having
 # to re-parse the whole header string.
 _CC_ENTRYPOINT_RE = re.compile(r"cc_entrypoint=([^;]+);")
+# Claude Code stamps `cc_is_subagent=true;` into the SAME billing-header
+# block (system[0]) for every request a Task subagent makes. It is the only
+# per-request signal that a flow belongs to a subagent rather than the main
+# agent — cc_entrypoint is process-scoped (in-process subagents share it), so
+# it cannot disambiguate. Extract it so the adapter can keep subagent flows
+# OUT of the parent's visible turn stream (agent-code #477 Track B).
+_CC_IS_SUBAGENT_RE = re.compile(r"cc_is_subagent=([^;]+);")
 
 
 # Signature regex for the Claude Code compaction-synthesis request.
@@ -401,10 +408,14 @@ def _extract_request_shape(content: bytes):
     # Code source). Look at the first prefix we collected; if no
     # match, leave None.
     attribution_entrypoint = None
+    is_subagent = False
     if system_prefixes:
         match = _CC_ENTRYPOINT_RE.search(system_prefixes[0])
         if match:
             attribution_entrypoint = match.group(1).strip()
+        sub_match = _CC_IS_SUBAGENT_RE.search(system_prefixes[0])
+        if sub_match:
+            is_subagent = sub_match.group(1).strip().lower() == "true" 
 
     compaction_synthesis = _detect_compaction_synthesis(messages)
     prompt_suggestion = _detect_prompt_suggestion(messages)
@@ -418,6 +429,7 @@ def _extract_request_shape(content: bytes):
         "system_total_chars": system_total_chars,
         "messages_total_chars": messages_total_chars,
         "attribution_entrypoint": attribution_entrypoint,
+        "is_subagent": is_subagent,
         "compaction_synthesis": compaction_synthesis,
         "prompt_suggestion": prompt_suggestion,
     }
