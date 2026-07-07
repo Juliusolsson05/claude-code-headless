@@ -345,6 +345,11 @@ type ParsedRequestShape = {
    *  predicate: a suggestion fork runs on the user's PRIMARY model with the
    *  full tools array, so isSidecarFlow can never catch it. */
   isPromptSuggestion: boolean
+  /** cc_is_subagent=true in the billing header — this flow belongs to a
+   *  Task subagent, not the main agent (#477 Track B). Kept OUT of the
+   *  parent's visible turn stream; the subagent's activity renders in its
+   *  own card via the watcher/SubAgentState channel. */
+  isSubagent: boolean
 }
 
 type FlowState = {
@@ -579,6 +584,17 @@ export type ClaudeProxyAdapterOptions = {
    *  Haiku via `getSmallFastModel()`. Pass `null` to disable sidecar
    *  filtering entirely even when a session model is provided. */
   sidecarModelPattern?: RegExp | null
+}
+
+/**
+ * Detect Claude Code's `cc_is_subagent=true` flag in a billing-header block
+ * (system[0]). Exported for unit tests; the mitm addon does the same
+ * extraction server-side so the adapter normally reads a pre-parsed
+ * `is_subagent` field, but the body_b64 fallback path re-derives it here.
+ * (#477 Track B.)
+ */
+export function headerMarksSubagent(systemPrefix: string | undefined | null): boolean {
+  return typeof systemPrefix === 'string' && /cc_is_subagent=true/.test(systemPrefix)
 }
 
 export class ClaudeProxyAdapter {
@@ -1074,6 +1090,31 @@ export class ClaudeProxyAdapter {
         // real turn holds the active lock, its output can still leak as a
         // phantom turn. Catching it would require a response-side or
         // lock-timing heuristic; tracked as follow-up, out of scope for #174.
+        // Subagent routing (#477 Track B). A Task subagent's API calls go
+        // through the SAME proxy as the main agent, all src=proxy, so
+        // without this they win the active lock while the main agent waits
+        // and their Read/Bash/text paint as PARENT feed rows. cc_is_subagent
+        // is Claude Code's explicit per-request flag (cc_entrypoint is
+        // process-scoped and can't disambiguate in-process subagents). Keep
+        // the flow OUT of the visible stream exactly like a prompt-suggestion
+        // fork: clear the spinner, flip to 'secondary' so later deltas fall
+        // through the isActive gates, record the decision. The subagent's
+        // activity still renders in its Task card via the watcher channel
+        // (SubAgentState, keyed by toolUseId) — N concurrent subagents are
+        // demuxed there, not here. Follow-up: correlate cch → toolUseId to
+        // stream live INTO each card instead of the 600ms file poll.
+        if (isActive && state.requestShape?.isSubagent === true) {
+          this.publishPhase(state, 'idle')
+          state.attribution = 'secondary'
+          this.channel.publishFlowIgnored({
+            flowId: state.flowId,
+            reason: 'subagent',
+            source,
+            confidence,
+          })
+          this.onDiagnostic(`flow ${state.flowId} routed as subagent (model=${ev.model})`)
+          return
+        }
         if (isActive && state.requestShape?.isPromptSuggestion === true) {
           state.isPromptSuggestionFlow = true
           this.publishPhase(state, 'idle')
@@ -1670,8 +1711,9 @@ export class ClaudeProxyAdapter {
     const rawCompaction = obj.compaction_synthesis
     const isCompactionSynthesis = rawCompaction === true
     const isPromptSuggestion = obj.prompt_suggestion === true
+    const isSubagent = obj.is_subagent === true
 
-    return { maxTokens, messageCount, systemPrefixes, isCompactionSynthesis, isPromptSuggestion }
+    return { maxTokens, messageCount, systemPrefixes, isCompactionSynthesis, isPromptSuggestion, isSubagent }
   }
 
   /** Decode and minimally parse the addon-supplied request body so the
@@ -1774,7 +1816,11 @@ export class ClaudeProxyAdapter {
       }
     }
 
-    return { maxTokens, messageCount, systemPrefixes, isCompactionSynthesis, isPromptSuggestion }
+    // cc_is_subagent lives in the billing-header block (system[0]); detect it
+    // from the prefixes this fallback already collected (#477 Track B).
+    const isSubagent = systemPrefixes.some(headerMarksSubagent)
+
+    return { maxTokens, messageCount, systemPrefixes, isCompactionSynthesis, isPromptSuggestion, isSubagent }
   }
 
   /** Whether the given flow looks like a sidecar (auxiliary) call rather
