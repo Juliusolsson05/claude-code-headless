@@ -118,42 +118,77 @@ export class ProxyServer extends EventEmitter {
 
   async start(): Promise<void> {
     try {
-      const caAlreadyExists = await canReadFile(this.info.caCertPath)
+      // WHY a bounded EADDRINUSE retry (agent-code#495 A7): the listen port
+      // is chosen in createProxyServer by binding-then-closing a throwaway
+      // net server (getFreePort) and handed to mitmdump moments later via
+      // --listen-port. That gap is a classic TOCTOU: on a busy machine
+      // another process can grab the port in between, mitmdump exits with
+      // "Address already in use" before writing its CA, and the whole
+      // provider session — the spine of every Claude run — fails to start.
+      //
+      // WHY retry-with-a-fresh-port instead of `--listen-port 0`: with port
+      // 0 the actually-bound port would have to be scraped from mitmdump's
+      // human-readable stderr banner, which is version-fragile text, and
+      // info.proxyUrl consumers would need a post-start handshake. Retrying
+      // keeps the contract identical (info is final once start() resolves —
+      // claudeSession reads info.proxyUrl only after awaiting start()) and
+      // collisions are rare enough that three attempts effectively never
+      // lose. Only the pre-CA port-collision death retries; every other
+      // failure (missing addon, bad mitmdump, CA timeout) rethrows at once.
+      for (let attempt = 1; ; attempt++) {
+        try {
+          const caAlreadyExists = await canReadFile(this.info.caCertPath)
 
-      // WHY a missing shared CA is a single-process critical section:
-      //
-      // Agent Code restores several Claude panes at once from a single Node
-      // main process — `createProxyServer` is invoked from `ClaudeSession` in
-      // the Electron main, so every concurrent pane shares this module's
-      // global state. If the shared mitmproxy confdir has just been deleted
-      // as part of a debug-storage cleanup, every restored pane can start
-      // `mitmdump` in the same second. mitmproxy lazily creates its CA on
-      // startup, so concurrent first starts race through CA generation. The
-      // losing shape is nasty: one live proxy can keep an in-memory CA/cert
-      // pair while a different generated CA wins on disk. Claude then
-      // receives NODE_EXTRA_CA_CERTS pointing at the disk winner, connects
-      // through the live proxy using the in-memory loser, and reports:
-      //   "SSL certificate verification failed. Check your proxy..."
-      //
-      // The serialization is therefore a module-scoped Promise queue, not a
-      // filesystem lock — that's intentional because the race we observe is
-      // intra-process. Multiple Agent Code app instances racing against the
-      // same confdir is not a scenario this guard covers (and it would have
-      // larger problems anyway, e.g. workspace.json contention). If the
-      // headless package ever grows a multi-process spawner that targets the
-      // same confdir, replace this with a real `mkdir`/`open('wx')`
-      // filesystem lock and recheck the CA inside it.
-      //
-      // Serialising only the bootstrap case keeps normal proxy startup cheap
-      // while making "delete the app proxy cache and restore many panes"
-      // deterministic. Once the CA file exists, later proxies can safely start
-      // in parallel because they all read the same persisted CA material.
-      if (!caAlreadyExists) {
-        await withCaBootstrapLock(this.info.confDir, () => this.startUnlocked())
-        return
+          // WHY a missing shared CA is a single-process critical section:
+          //
+          // Agent Code restores several Claude panes at once from a single Node
+          // main process — `createProxyServer` is invoked from `ClaudeSession` in
+          // the Electron main, so every concurrent pane shares this module's
+          // global state. If the shared mitmproxy confdir has just been deleted
+          // as part of a debug-storage cleanup, every restored pane can start
+          // `mitmdump` in the same second. mitmproxy lazily creates its CA on
+          // startup, so concurrent first starts race through CA generation. The
+          // losing shape is nasty: one live proxy can keep an in-memory CA/cert
+          // pair while a different generated CA wins on disk. Claude then
+          // receives NODE_EXTRA_CA_CERTS pointing at the disk winner, connects
+          // through the live proxy using the in-memory loser, and reports:
+          //   "SSL certificate verification failed. Check your proxy..."
+          //
+          // The serialization is therefore a module-scoped Promise queue, not a
+          // filesystem lock — that's intentional because the race we observe is
+          // intra-process. Multiple Agent Code app instances racing against the
+          // same confdir is not a scenario this guard covers (and it would have
+          // larger problems anyway, e.g. workspace.json contention). If the
+          // headless package ever grows a multi-process spawner that targets the
+          // same confdir, replace this with a real `mkdir`/`open('wx')`
+          // filesystem lock and recheck the CA inside it.
+          //
+          // Serialising only the bootstrap case keeps normal proxy startup cheap
+          // while making "delete the app proxy cache and restore many panes"
+          // deterministic. Once the CA file exists, later proxies can safely start
+          // in parallel because they all read the same persisted CA material.
+          if (!caAlreadyExists) {
+            await withCaBootstrapLock(this.info.confDir, () => this.startUnlocked())
+          } else {
+            await this.startUnlocked()
+          }
+          return
+        } catch (error) {
+          if (attempt >= 3 || !isPortCollisionError(error)) throw error
+          // The collision path means mitmdump already exited (waitForCa
+          // only reports "exited before CA became ready" when the child is
+          // dead) — do NOT call stop(): its child.once('exit') handshake
+          // never fires for an already-exited process and would hang here
+          // forever. Manual cleanup + a fresh port, then loop.
+          this.child = null
+          this.childExitCode = null
+          this.childExitSignal = null
+          this.stderrTail.length = 0
+          const nextPort = await getFreePort()
+          this.info.proxyPort = nextPort
+          this.info.proxyUrl = `http://127.0.0.1:${nextPort}`
+        }
       }
-
-      await this.startUnlocked()
     } catch (error) {
       await this.writeStartupError(error)
       throw error
@@ -647,6 +682,18 @@ async function resolveMitmDumpPath(options: CreateProxyServerOptions): Promise<s
   throw new Error(
     'Unable to find mitmdump. Run `npm run proxy-test-bootstrap` first or set CLAUDE_HEADLESS_MITMDUMP.',
   )
+}
+
+// Detects the one startup failure worth retrying: mitmdump lost the
+// getFreePort → --listen-port TOCTOU race. The signal is version-fragile
+// by nature (mitmproxy prints a human-readable OSError), so match the
+// stable substrings — Python's EADDRINUSE strerror text ("address already
+// in use") and the errno name itself — case-insensitively. waitForCa
+// embeds the stderr tail in the thrown Error message, which is what
+// arrives here.
+function isPortCollisionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /address already in use|EADDRINUSE/i.test(message)
 }
 
 async function getFreePort(): Promise<number> {
