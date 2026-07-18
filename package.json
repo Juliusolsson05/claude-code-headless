@@ -8,10 +8,21 @@
   "files": [
     "dist"
   ],
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "scripts": {
-    "build": "tsc && cp src/proxy/mitmAddon.py dist/proxy/mitmAddon.py",
+    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json && cp src/proxy/mitmAddon.py dist/proxy/mitmAddon.py",
+    "typecheck": "tsc --noEmit",
     "upstream:check": "node scripts/check-upstream.mjs",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:core": "vitest run --project core",
+    "test:system": "vitest run --project system",
+    "test:live": "vitest run --config vitest.live.config.ts --passWithNoTests",
+    "test:coverage": "vitest run --coverage",
+    "test:package": "npm run build && node scripts/test-package.mjs --require dist/proxy/mitmAddon.py",
+    "test:contract": "node scripts/check-test-contract.mjs",
+    "check": "npm run test:contract && npm run typecheck && npm test && npm run test:package"
   },
   "dependencies": {
     "@xterm/headless": "^5.5.0",
@@ -21,6 +32,8 @@
     "node-pty": "^1.0.0"
   },
   "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@vitest/coverage-v8": "^4.1.10",
     "tsx": "^4.21.0",
     "typescript": "^5.5.0",
     "vitest": "^4.1.10"
