@@ -42,6 +42,86 @@ export function isPromptLine(line: string): boolean {
   return /^\s*[❯>]\s*$/.test(line)
 }
 
+export type ClaudeComposerState = 'empty' | 'drafted' | 'unpainted'
+
+const EMPTY_COMPOSER_HINTS = new Set(['Press up to edit'])
+
+/**
+ * Classify Claude's active composer without asking a host application to learn
+ * Claude-specific terminal chrome.
+ *
+ * WHY this lives beside `isPromptLine`: emptiness is a provider protocol, not
+ * a generic app heuristic. Claude currently paints both a genuinely bare
+ * marker and `❯ Press up to edit` for an empty composer, and older/alternate
+ * terminal builds use ASCII `>`. A caller that recognizes only one rendering
+ * can wait forever even though the PTY is writable; a caller that treats every
+ * marker-prefixed row as empty can append automation onto a human draft. The
+ * exact known hint list deliberately fails closed when Claude introduces new
+ * prompt text: an unknown string is a draft until a captured screen proves it
+ * is provider-owned chrome.
+ */
+export function parseClaudeComposerState(screen: string): ClaudeComposerState {
+  if (!screen) return 'unpainted'
+  const lines = screen.split('\n')
+  let start = -1
+
+  // Claude brackets the editable area with horizontal rules. Starting from the
+  // final box prevents an old user-message echo in scrollback from becoming the
+  // active composer. Within that box the FIRST prompt marker is authoritative:
+  // later marker-prefixed rows may be literal pasted content.
+  for (let divider = lines.length - 1; divider >= 0; divider -= 1) {
+    if (!isDividerLine(lines[divider] ?? '')) continue
+    const nextDivider = lines.findIndex((line, index) =>
+      index > divider && isDividerLine(line),
+    )
+    const segmentEnd = nextDivider < 0 ? lines.length : nextDivider
+    for (let index = divider + 1; index < segmentEnd; index += 1) {
+      if (/^\s*[❯>](?:\s|$)/u.test(lines[index] ?? '')) {
+        start = index
+        break
+      }
+    }
+    if (start >= 0) break
+  }
+
+  // Unit fixtures and older Claude layouts do not always contain the upper
+  // rule. Keep the compatibility scan bounded to the viewport tail so a prompt
+  // from distant scrollback cannot manufacture current writability.
+  if (start < 0) {
+    const lowerBound = Math.max(0, lines.length - 12)
+    for (let index = lines.length - 1; index >= lowerBound; index -= 1) {
+      if (/^\s*[❯>](?:\s|$)/u.test(lines[index] ?? '')) {
+        start = index
+        break
+      }
+    }
+  }
+  if (start < 0) return 'unpainted'
+
+  const markerLine = (lines[start] ?? '').trim()
+  const firstLineContent = markerLine.replace(/^[❯>]\s*/u, '').trim()
+  let end = lines.length
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (isDividerLine(lines[index] ?? '')) {
+      end = index
+      break
+    }
+  }
+  const continuationHasContent = lines
+    .slice(start + 1, end)
+    // Older compact layouts omit the lower rule and place the persistent status
+    // row directly after the prompt. That row is known provider chrome, not a
+    // second draft line; every other nonblank continuation still fails closed.
+    .some(line => line.trim().length > 0 && !isStatusLine(line))
+
+  if (!continuationHasContent && (
+    firstLineContent.length === 0 || EMPTY_COMPOSER_HINTS.has(firstLineContent)
+  )) {
+    return 'empty'
+  }
+  return 'drafted'
+}
+
 /**
  * A line that starts with `❯` followed by text content. CC uses this
  * shape for queued user messages (and for the "your submitted prompt"
@@ -410,4 +490,3 @@ export function extractAssistantInProgress(screen: string): string {
   // and the comparison stays stable across Ink's repadding.
   return block.map(l => l.replace(/[ \t]+$/, '')).join('\n')
 }
-

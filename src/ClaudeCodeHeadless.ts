@@ -9,6 +9,8 @@ import {
 import {
   detectActivity,
   extractAssistantInProgress,
+  parseClaudeComposerState,
+  type ClaudeComposerState,
 } from './parsers/ScreenParser.js'
 import { detectCompaction, type CompactionState } from './parsers/CompactionParser.js'
 import { detectResumePrompt, type ResumePromptState } from './parsers/ResumePromptParser.js'
@@ -302,6 +304,11 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private compactionState: CompactionState = { visible: false }
   private lastCompactionKey: string | null = null
   private pickerState: SlashPickerState = { visible: false, items: [] }
+  // Computed once per terminal snapshot alongside every other provider parser.
+  // Host applications can have several independent observers (renderer,
+  // orchestration, diagnostics); making each observer rescan the full viewport
+  // would multiply terminal parsing cost with consumer count.
+  private composerState: ClaudeComposerState = 'unpainted'
   // AskUserQuestion picker (PR-4). The parser returns `AskUserQuestionState |
   // null` (null = no picker on screen) rather than a `{ visible: false }`
   // sentinel, so the resting value is `null` — see the `askUserQuestion` field
@@ -539,6 +546,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
 
     // On every screen snapshot, run all parsers and emit structured events.
     this.terminal.on('screen', (snap) => {
+      this.composerState = parseClaudeComposerState(snap.plain)
       const trust = detectTrustDialog(snap.plain)
       const trustKey = trust.visible
         ? JSON.stringify({
@@ -639,14 +647,25 @@ export class ClaudeCodeHeadless extends EventEmitter {
         // into the new turn (the user sees yesterday's reply briefly
         // under their new prompt). Suppress until the extracted text
         // actually differs from the baseline captured at turn start.
-        if (!this.screenBaselineSatisfied) {
-          if (!fullText || fullText === this.screenBaselineText) {
-            return
-          }
+        if (
+          !this.screenBaselineSatisfied &&
+          fullText &&
+          fullText !== this.screenBaselineText
+        ) {
           this.screenBaselineSatisfied = true
         }
 
-        if (fullText && fullText !== this.lastScreenSemanticText) {
+        // WHY this predicate replaces the former callback-level early return:
+        // the baseline may suppress a SEMANTIC delta, but the same terminal
+        // frame still owns activity and condition truth below. Returning from
+        // the screen callback here left the composer on frame N while the
+        // unified trust/permission snapshot remained on frame N-1, which made
+        // downstream readiness gates briefly believe a modal was writable.
+        if (
+          this.screenBaselineSatisfied &&
+          fullText &&
+          fullText !== this.lastScreenSemanticText
+        ) {
           // Compute the markdown flavor from the wider `recent`
           // snapshot rather than re-running the extractor on
           // markdown — the extractor is written against plain text.
@@ -1397,6 +1416,11 @@ export class ClaudeCodeHeadless extends EventEmitter {
   /** Current plain-text screen snapshot. */
   getScreen(): string {
     return this.terminal.snapshotPlain()
+  }
+
+  /** Latest provider-owned composer classification, computed once per frame. */
+  getComposerState(): ClaudeComposerState {
+    return this.composerState
   }
 
   /** Current markdown-reconstructed screen snapshot. */
