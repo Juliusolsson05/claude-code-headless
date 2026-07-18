@@ -55,21 +55,32 @@ afterEach(async () => {
 })
 
 describe('FileTailer scoped unwatch', () => {
-  it('a second tailer on the same path survives the first one closing', async () => {
-    const file = makeFile()
-    const seenByB: number[] = []
-    const a = tail(file, [])
-    tail(file, seenByB)
+  it(
+    'a second tailer on the same path survives the first one closing',
+    async () => {
+      const file = makeFile()
+      const seenByB: number[] = []
+      const a = tail(file, [])
+      tail(file, seenByB)
 
-    // The exact production sequence: old session (A) closes while the
-    // new session (B) tails the same rollout.
-    await a.close()
-    appendFileSync(file, JSON.stringify({ seq: 1 }) + '\n')
-    appendFileSync(file, JSON.stringify({ seq: 2 }) + '\n')
+      // WHY readiness is observed before closing A: FileTailer intentionally
+      // bootstraps through an asynchronous read stream. Racing the append
+      // against that bootstrap tests scheduler luck rather than scoped unwatch
+      // ownership, and failed under coverage load despite correct watcher
+      // behavior. Seeing seq=0 proves B owns a live initialized tail first.
+      expect(await waitFor(() => seenByB.includes(0), 5_000)).toBe(true)
 
-    expect(await waitFor(() => seenByB.includes(2), 3000)).toBe(true)
-    expect(seenByB).toContain(1)
-  })
+      // The exact production sequence: old session (A) closes while the new
+      // session (B) tails the same rollout.
+      await a.close()
+      appendFileSync(file, JSON.stringify({ seq: 1 }) + '\n')
+      appendFileSync(file, JSON.stringify({ seq: 2 }) + '\n')
+
+      expect(await waitFor(() => seenByB.includes(2), 5_000)).toBe(true)
+      expect(seenByB).toContain(1)
+    },
+    15_000,
+  )
 
   it('watchdog self-heals a murdered watcher and surfaces a diagnostic', async () => {
     const file = makeFile()
