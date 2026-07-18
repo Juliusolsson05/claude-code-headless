@@ -289,6 +289,7 @@ Resizes the PTY and the headless terminal in lockstep.
 | `isWorking()` | `boolean` | True if the spinner IS visible. |
 | `getActivity()` | `string \| null` | Current activity verb (e.g. `"Cogitating…"`) or `null` if idle. |
 | `getScreen()` | `string` | Current plain-text viewport snapshot. |
+| `getComposerState()` | `'empty' \| 'drafted' \| 'unpainted'` | Provider-owned classification of the active composer, computed once per screen frame. |
 | `getScreenMarkdown()` | `string` | Current viewport with bold/italic reconstructed as markdown. |
 | `getAssistantInProgress()` | `string` | In-progress assistant text extracted from the screen; `''` if none yet. |
 | `getSlashPickerState()` | `SlashPickerState` | Last-detected slash picker state. |
