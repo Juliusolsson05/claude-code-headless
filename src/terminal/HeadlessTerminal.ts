@@ -2,6 +2,8 @@ import { EventEmitter } from 'events'
 import type { IPty } from 'node-pty'
 import xtermHeadless from '@xterm/headless'
 
+import { isDividerLine, type ComposerAttributes } from '../parsers/ScreenParser.js'
+
 const { Terminal } = xtermHeadless
 type TerminalInstance = InstanceType<typeof Terminal>
 
@@ -380,6 +382,112 @@ export class HeadlessTerminal extends EventEmitter {
     return this.term
   }
 
+  /**
+   * Styling summary of the active composer row, or null when no composer is
+   * painted. Feed the result to parseClaudeComposerState().
+   *
+   * WHY this lives here rather than in ScreenParser: ScreenParser is
+   * deliberately pure-string so its tests stay trivial, and importing xterm
+   * there would make "classify a screen" depend on a terminal engine. This file
+   * already owns the Terminal and already hands out cell-level reads via
+   * getTerminal() (the slash picker's fg-color detection), so the cell walk
+   * belongs here. We return plain counts rather than the Terminal itself so the
+   * parser keeps consuming serialisable data.
+   *
+   * WHY the last divider-bracketed box wins: identical reasoning to
+   * ScreenParser's marker search — an old user-message echo in scrollback must
+   * never be mistaken for the live composer. The two searches MUST agree; if you
+   * change one, change both, or the parser will classify a row that these counts
+   * never described.
+   */
+  snapshotComposerAttributes(): ComposerAttributes | null {
+    const buf = this.term.buffer.active
+    const top = buf.viewportY
+    const bottom = buf.viewportY + this.term.rows - 1
+
+    let markerY = -1
+    for (let y = bottom; y >= top && markerY < 0; y--) {
+      const line = buf.getLine(y)
+      if (!line || !isDividerLine(line.translateToString(true))) continue
+      for (let k = y + 1; k <= bottom; k++) {
+        const candidate = buf.getLine(k)
+        if (!candidate) continue
+        const text = candidate.translateToString(true)
+        if (isDividerLine(text)) break
+        if (/^\s*[❯>](?:\s|$)/u.test(text)) {
+          markerY = k
+          break
+        }
+      }
+    }
+    // Compatibility scan, mirroring ScreenParser's: older Claude layouts do not
+    // always paint the upper rule. Without this the two searches disagree
+    // exactly where the box is missing — ScreenParser finds a composer, we
+    // return null, and classification silently falls back to the
+    // known-incomplete allowlist, i.e. straight back into the bug this change
+    // removes. Bounded to the viewport tail for the same reason ScreenParser
+    // bounds it: a marker from distant scrollback must not manufacture a
+    // current composer.
+    if (markerY < 0) {
+      const lowerBound = Math.max(top, bottom - 11)
+      for (let y = bottom; y >= lowerBound; y--) {
+        const line = buf.getLine(y)
+        if (!line) continue
+        if (/^\s*[❯>](?:\s|$)/u.test(line.translateToString(true))) {
+          markerY = y
+          break
+        }
+      }
+    }
+    if (markerY < 0) return null
+
+    const line = buf.getLine(markerY)
+    if (!line) return null
+
+    let dim = 0
+    let inverse = 0
+    let plain = 0
+    let seenMarker = false
+    for (let x = 0; x < line.length; x++) {
+      const cell = line.getCell(x)
+      if (!cell) continue
+      const chars = cell.getChars()
+      if (!chars.trim()) continue
+      // The marker glyph is chrome, not composer content.
+      if (!seenMarker && /[❯>]/u.test(chars)) {
+        seenMarker = true
+        continue
+      }
+      if (cell.isDim()) dim++
+      else if (cell.isInverse()) inverse++
+      else plain++
+    }
+    return { dim, inverse, plain }
+  }
+
+  /**
+   * Test-only synchronous-ish write directly into the headless terminal,
+   * bypassing the PTY.
+   *
+   * WHY it returns a promise: xterm's write() is async — bytes are not in the
+   * buffer when the call returns — so a test that asserts immediately would race
+   * the parser. Resolving from the write callback is the only way to assert on
+   * already-parsed cells. Not used on any production path; attach() owns the
+   * real mirror.
+   */
+  writeForTest(data: string): Promise<void> {
+    return new Promise(resolve => {
+      this.term.write(data, () => {
+        // Mirror attach()'s ordering: parse, then schedule the snapshot flush.
+        // Without this a test can read cells directly but never sees a 'screen'
+        // event, so anything derived in that handler (composerState) stays
+        // stale and the test proves less than it appears to.
+        this.scheduleFlush()
+        resolve()
+      })
+    })
+  }
+
   /** True if the PTY has exited. */
   isExited(): boolean {
     return this.exited
@@ -473,6 +581,23 @@ export class HeadlessTerminal extends EventEmitter {
       // getTerminal() (slash picker / AskUserQuestion detection), so
       // nothing observable regresses; revisit if a consumer ever
       // needs attribute-driven cadence.
+      //
+      // UPDATE 2026-07-19: composer classification now DOES depend on
+      // attributes (snapshotComposerAttributes, consumed in
+      // ClaudeCodeHeadless's 'screen' handler). It is still safe, but the
+      // reason is narrower than before and worth stating: a composer
+      // transition between placeholder and human draft essentially always
+      // changes the row's TEXT too — the placeholder is replaced by what the
+      // user typed, or vice versa — so the text gate fires. The uncovered case
+      // is a styling flip with byte-identical text, e.g. a human draft whose
+      // characters exactly match the suggestion Claude was offering. That
+      // leaves composerState briefly stale, which the prompt gate's
+      // bounded-staleness rule absorbs.
+      //
+      // Deliberately NOT making this gate attribute-aware: serialising cell
+      // attributes every frame is precisely the 60Hz snapshot churn that
+      // previously pinned the main process at ~80% CPU. Text-only comparison
+      // stays the right default.
       const plain = this.snapshotPlain()
       const recent = this.snapshotRecent()
       if (plain === this.lastEmittedPlain && recent === this.lastEmittedRecent) {

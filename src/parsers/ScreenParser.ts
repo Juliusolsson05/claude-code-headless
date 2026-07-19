@@ -44,7 +44,36 @@ export function isPromptLine(line: string): boolean {
 
 export type ClaudeComposerState = 'empty' | 'drafted' | 'unpainted'
 
-const EMPTY_COMPOSER_HINTS = new Set(['Press up to edit'])
+/**
+ * Per-frame styling summary of the composer's content cells, produced by
+ * `HeadlessTerminal.snapshotComposerAttributes()`.
+ *
+ * WHY this type exists at all: the plain-text screen erases styling, and
+ * Claude's placeholder text is arbitrary — prompt suggestions are model-authored
+ * prose, example commands are generated from the user's git history, teammate
+ * hints contain user data. None of it is distinguishable from a human draft by
+ * its characters. The ONLY reliable discriminator is how it is painted.
+ *
+ * Counts exclude the `❯`/`>` marker glyph and every blank cell.
+ */
+export type ComposerAttributes = {
+  /** Cells rendered dim (SGR 2). Upstream paints every placeholder this way. */
+  dim: number
+  /** Cells rendered as the inverted cursor block (SGR 7). */
+  inverse: number
+  /** Cells that are neither — i.e. characters the human typed. */
+  plain: number
+}
+
+// Known-incomplete BY CONSTRUCTION, and only consulted on the string-fallback
+// path. Placeholders also include teammate hints (user data), example commands
+// (generated from git history), and prompt suggestions (model-authored prose),
+// none of which can be enumerated. Both entries below are proven provider chrome
+// from captured screens; the attribute path is the complete answer.
+const EMPTY_COMPOSER_HINTS = new Set([
+  'Press up to edit',
+  'Press up to edit queued messages',
+])
 
 /**
  * Classify Claude's active composer without asking a host application to learn
@@ -59,8 +88,18 @@ const EMPTY_COMPOSER_HINTS = new Set(['Press up to edit'])
  * exact known hint list deliberately fails closed when Claude introduces new
  * prompt text: an unknown string is a draft until a captured screen proves it
  * is provider-owned chrome.
+ *
+ * That fail-closed rule shipped in #39 and broke within a day: Claude renders
+ * prompt suggestions INTO the composer as placeholder text, so ordinary
+ * model-authored prose was read as a human draft and the prompt gate latched
+ * `occupied` permanently (186 continuous seconds observed). Pass `attrs`
+ * whenever the caller has terminal access — styling settles it exactly, and the
+ * string path below survives only for callers that have none.
  */
-export function parseClaudeComposerState(screen: string): ClaudeComposerState {
+export function parseClaudeComposerState(
+  screen: string,
+  attrs?: ComposerAttributes | null,
+): ClaudeComposerState {
   if (!screen) return 'unpainted'
   const lines = screen.split('\n')
   let start = -1
@@ -114,6 +153,35 @@ export function parseClaudeComposerState(screen: string): ClaudeComposerState {
     // second draft line; every other nonblank continuation still fails closed.
     .some(line => line.trim().length > 0 && !isStatusLine(line))
 
+  // ATTRIBUTE PATH — authoritative whenever the caller could supply it.
+  //
+  // WHY this outranks every string heuristic below: upstream builds the
+  // placeholder as chalk.dim(text), or invert(text[0]) + chalk.dim(rest) when
+  // focused, and renders it ONLY when the composer value is empty
+  // (vendor/claude-code-src/full/hooks/renderPlaceholder.ts:33-45). So a content
+  // cell that is neither dim nor the inverted cursor is, by construction, a
+  // character the human typed. That is a structural property of the renderer
+  // rather than a guess about wording, which is why it keeps working when
+  // Claude invents new placeholder text — the exact drift that broke the
+  // allowlist a day after it shipped.
+  //
+  // Reached only after the marker search above succeeded: attributes describing
+  // a row we never located prove nothing, so 'unpainted' still wins.
+  // `continuationHasContent` is still consulted here. The attribute descriptor
+  // samples ONLY the marker row, so on its own it is strictly weaker than the
+  // string path it takes precedence over: a draft whose first line is empty
+  // (shift+enter, or a paste beginning with a newline) puts every typed
+  // character on a continuation row, leaving the marker row with zero content
+  // cells. Reading `attrs.plain` alone would call that 'empty' and let an agent
+  // type over a human's half-written message — strictly worse than the
+  // false-'drafted' bug this whole change exists to fix, because that one only
+  // blocked delivery while this one destroys input.
+  if (attrs) {
+    return attrs.plain > 0 || continuationHasContent ? 'drafted' : 'empty'
+  }
+
+  // STRING FALLBACK for callers with no terminal access (replayed recordings,
+  // unit fixtures). Known-incomplete — see ComposerAttributes.
   if (!continuationHasContent && (
     firstLineContent.length === 0 || EMPTY_COMPOSER_HINTS.has(firstLineContent)
   )) {

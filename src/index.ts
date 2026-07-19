@@ -76,6 +76,7 @@ export {
   isPromptLine,
   parseClaudeComposerState,
   type ClaudeComposerState,
+  type ComposerAttributes,
   isUserPromptLine,
   isStatusLine,
   isIntermediateChromeLine,
