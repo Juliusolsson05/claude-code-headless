@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
-import { parseClaudeComposerState } from './ScreenParser.js'
+import { parseClaudeComposerState, type ComposerAttributes } from './ScreenParser.js'
+
+const RULE = '─'.repeat(40)
+const box = (composerRow: string): string => [RULE, composerRow, RULE].join('\n')
 
 describe('parseClaudeComposerState', () => {
   it.each([
@@ -36,5 +39,76 @@ describe('parseClaudeComposerState', () => {
       '────────────────────',
     ].join('\n')
     expect(parseClaudeComposerState(screen)).toBe('drafted')
+  })
+})
+
+describe('parseClaudeComposerState with cell attributes', () => {
+  // WHY these cases exist: upstream renders EVERY composer placeholder through
+  // chalk.dim, and only when the composer value is empty
+  // (vendor/claude-code-src/full/hooks/renderPlaceholder.ts:33-45). So dim
+  // content is positive proof of emptiness no matter what the words say. Each
+  // string below is real text a live Claude 2.1.215 painted into an EMPTY
+  // composer — the last two are unbounded by construction (generated from the
+  // user's git history, and model-authored prose), which is exactly why the
+  // string allowlist this replaces could never be completed.
+  it.each([
+    'Press up to edit queued messages',
+    'now count backwards from 30 to 1',
+    'Message @some-teammate…',
+    'write a test for parseClaudeComposerState',
+  ])('treats fully dim composer text as empty: %s', text => {
+    const attrs: ComposerAttributes = { dim: text.length, inverse: 0, plain: 0 }
+    expect(parseClaudeComposerState(box(`❯ ${text}`), attrs)).toBe('empty')
+  })
+
+  it('treats the focused placeholder (inverted first char) as empty', () => {
+    // Focused composer renders invert(placeholder[0]) + chalk.dim(rest), so the
+    // cursor cell must not be mistaken for human-owned text.
+    const attrs: ComposerAttributes = { dim: 31, inverse: 1, plain: 0 }
+    expect(parseClaudeComposerState(box('❯ now count backwards from 30 to 1'), attrs))
+      .toBe('empty')
+  })
+
+  it('treats any non-dim content cell as a human draft', () => {
+    const attrs: ComposerAttributes = { dim: 0, inverse: 0, plain: 26 }
+    expect(parseClaudeComposerState(box('❯ this is a real human draft'), attrs))
+      .toBe('drafted')
+  })
+
+  it('treats a human draft with the cursor mid-text as a draft', () => {
+    const attrs: ComposerAttributes = { dim: 0, inverse: 1, plain: 25 }
+    expect(parseClaudeComposerState(box('❯ this is a real human draft'), attrs))
+      .toBe('drafted')
+  })
+
+  it('treats a bare marker with no content cells as empty', () => {
+    const attrs: ComposerAttributes = { dim: 0, inverse: 0, plain: 0 }
+    expect(parseClaudeComposerState(box('❯ '), attrs)).toBe('empty')
+  })
+
+  it('returns unpainted when no composer row exists, even with attributes', () => {
+    // Attributes describing a row we never located prove nothing, so the
+    // marker search still decides whether a composer exists at all.
+    const attrs: ComposerAttributes = { dim: 5, inverse: 0, plain: 0 }
+    expect(parseClaudeComposerState('', attrs)).toBe('unpainted')
+  })
+
+  it('falls back to string classification when attributes are absent', () => {
+    // Callers with no terminal access (replayed recordings, existing fixtures)
+    // must keep the old behaviour rather than crash or silently flip.
+    expect(parseClaudeComposerState(box('❯ this is a real human draft'))).toBe('drafted')
+    expect(parseClaudeComposerState(box('❯ Press up to edit'))).toBe('empty')
+  })
+
+  it('does not treat a null descriptor as an all-dim composer', () => {
+    expect(parseClaudeComposerState(box('❯ this is a real human draft'), null))
+      .toBe('drafted')
+  })
+
+  it('recognizes the queued-messages hint through the string fallback', () => {
+    // Defense in depth: this exact string is proven provider chrome from a
+    // captured screen, and the fallback path is what replayed recordings take.
+    expect(parseClaudeComposerState(box('❯ Press up to edit queued messages')))
+      .toBe('empty')
   })
 })
