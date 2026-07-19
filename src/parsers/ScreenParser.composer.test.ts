@@ -1,9 +1,36 @@
-import { describe, expect, it } from 'vitest'
+import type { IPty } from 'node-pty'
+import { describe, expect, it, vi } from 'vitest'
 
+import { HeadlessTerminal } from '../terminal/HeadlessTerminal.js'
 import { parseClaudeComposerState, type ComposerAttributes } from './ScreenParser.js'
 
 const RULE = '─'.repeat(40)
+const NARROW_RULE = '─'.repeat(30)
 const box = (composerRow: string): string => [RULE, composerRow, RULE].join('\n')
+
+// Real SGR sequences, matching what chalk emits upstream: chalk.dim -> SGR 2,
+// chalk.inverse -> SGR 7. Writing genuine escape codes (rather than asserting
+// on a hand-built descriptor) is the point of these cases — they prove the cell
+// walk reads what a terminal actually paints.
+const DIM = (s: string): string => `\x1b[2m${s}\x1b[22m`
+const INV = (s: string): string => `\x1b[7m${s}\x1b[27m`
+
+function fakePty(): IPty {
+  const disposable = { dispose: vi.fn() }
+  return {
+    pid: 1, process: 'claude', cols: 80, rows: 12, handleFlowControl: false,
+    write: vi.fn(), resize: vi.fn(), clear: vi.fn(), pause: vi.fn(),
+    resume: vi.fn(), kill: vi.fn(),
+    onData: vi.fn(() => disposable), onExit: vi.fn(() => disposable),
+  } as unknown as IPty
+}
+
+async function paint(...rows: string[]): Promise<HeadlessTerminal> {
+  const term = new HeadlessTerminal({ pty: fakePty(), cols: 80, rows: 12 })
+  // \r\n so xterm advances lines exactly as it would for PTY output.
+  await term.writeForTest(rows.join('\r\n'))
+  return term
+}
 
 describe('parseClaudeComposerState', () => {
   it.each([
@@ -110,5 +137,75 @@ describe('parseClaudeComposerState with cell attributes', () => {
     // captured screen, and the fallback path is what replayed recordings take.
     expect(parseClaudeComposerState(box('❯ Press up to edit queued messages')))
       .toBe('empty')
+  })
+})
+
+describe('HeadlessTerminal.snapshotComposerAttributes', () => {
+  it('counts a dim placeholder as dim content with no plain cells', async () => {
+    const term = await paint(RULE, `❯ ${DIM('Press up to edit queued messages')}`, RULE)
+    const attrs = term.snapshotComposerAttributes()
+    expect(attrs).not.toBeNull()
+    expect(attrs!.plain).toBe(0)
+    expect(attrs!.dim).toBeGreaterThan(0)
+  })
+
+  it('counts a focused placeholder as inverse-first plus dim remainder', async () => {
+    const term = await paint(
+      RULE, `❯ ${INV('n')}${DIM('ow count backwards from 30 to 1')}`, RULE,
+    )
+    const attrs = term.snapshotComposerAttributes()!
+    expect(attrs.plain).toBe(0)
+    expect(attrs.inverse).toBe(1)
+    expect(attrs.dim).toBeGreaterThan(0)
+  })
+
+  it('counts typed text as plain content', async () => {
+    const term = await paint(RULE, '❯ this is a real human draft', RULE)
+    const attrs = term.snapshotComposerAttributes()!
+    expect(attrs.plain).toBeGreaterThan(0)
+    expect(attrs.dim).toBe(0)
+  })
+
+  it('returns null when no composer row is painted', async () => {
+    const term = await paint('just some output', 'no composer here')
+    expect(term.snapshotComposerAttributes()).toBeNull()
+  })
+
+  it('does not count the marker glyph itself as content', async () => {
+    const term = await paint(RULE, '❯ ', RULE)
+    expect(term.snapshotComposerAttributes()).toEqual({ dim: 0, inverse: 0, plain: 0 })
+  })
+})
+
+describe('composer attribute edge cases', () => {
+  it('classifies a wrapped dim placeholder as empty', async () => {
+    // Long suggestions wrap past the marker row, and only the marker row is
+    // sampled. Assert the wrapped case explicitly rather than assuming the
+    // first row alone carries the verdict.
+    const long = 'go, full attribute reader and include the recording change'
+    const term = await paint(NARROW_RULE, `❯ ${DIM(long)}`, NARROW_RULE)
+    const attrs = term.snapshotComposerAttributes()!
+    expect(attrs.plain).toBe(0)
+    expect(parseClaudeComposerState(term.snapshotPlain(), attrs)).toBe('empty')
+  })
+
+  it('classifies the pasted-content marker as a human draft', async () => {
+    // "[Pasted text #1 +5 lines]" is Claude's own chrome, but it stands in for
+    // content the human actually pasted, so it MUST stay 'drafted'. It renders
+    // non-dim, so the attribute path gets this right for free — lock it in.
+    const term = await paint(RULE, '❯ [Pasted text #1 +5 lines]', RULE)
+    const attrs = term.snapshotComposerAttributes()!
+    expect(attrs.plain).toBeGreaterThan(0)
+    expect(parseClaudeComposerState(term.snapshotPlain(), attrs)).toBe('drafted')
+  })
+
+  it('does not mistake a trust-dialog menu row for a composer draft', async () => {
+    // '❯ 1. Yes, I trust this folder' matches the marker regex. Conditions are
+    // checked before the composer in derivePromptGateState so this is latent
+    // today, but it is the same class of bug and must not regress.
+    const term = await paint(
+      'Do you trust the files in this folder?', '❯ 1. Yes, I trust this folder',
+    )
+    expect(term.snapshotComposerAttributes()).toBeNull()
   })
 })

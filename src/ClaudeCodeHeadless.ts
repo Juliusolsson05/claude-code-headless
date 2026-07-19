@@ -546,7 +546,15 @@ export class ClaudeCodeHeadless extends EventEmitter {
 
     // On every screen snapshot, run all parsers and emit structured events.
     this.terminal.on('screen', (snap) => {
-      this.composerState = parseClaudeComposerState(snap.plain)
+      // Pass the per-frame cell-attribute descriptor so placeholder text —
+      // prompt suggestions, queue/teammate hints, example commands — is
+      // recognised as an EMPTY composer. The plain snapshot alone cannot tell
+      // model-authored suggestion prose from a human draft, and guessing wrong
+      // latches the prompt gate at 'occupied' with no recovery path.
+      this.composerState = parseClaudeComposerState(
+        snap.plain,
+        this.terminal.snapshotComposerAttributes(),
+      )
       const trust = detectTrustDialog(snap.plain)
       const trustKey = trust.visible
         ? JSON.stringify({
