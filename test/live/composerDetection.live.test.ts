@@ -61,10 +61,16 @@ describe('live composer detection', () => {
       // Wait for the composer box (a divider rule) to paint.
       for (let i = 0; i < 25 && !/─{10}/.test(term.snapshotPlain()); i++) await sleep(1000)
 
+      // Unconditional: extraction itself must work. Without this the test
+      // passes even if snapshotComposerAttributes() returns null forever, since
+      // a bare `❯` classifies 'empty' through the string fallback too — i.e.
+      // total extraction failure would look identical to success.
+      expect(term.snapshotComposerAttributes()).not.toBeNull()
       expect(classify()).toBe('empty')
 
       pty.write('this is a real human draft')
       await sleep(2500)
+      expect(term.snapshotComposerAttributes()!.plain).toBeGreaterThan(0)
       expect(classify()).toBe('drafted')
 
       for (let i = 0; i < 80; i++) pty.write('\x7f')
@@ -75,19 +81,31 @@ describe('live composer detection', () => {
       // that suggestion as a dim placeholder over an EMPTY composer, which is
       // the exact regression: arbitrary model prose that must NOT read as a
       // draft.
+      //
+      // Polled rather than sampled once: a single fixed sleep races the
+      // streaming turn, so a slow reply — not the absence of a suggestion —
+      // was the likely reason to miss it.
       pty.write('count slowly from 1 to 30, one number per line\r')
-      await sleep(35000)
-
-      const attrs = term.snapshotComposerAttributes()
-      if (attrs && attrs.dim > 0) {
-        // A placeholder is on screen. It has visible text, so the pre-fix
-        // parser would have said 'drafted' and blocked delivery forever.
-        expect(attrs.plain).toBe(0)
-        expect(classify()).toBe('empty')
-      } else {
-        // Suggestions are not guaranteed on any given run (they depend on model
-        // output and user settings). Say so loudly rather than passing quietly
-        // and implying coverage this run did not actually provide.
+      let sawDimPlaceholder = false
+      for (let i = 0; i < 45; i++) {
+        const polled = term.snapshotComposerAttributes()
+        if (polled && polled.dim > 0) {
+          sawDimPlaceholder = true
+          // Visible text over an empty composer: the pre-fix parser called this
+          // 'drafted' and blocked delivery indefinitely.
+          expect(polled.plain).toBe(0)
+          expect(classify()).toBe('empty')
+          break
+        }
+        await sleep(1000)
+      }
+      if (!sawDimPlaceholder) {
+        // Deliberately NOT a failure. A placeholder needs Claude to actually
+        // offer a suggestion, and an empty composer does not always carry one —
+        // a fresh temp cwd has no git history, so there is no example command
+        // to fall back on. Asserting it would make the canary flaky for a
+        // reason unrelated to drift. Say so loudly instead, so a run never
+        // implies coverage it did not provide.
         console.warn(
           '[live] no dim placeholder appeared this run; the placeholder assertion did not execute',
         )

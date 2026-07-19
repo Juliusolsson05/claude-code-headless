@@ -420,6 +420,25 @@ export class HeadlessTerminal extends EventEmitter {
         }
       }
     }
+    // Compatibility scan, mirroring ScreenParser's: older Claude layouts do not
+    // always paint the upper rule. Without this the two searches disagree
+    // exactly where the box is missing — ScreenParser finds a composer, we
+    // return null, and classification silently falls back to the
+    // known-incomplete allowlist, i.e. straight back into the bug this change
+    // removes. Bounded to the viewport tail for the same reason ScreenParser
+    // bounds it: a marker from distant scrollback must not manufacture a
+    // current composer.
+    if (markerY < 0) {
+      const lowerBound = Math.max(top, bottom - 11)
+      for (let y = bottom; y >= lowerBound; y--) {
+        const line = buf.getLine(y)
+        if (!line) continue
+        if (/^\s*[❯>](?:\s|$)/u.test(line.translateToString(true))) {
+          markerY = y
+          break
+        }
+      }
+    }
     if (markerY < 0) return null
 
     const line = buf.getLine(markerY)

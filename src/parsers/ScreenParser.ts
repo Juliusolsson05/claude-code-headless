@@ -167,8 +167,17 @@ export function parseClaudeComposerState(
   //
   // Reached only after the marker search above succeeded: attributes describing
   // a row we never located prove nothing, so 'unpainted' still wins.
+  // `continuationHasContent` is still consulted here. The attribute descriptor
+  // samples ONLY the marker row, so on its own it is strictly weaker than the
+  // string path it takes precedence over: a draft whose first line is empty
+  // (shift+enter, or a paste beginning with a newline) puts every typed
+  // character on a continuation row, leaving the marker row with zero content
+  // cells. Reading `attrs.plain` alone would call that 'empty' and let an agent
+  // type over a human's half-written message — strictly worse than the
+  // false-'drafted' bug this whole change exists to fix, because that one only
+  // blocked delivery while this one destroys input.
   if (attrs) {
-    return attrs.plain > 0 ? 'drafted' : 'empty'
+    return attrs.plain > 0 || continuationHasContent ? 'drafted' : 'empty'
   }
 
   // STRING FALLBACK for callers with no terminal access (replayed recordings,

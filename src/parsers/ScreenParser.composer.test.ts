@@ -199,13 +199,53 @@ describe('composer attribute edge cases', () => {
     expect(parseClaudeComposerState(term.snapshotPlain(), attrs)).toBe('drafted')
   })
 
-  it('does not mistake a trust-dialog menu row for a composer draft', async () => {
-    // '❯ 1. Yes, I trust this folder' matches the marker regex. Conditions are
-    // checked before the composer in derivePromptGateState so this is latent
-    // today, but it is the same class of bug and must not regress.
-    const term = await paint(
-      'Do you trust the files in this folder?', '❯ 1. Yes, I trust this folder',
-    )
-    expect(term.snapshotComposerAttributes()).toBeNull()
+  it('reads a trust-dialog menu row as real content, not a placeholder', async () => {
+    // '❯ 1. Yes, I trust this folder' matches the marker regex. An earlier
+    // version of this test asserted the attributes were null and passed only
+    // because the fixture had no divider — it would have passed for ANY
+    // two-line screen, proving nothing about trust rows. Paint the divider so
+    // the composer search actually succeeds, then assert the real property:
+    // menu text is undimmed, so it must never be mistaken for a placeholder.
+    const term = await paint(RULE, '❯ 1. Yes, I trust this folder', RULE)
+    const attrs = term.snapshotComposerAttributes()!
+    expect(attrs.plain).toBeGreaterThan(0)
+    expect(parseClaudeComposerState(term.snapshotPlain(), attrs)).toBe('drafted')
+  })
+
+  it('classifies a draft whose first line is empty as drafted', async () => {
+    // Regression: the attribute descriptor samples ONLY the marker row, so a
+    // draft written after shift+enter — or pasted starting with a newline —
+    // leaves the marker row empty and every typed character on a continuation
+    // row. Reading attrs.plain alone returned 'empty' and would let an agent
+    // type over a half-written human message. Strictly worse than the
+    // false-'drafted' bug, because that one only blocked delivery.
+    const term = await paint(RULE, '❯ ', '  this is a real human draft', RULE)
+    const attrs = term.snapshotComposerAttributes()!
+    expect(attrs.plain).toBe(0)
+    expect(parseClaudeComposerState(term.snapshotPlain(), attrs)).toBe('drafted')
+  })
+
+  it('extracts attributes from a composer painted without a divider box', async () => {
+    // Older Claude layouts omit the upper rule. If only ScreenParser handles
+    // that, the two marker searches disagree: it finds a composer, the terminal
+    // returns null, and classification silently drops to the known-incomplete
+    // allowlist — the original bug, intact, on exactly those layouts.
+    const term = await paint('some earlier output', `❯ ${DIM('a suggestion nobody allowlisted')}`)
+    const attrs = term.snapshotComposerAttributes()
+    expect(attrs).not.toBeNull()
+    expect(attrs!.plain).toBe(0)
+    expect(attrs!.dim).toBeGreaterThan(0)
+    expect(parseClaudeComposerState(term.snapshotPlain(), attrs)).toBe('empty')
+  })
+
+  it('counts wide CJK and emoji drafts without double-counting cells', async () => {
+    // Depends on xterm representing a wide glyph's trailing half as an empty
+    // cell, which the blank-cell skip relies on. Pin it: a silent change here
+    // would inflate `plain` and could not be caught anywhere else.
+    const term = await paint(RULE, '❯ 修复这个错误 🚀', RULE)
+    const attrs = term.snapshotComposerAttributes()!
+    expect(attrs.dim).toBe(0)
+    expect(attrs.plain).toBeGreaterThan(0)
+    expect(parseClaudeComposerState(term.snapshotPlain(), attrs)).toBe('drafted')
   })
 })
