@@ -24,10 +24,22 @@ export function spawnClaudeWithProxy(
   env.https_proxy = options.proxyUrl
   env.HTTP_PROXY = options.proxyUrl
   env.http_proxy = options.proxyUrl
+
+  // CA trust: inject ONLY NODE_EXTRA_CA_CERTS, and deliberately NOT
+  // SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE.
+  //
+  // WHY (Agent Code #281): those three vars each point at a *single-cert*
+  // file, and each one REPLACES the process's entire root trust store with
+  // just that cert. Since the proxy only MITMs the provider host and passes
+  // every other host through with its REAL certificate, replacing the trust
+  // store makes every passthrough host (npm registry, PyPI, Azure, GitHub, …)
+  // fail to verify — breaking npm/pip/az/curl/git for any tool that reads
+  // those vars. NODE_EXTRA_CA_CERTS is different: Node *appends* it to the
+  // built-in roots (additive), so the spawned agent trusts the proxy cert for
+  // the intercepted host while still trusting real certs everywhere else.
+  // Chasing this per-tool (npm_config_cafile, GIT_SSL_CAINFO, …) is an
+  // unwinnable allowlist; not replacing the store is the universal fix.
   env.NODE_EXTRA_CA_CERTS = options.caCertPath
-  env.SSL_CERT_FILE = options.caCertPath
-  env.REQUESTS_CA_BUNDLE = options.caCertPath
-  env.CURL_CA_BUNDLE = options.caCertPath
 
   // Keep loopback direct so the experiment doesn't eat its own tail.
   // Do NOT add `.anthropic.com` here — that would bypass the proxy for the

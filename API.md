@@ -1382,8 +1382,21 @@ to route HTTPS through the proxy and trust its CA. `SpawnClaudeWithProxyOptions`
 | `binary` | `string` | `'claude'` | The CLI binary. |
 
 It sets `HTTPS_PROXY`/`HTTP_PROXY` (+ lowercase), `NODE_EXTRA_CA_CERTS`,
-`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and a
-loopback-only `NO_PROXY`.
+and a loopback-only `NO_PROXY`.
+
+It deliberately does **not** set `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` or
+`CURL_CA_BUNDLE`. Those three *replace* the process's entire root trust
+store with the single-cert file they point at, whereas `NODE_EXTRA_CA_CERTS`
+*appends* to the built-in roots. Since the proxy only MITMs the provider
+host and passes every other host through with its real certificate,
+replacing the store made every passthrough host (npm registry, PyPI, Azure,
+GitHub, …) fail verification — breaking npm/pip/az/curl/git for any tool in
+the spawned PTY that reads those variables. See Agent Code #281.
+
+The tradeoff this accepts: a **non-Node** tool inside the PTY that needs to
+reach the MITM'd provider host through the proxy will not trust the CA. In
+practice nothing does — only the Claude CLI (Node) talks to that host, and
+it is the single host the proxy intercepts.
 
 ---
 
