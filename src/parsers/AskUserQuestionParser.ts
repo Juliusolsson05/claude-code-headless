@@ -128,13 +128,29 @@ const SUBMIT_RE = /^(\s*)(❯\s+)?Submit\s*$/
 
 // Multi-question AUQ renders a nav bar like:
 //   ←  ☐ Season  ☐ Relax  ✔ Submit  →
-// The first chip is the current question tab in the observed Claude layout,
-// while later chips are sibling questions. The broad header parser below used
-// to capture "Season  ☐ Relax", which is useful visually but wrong as a
-// resolver identity: the semantic payload's first answer has header "Season".
-// Keep the current chip as the header so header checks stay aligned with the
-// current on-screen question.
+// A single chip ("☐ Choice", or a one-question nav bar) names the question on
+// screen, so it is a usable resolver identity. Two or more chips are NOT: the
+// row lists every sibling question, and which one is active is carried by SGR
+// highlight, which this plain-text scan has already thrown away.
+//
+// We previously assumed the FIRST chip was the active tab. A recorded
+// four-question picker disproves it:
+//   ←  ☐ PR #589  ☐ PR #588  ☐ #577 next  ☐ Also do  ✔ Submit  →
+// Every chip stays ☐ for the whole flow — answered tabs are never redrawn as
+// ☒ — so "first chip" is permanently the FIRST question's header. On question
+// 2+ that is a stale value that disagrees with the semantic payload's header,
+// and sameQuestion()'s header check vetoed the answer: the driver fell into
+// sendThenReparse and timed out at `wait-question:<q>`, which is precisely the
+// multi-question breakage this was meant to fix.
+//
+// So: emit `header: null` for a multi-chip nav bar. A wrong header is worse
+// than no header — sameQuestion treats a null header as "no opinion" and rests
+// identity on the question text, which is the stronger signal anyway and is
+// what distinguishes sibling questions. Note this must NOT be conflated with
+// "no chip seen yet": the chip row is also the top boundary of the question
+// region, so the scan below tracks that separately in `sawHeaderChip`.
 const FIRST_HEADER_CHIP_RE = /[☐☒]\s+([^☐☒✔✓←→]+)/
+const CHIP_GLYPH_RE = /[☐☒]/g
 
 type ScannedRow = {
   number: number
@@ -211,6 +227,12 @@ export function detectAskUserQuestion(term: TerminalInstance): AskUserQuestionSt
   let header: string | null = null
   let question: string | null = null
   let sawFirstOption = false
+  // Separate from `header` on purpose. The chip row is the top boundary of the
+  // question region (see the capture block below), and a multi-chip nav bar
+  // legitimately yields `header: null` — so nullness can no longer mean "chip
+  // row not reached yet" without swallowing the question on every
+  // multi-question picker.
+  let sawHeaderChip = false
 
   for (let i = 0; i < fingerprintIdx; i++) {
     const raw = lines[i]
@@ -272,13 +294,16 @@ export function detectAskUserQuestion(term: TerminalInstance): AskUserQuestionSt
     // bearing a `❯` (belt-and-suspenders against the composer cursor).
     if (!sawFirstOption) {
       const hasChip = /[☐☒]/.test(raw)
-      if (hasChip && header === null) {
-        // Pull the word(s) after the chip glyph as the header label. For
-        // the multi nav bar ("←  ☐ Colors  ✔ Submit  →") this grabs
-        // "Colors"; for the single chip ("☐ Choice") it grabs "Choice".
-        const m = raw.match(FIRST_HEADER_CHIP_RE)
+      if (hasChip && !sawHeaderChip) {
+        sawHeaderChip = true
+        // One chip names the question on screen ("☐ Choice", or a
+        // single-question nav bar "←  ☐ Colors  ✔ Submit  →" → "Colors").
+        // Two or more list siblings with no plain-text marker for which is
+        // active, so there is no honest answer — see FIRST_HEADER_CHIP_RE.
+        const chipCount = raw.match(CHIP_GLYPH_RE)?.length ?? 0
+        const m = chipCount === 1 ? raw.match(FIRST_HEADER_CHIP_RE) : null
         header = m ? m[1].trim() : null
-      } else if (!hasChip && header !== null && question === null && !raw.includes('❯')) {
+      } else if (!hasChip && sawHeaderChip && question === null && !raw.includes('❯')) {
         question = raw.trim()
       }
     }
