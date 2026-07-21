@@ -126,6 +126,16 @@ const DIVIDER_RE = /^\s*[─—-]{3,}\s*$/
 // number. It can carry the `❯` cursor. Indented like an option label.
 const SUBMIT_RE = /^(\s*)(❯\s+)?Submit\s*$/
 
+// Multi-question AUQ renders a nav bar like:
+//   ←  ☐ Season  ☐ Relax  ✔ Submit  →
+// The first chip is the current question tab in the observed Claude layout,
+// while later chips are sibling questions. The broad header parser below used
+// to capture "Season  ☐ Relax", which is useful visually but wrong as a
+// resolver identity: the semantic payload's first answer has header "Season".
+// Keep the current chip as the header so header checks stay aligned with the
+// current on-screen question.
+const FIRST_HEADER_CHIP_RE = /[☐☒]\s+([^☐☒✔✓←→]+)/
+
 type ScannedRow = {
   number: number
   label: string
@@ -266,7 +276,7 @@ export function detectAskUserQuestion(term: TerminalInstance): AskUserQuestionSt
         // Pull the word(s) after the chip glyph as the header label. For
         // the multi nav bar ("←  ☐ Colors  ✔ Submit  →") this grabs
         // "Colors"; for the single chip ("☐ Choice") it grabs "Choice".
-        const m = raw.match(/[☐☒]\s+([^✔✓←→]+)/)
+        const m = raw.match(FIRST_HEADER_CHIP_RE)
         header = m ? m[1].trim() : null
       } else if (!hasChip && header !== null && question === null && !raw.includes('❯')) {
         question = raw.trim()
