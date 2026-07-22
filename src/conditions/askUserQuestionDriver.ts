@@ -158,9 +158,25 @@ function labelsCorrespond(optionLabel: string, wanted: string): boolean {
 // number — when present — agrees with it. If the screen text cannot single out
 // one option, we fail closed and let the user answer in the terminal; a wrong
 // answer is far worse than a retry.
+// `allowTruncated` gates the prefix tolerance to the SINGLE-SELECT path.
+//
+// Multi-select passes false, and that is deliberate, not laziness. A live
+// review found that once a wrapping option resolves, `driveMulti`'s
+// reconciliation loop runs over every row — and an UNWANTED option whose
+// checkbox `[ ]` wrapped across two physical lines has `toggled: undefined`,
+// which the loop's `actual === desired` idempotency check reads as "needs
+// toggling", so it presses that option's digit and selects a row the user did
+// not ask for, then hangs. On `main` (exact-only) a wrapping selection never
+// resolved, so `driveMulti` failed closed before the loop and that over-toggle
+// was unreachable. Enabling truncation tolerance for multi-select would make it
+// reachable — a fail-closed → wrong-row regression — while gaining nothing,
+// because multi-select is separately broken downstream (the "Submit answers"
+// review screen is never pressed; see the follow-up issue). So multi-select
+// stays exactly as it was until that whole path is fixed together.
 function optionBySelection(
   state: AskUserQuestionState,
   selection: AnswerSelection,
+  allowTruncated: boolean,
 ): AskUserQuestionOption | null {
   const wanted = normalizeLabel(selection.label)
 
@@ -179,6 +195,7 @@ function optionBySelection(
     return numberAgrees(exact[0]) ? exact[0] : null
   }
   if (exact.length > 1) return null // duplicate labels — fail closed
+  if (!allowTruncated) return null
 
   // Truncation-tolerant, but only when it is UNAMBIGUOUS: more than one
   // prefix-consistent option means the screen does not distinguish them and the
@@ -426,7 +443,7 @@ async function driveSingle(
       failedAtStep: 'single-missing-selection',
     }
   }
-  const option = optionBySelection(state, selection)
+  const option = optionBySelection(state, selection, true)
   if (!option) {
     return {
       ok: false,
@@ -457,7 +474,7 @@ async function driveMulti(
   const selectedNumbers = new Set<number>()
   const selectedLabels = new Set<string>()
   for (const selection of answerSelections(answer)) {
-    const option = optionBySelection(state, selection)
+    const option = optionBySelection(state, selection, false)
     if (!option) {
       return {
         ok: false,

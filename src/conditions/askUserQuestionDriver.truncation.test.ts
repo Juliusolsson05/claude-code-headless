@@ -201,4 +201,35 @@ describe('AskUserQuestion truncated-label answering', () => {
     expect(result?.ok).toBe(false)
     expect(writes.filter(Boolean)).toEqual([])
   })
+
+  it('does NOT apply truncation tolerance to multi-select (stays fail-closed)', async () => {
+    // Truncation tolerance is single-select only. A live review found that
+    // resolving a wrapping option in multi-select lets driveMulti's toggle loop
+    // reach a pre-existing checkbox-wrap over-toggle; on main that path failed
+    // closed. So a multi-select answer by a full (wrapping) label must NOT
+    // resolve here — it fails closed exactly as before, no keystroke.
+    const state = await parsePicker()
+    const { ctx, writes } = mockCtx(state)
+    const result = await resolveAskUserQuestionAction(
+      {
+        kind: 'custom',
+        id: 'answer',
+        label: 'Answer',
+        name: 'claude.askUserQuestion.answer',
+        payload: {
+          answers: [
+            {
+              question: 'Which rollout strategy do you prefer?',
+              multiSelect: true,
+              selectedOptions: [{ label: FULL_LABELS[0], number: 1 }],
+              selectedLabels: [FULL_LABELS[0]],
+            },
+          ],
+        },
+      },
+      ctx,
+    )
+    expect(result?.ok).toBe(false)
+    expect(writes.filter(Boolean)).toEqual([])
+  })
 })
