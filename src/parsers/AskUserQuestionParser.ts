@@ -150,7 +150,21 @@ const SUBMIT_RE = /^(\s*)(❯\s+)?Submit\s*$/
 // "no chip seen yet": the chip row is also the top boundary of the question
 // region, so the scan below tracks that separately in `sawHeaderChip`.
 const FIRST_HEADER_CHIP_RE = /[☐☒]\s+([^☐☒✔✓←→]+)/
-const CHIP_GLYPH_RE = /[☐☒]/g
+
+/**
+ * A pre-option line that is only nav furniture, never question text.
+ *
+ * A wrapped nav bar leaves a chip-less tail ("✔ Submit  →", or just "t  →").
+ * Without this the tail became `state.question`, which sameQuestion can never
+ * match — the same wait-question timeout by a different route. Pre-existing,
+ * but multi-chip bars are precisely the ones long enough to wrap, so it sits
+ * squarely in this fix's blast radius.
+ */
+function isNavChrome(raw: string): boolean {
+  const text = raw.trim()
+  if (text.length === 0) return true
+  return /^[←→✔✓\s]*(Submit)?[←→✔✓\s]*$/.test(text)
+}
 
 type ScannedRow = {
   number: number
@@ -226,6 +240,12 @@ export function detectAskUserQuestion(term: TerminalInstance): AskUserQuestionSt
   // question is the first plain prose line before the first numbered row.
   let header: string | null = null
   let question: string | null = null
+  // Chip evidence is accumulated across the whole pre-option region and resolved
+  // once at the end, because a wrapped nav bar spreads its chips over several
+  // physical rows.
+  let chipTotal = 0
+  let firstChipLabel: string | null = null
+  const questionLines: string[] = []
   let sawFirstOption = false
   // Separate from `header` on purpose. The chip row is the top boundary of the
   // question region (see the capture block below), and a multi-chip nav bar
@@ -293,21 +313,45 @@ export function detectAskUserQuestion(term: TerminalInstance): AskUserQuestionSt
     // so a null here is harmless. We also explicitly reject any line still
     // bearing a `❯` (belt-and-suspenders against the composer cursor).
     if (!sawFirstOption) {
-      const hasChip = /[☐☒]/.test(raw)
-      if (hasChip && !sawHeaderChip) {
-        sawHeaderChip = true
-        // One chip names the question on screen ("☐ Choice", or a
-        // single-question nav bar "←  ☐ Colors  ✔ Submit  →" → "Colors").
-        // Two or more list siblings with no plain-text marker for which is
-        // active, so there is no honest answer — see FIRST_HEADER_CHIP_RE.
-        const chipCount = raw.match(CHIP_GLYPH_RE)?.length ?? 0
-        const m = chipCount === 1 ? raw.match(FIRST_HEADER_CHIP_RE) : null
-        header = m ? m[1].trim() : null
-      } else if (!hasChip && sawHeaderChip && question === null && !raw.includes('❯')) {
-        question = raw.trim()
+      const chipCount = (raw.match(/[☐☒]/g) ?? []).length
+      if (chipCount > 0) {
+        // Chips accumulate ACROSS lines, because a long nav bar wraps: at 60
+        // columns the four-question bar puts one chip on the first physical row
+        // and the rest on the next. Counting per-line saw chipCount === 1 there
+        // and happily published the first chip as the header — the exact stale
+        // value this fix exists to remove, reappearing on narrow terminals.
+        chipTotal += chipCount
+        if (firstChipLabel === null) {
+          const m = raw.match(FIRST_HEADER_CHIP_RE)
+          if (m) firstChipLabel = m[1].trim()
+        }
+        // Only a row that actually yielded a chip label (or is unambiguously a
+        // multi-chip bar) opens the question region. The previous revision
+        // latched on ANY chip-bearing row, which diverged from the original
+        // `header === null` gate: a chip-ish row that failed the label regex
+        // used to leave the region CLOSED so a later real chip row could still
+        // open it. Latching early made the next prose line get captured as the
+        // question, and a WRONG question is worse than a null one — it makes
+        // sameQuestion() false forever, i.e. the timeout this fix removes.
+        if (chipCount >= 2 || firstChipLabel !== null) sawHeaderChip = true
+      } else if (sawHeaderChip && !raw.includes('❯') && !isNavChrome(raw)) {
+        // Every visual line of the question, not just the first.
+        //
+        // The question wraps (the motivating screen wrapped after "How do you
+        // want it"), and keeping only line one left `state.question` a strict
+        // PREFIX of the real question. Identity then rested on prefix matching
+        // — which is fine until two sibling questions in one call share their
+        // first wrapped line, a natural shape for templated multi-question
+        // prompts where only the tail differs. With the header deliberately
+        // null for multi-chip bars there is nothing left to break that tie, so
+        // the driver could accept answer j on question i. Capturing the whole
+        // question makes exact equality the normal case and closes that gap.
+        questionLines.push(raw.trim())
       }
     }
   }
+  header = chipTotal >= 2 ? null : firstChipLabel
+  question = questionLines.length === 0 ? null : questionLines.join(' ')
 
   // No numbered rows at all → the fingerprint matched something that isn't
   // actually a picker (defensive). Bail.
