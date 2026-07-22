@@ -114,11 +114,42 @@ function answerSelections(answer: AskUserQuestionAnswer): AnswerSelection[] {
   return (answer.selectedLabels ?? []).map(label => ({ label }))
 }
 
+// Does the option's ON-SCREEN label correspond to the label the caller asked
+// for? Not string equality — TRUNCATION-TOLERANT prefix containment.
+//
+// The bug this fixes, reproduced end-to-end against a live claude picker: the
+// screen label is a hard-wrapped PREFIX of the real label, because the TUI
+// keeps only the first physical line and drops the wrapped tail (there is no
+// text signal that separates a wrapped label continuation from an option's
+// dim description — verified live, they share the same fg color, so the
+// continuation cannot be reliably rejoined in the parser). Meanwhile the
+// caller's payload carries the FULL label from the semantic tool input. So
+// exact equality could never match a wrapping option, and answering it failed
+// with `option-not-found` and zero keystrokes while the picker sat unanswered.
+//
+// Containment either direction: normally the caller's label is the longer,
+// full one and the screen label is its prefix, but a caller that happens to
+// send the already-truncated screen label (or a short label rendered whole)
+// must still match. The MIN_MATCH_CHARS floor stops a trivially short prefix
+// ("we should…") from matching several distinct options; below it we require
+// exact equality. That floor plus the number check below is what keeps
+// duplicate/ambiguous labels failing closed rather than answering the wrong
+// row.
+const MIN_MATCH_CHARS = 12
+function labelsCorrespond(optionLabel: string, wanted: string): boolean {
+  const a = normalizeLabel(optionLabel)
+  const b = normalizeLabel(wanted)
+  if (a === b) return true
+  const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a]
+  if (shorter.length < MIN_MATCH_CHARS) return false
+  return longer.startsWith(shorter)
+}
+
 function optionBySelection(
   state: AskUserQuestionState,
   selection: AnswerSelection,
 ): AskUserQuestionOption | null {
-  const wanted = normalizeLabel(selection.label)
+  const wanted = selection.label
   if (selection.number !== undefined) {
     const byNumber = state.options.find(option => option.number === selection.number)
     if (!byNumber) return null
@@ -127,10 +158,13 @@ function optionBySelection(
     // answered in the raw terminal and the TUI advanced, "2" may now mean an
     // entirely different option. Pairing number with label lets us use the number
     // to disambiguate duplicate labels without blindly trusting stale semantics.
-    return normalizeLabel(byNumber.label) === wanted ? byNumber : null
+    // Containment rather than equality so a truncated screen label still passes;
+    // a genuinely different option at that number fails the prefix test and we
+    // still fail closed.
+    return labelsCorrespond(byNumber.label, wanted) ? byNumber : null
   }
 
-  const matches = state.options.filter(option => normalizeLabel(option.label) === wanted)
+  const matches = state.options.filter(option => labelsCorrespond(option.label, wanted))
   // Legacy payloads only carried labels. A single match remains supported, but
   // duplicate labels must fail closed: choosing the first duplicate is worse than
   // asking the user to retry through the terminal because it silently submits the
