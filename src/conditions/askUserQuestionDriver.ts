@@ -114,28 +114,95 @@ function answerSelections(answer: AskUserQuestionAnswer): AnswerSelection[] {
   return (answer.selectedLabels ?? []).map(label => ({ label }))
 }
 
+// Is the option's ON-SCREEN label prefix-consistent with the label the caller
+// asked for? A wrapping option is kept by the TUI as only its first physical
+// line, so the screen label is a hard-wrapped PREFIX of the real one (there is
+// no text signal separating a wrapped label continuation from an option's dim
+// description — verified live, they share the same fg color, so the parser
+// cannot rejoin it). The caller's payload carries the FULL label from the
+// semantic tool input, so exact equality could never match a wrapping option:
+// answering it failed with `option-not-found` and zero keystrokes.
+//
+// Containment either direction: normally the caller's label is the longer,
+// full one and the screen label is its prefix, but a caller that sends the
+// already-truncated screen label (or a short whole label) must still match.
+// The MIN_MATCH_CHARS floor keeps a trivially short prefix from being treated
+// as prefix-consistent; below it only exact equality counts.
+//
+// This predicate is deliberately NOT the whole safety story. On its own it is
+// AMBIGUOUS — two sibling options that share a long stem ("We should deploy to
+// staging …") truncate to the same screen prefix, and both are prefix-
+// consistent with either full label. `optionBySelection` below resolves that by
+// requiring the match to be UNIQUE; this function only answers "could these be
+// the same option?", never "are they, definitely?".
+const MIN_MATCH_CHARS = 12
+function labelsCorrespond(optionLabel: string, wanted: string): boolean {
+  const a = normalizeLabel(optionLabel)
+  const b = normalizeLabel(wanted)
+  if (a === b) return true
+  const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a]
+  if (shorter.length < MIN_MATCH_CHARS) return false
+  return longer.startsWith(shorter)
+}
+
+// Resolve the on-screen option a selection refers to, tolerating a truncated
+// screen label but NEVER silently answering the wrong row.
+//
+// The invariant that carries safety is UNIQUENESS, not the number. Review of
+// the first cut showed that leaning on `number` alone re-opened the exact hole
+// the number pairing exists to guard: when the picker has diverged from the
+// semantic ordering (the user answered in the raw terminal and the TUI
+// advanced) AND the labels are prefix-related, trusting the number let the
+// prefix test pass and answered the wrong option instead of failing closed. So
+// every path here demands that exactly one option corresponds, and that the
+// number — when present — agrees with it. If the screen text cannot single out
+// one option, we fail closed and let the user answer in the terminal; a wrong
+// answer is far worse than a retry.
+// `allowTruncated` gates the prefix tolerance to the SINGLE-SELECT path.
+//
+// Multi-select passes false, and that is deliberate, not laziness. A live
+// review found that once a wrapping option resolves, `driveMulti`'s
+// reconciliation loop runs over every row — and an UNWANTED option whose
+// checkbox `[ ]` wrapped across two physical lines has `toggled: undefined`,
+// which the loop's `actual === desired` idempotency check reads as "needs
+// toggling", so it presses that option's digit and selects a row the user did
+// not ask for, then hangs. On `main` (exact-only) a wrapping selection never
+// resolved, so `driveMulti` failed closed before the loop and that over-toggle
+// was unreachable. Enabling truncation tolerance for multi-select would make it
+// reachable — a fail-closed → wrong-row regression — while gaining nothing,
+// because multi-select is separately broken downstream (the "Submit answers"
+// review screen is never pressed; see the follow-up issue). So multi-select
+// stays exactly as it was until that whole path is fixed together.
 function optionBySelection(
   state: AskUserQuestionState,
   selection: AnswerSelection,
+  allowTruncated: boolean,
 ): AskUserQuestionOption | null {
   const wanted = normalizeLabel(selection.label)
-  if (selection.number !== undefined) {
-    const byNumber = state.options.find(option => option.number === selection.number)
-    if (!byNumber) return null
-    // WHY verify the label even when the renderer sends a number:
-    // the number is only safe for the CURRENT live picker. If the user already
-    // answered in the raw terminal and the TUI advanced, "2" may now mean an
-    // entirely different option. Pairing number with label lets us use the number
-    // to disambiguate duplicate labels without blindly trusting stale semantics.
-    return normalizeLabel(byNumber.label) === wanted ? byNumber : null
-  }
 
-  const matches = state.options.filter(option => normalizeLabel(option.label) === wanted)
-  // Legacy payloads only carried labels. A single match remains supported, but
-  // duplicate labels must fail closed: choosing the first duplicate is worse than
-  // asking the user to retry through the terminal because it silently submits the
-  // wrong row.
-  return matches.length === 1 ? matches[0] : null
+  const numberAgrees = (option: AskUserQuestionOption): boolean =>
+    selection.number === undefined || option.number === selection.number
+
+  // Exact equality first, and it is always unambiguous enough to prefer: a
+  // short label rendered whole ("Enable caching") must resolve by equality even
+  // when a sibling extends it ("Enable caching and compression"), which the
+  // prefix path below would call ambiguous. Only fall to truncation tolerance
+  // when nothing matches exactly.
+  const exact = state.options.filter(option => normalizeLabel(option.label) === wanted)
+  if (exact.length === 1) {
+    // A number that disagrees with the exact-label row means the picker
+    // renumbered under us — do not ride an exact label match onto a stale row.
+    return numberAgrees(exact[0]) ? exact[0] : null
+  }
+  if (exact.length > 1) return null // duplicate labels — fail closed
+  if (!allowTruncated) return null
+
+  // Truncation-tolerant, but only when it is UNAMBIGUOUS: more than one
+  // prefix-consistent option means the screen does not distinguish them and the
+  // number cannot be trusted to (see the function docstring). Fail closed.
+  const corresponding = state.options.filter(option => labelsCorrespond(option.label, wanted))
+  if (corresponding.length !== 1) return null
+  return numberAgrees(corresponding[0]) ? corresponding[0] : null
 }
 
 function optionToggled(
@@ -376,7 +443,7 @@ async function driveSingle(
       failedAtStep: 'single-missing-selection',
     }
   }
-  const option = optionBySelection(state, selection)
+  const option = optionBySelection(state, selection, true)
   if (!option) {
     return {
       ok: false,
@@ -407,7 +474,7 @@ async function driveMulti(
   const selectedNumbers = new Set<number>()
   const selectedLabels = new Set<string>()
   for (const selection of answerSelections(answer)) {
-    const option = optionBySelection(state, selection)
+    const option = optionBySelection(state, selection, false)
     if (!option) {
       return {
         ok: false,
