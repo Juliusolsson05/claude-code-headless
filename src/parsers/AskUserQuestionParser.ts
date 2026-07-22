@@ -172,6 +172,8 @@ type ScannedRow = {
   cursor: boolean
   belowDivider: boolean
   toggled?: boolean
+  /** Column where the label began, so wrapped continuations can be rejoined. */
+  labelCol?: number
 }
 
 /**
@@ -231,6 +233,9 @@ export function detectAskUserQuestion(term: TerminalInstance): AskUserQuestionSt
   // fingerprint because descriptions wrap and the header/question distance
   // varies.
   const rows: ScannedRow[] = []
+  // Index of the row still eligible for a wrapped-label continuation, or -1.
+  let lastRowIdx = -1
+  const sawDividerSinceRow = false
   let dividerSeen = false
   let submitFocused = false
   let sawSubmit = false
@@ -285,6 +290,12 @@ export function detectAskUserQuestion(term: TerminalInstance): AskUserQuestionSt
       const cursor = Boolean(optMatch[2]) // `❯ ` capture — scoped to `❯ N.`
       const number = Number(optMatch[3])
       let label = optMatch[4].trim()
+      // Column where the label text begins, used to tell a WRAPPED label
+      // continuation from an option DESCRIPTION on the following lines.
+      // Claude indents descriptions further than the label; a wrapped label
+      // resumes at (or left of) the label column.
+      const labelCol = raw.length - raw.trimStart().length +
+        (optMatch[2]?.length ?? 0) + optMatch[3].length + 2
 
       // Strip a multi-select checkbox off the front of the label, if any.
       const cb = label.match(CHECKBOX_RE)
@@ -295,8 +306,30 @@ export function detectAskUserQuestion(term: TerminalInstance): AskUserQuestionSt
         label = cb[2].trim()
       }
 
-      rows.push({ number, label, cursor, belowDivider: dividerSeen, toggled })
+      rows.push({ number, label, cursor, belowDivider: dividerSeen, toggled, labelCol })
+      lastRowIdx = rows.length - 1
       continue
+    }
+
+    // A label that WRAPPED. Without this the parser kept only the first
+    // physical line, so `optionBySelection`'s label equality failed and a
+    // valid answer surfaced as `option-not-found` — the same dead-row failure
+    // as the number mismatch, by a different route.
+    //
+    // Distinguishing a wrapped label from a description is purely indentation:
+    // descriptions are indented PAST the label column, continuations are not.
+    // Only the row we just parsed can be continued, and only before any other
+    // structural line intervenes.
+    if (lastRowIdx !== -1 && !sawDividerSinceRow) {
+      const indent = raw.length - raw.trimStart().length
+      const row = rows[lastRowIdx]
+      if (row.labelCol !== undefined && indent < row.labelCol && !raw.includes('❯')) {
+        row.label = `${row.label} ${raw.trim()}`.trim()
+        continue
+      }
+      // Anything indented past the label column is a description; it ends the
+      // continuation window so a later description line cannot be appended.
+      lastRowIdx = -1
     }
 
     // Non-structural line BEFORE the first option: candidate header /

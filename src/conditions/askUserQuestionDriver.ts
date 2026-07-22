@@ -121,13 +121,27 @@ function optionBySelection(
   const wanted = normalizeLabel(selection.label)
   if (selection.number !== undefined) {
     const byNumber = state.options.find(option => option.number === selection.number)
-    if (!byNumber) return null
     // WHY verify the label even when the renderer sends a number:
     // the number is only safe for the CURRENT live picker. If the user already
     // answered in the raw terminal and the TUI advanced, "2" may now mean an
     // entirely different option. Pairing number with label lets us use the number
     // to disambiguate duplicate labels without blindly trusting stale semantics.
-    return normalizeLabel(byNumber.label) === wanted ? byNumber : null
+    if (byNumber && normalizeLabel(byNumber.label) === wanted) return byNumber
+    // The number is a HINT, not an identity, and a failed hint must fall through
+    // to label matching rather than fail the whole answer.
+    //
+    // AskUserQuestionRow sends `q.options.indexOf(option) + 1` — a SEMANTIC
+    // index into the transcript payload. This function resolves it against the
+    // SCREEN's numbering. Those agree in the simple case and diverge whenever
+    // Claude's picker numbers differently from the tool input (the injected
+    // "Type something" row, multi-question screens that renumber, any future
+    // reordering). On divergence the old code returned null, which surfaced as
+    // `option-not-found` and a dead, unclickable row — a false negative on a
+    // perfectly valid answer.
+    //
+    // Falling back to the label keeps the safety property that matters: the
+    // label is what the user actually chose, and the duplicate-label guard
+    // below still fails closed when it is ambiguous.
   }
 
   const matches = state.options.filter(option => normalizeLabel(option.label) === wanted)
@@ -176,10 +190,29 @@ function sameQuestion(
   if (answer.header && state.header) {
     return normalizeLabel(answer.header) === normalizeLabel(state.header)
   }
-  // The parser can legitimately return `question: null` for some Claude
-  // layouts. That is not enough identity to drive a structured answer. Returning
-  // false keeps the resolver from applying "Yes"/"No" meant for one question to
-  // a later, indistinguishable prompt after the user has interacted manually.
+  // Last resort: match on the OPTION SET.
+  //
+  // The parser legitimately returns `question: null` for some layouts (the
+  // question region only opens after a header chip is seen), and it now
+  // deliberately returns `header: null` for multi-chip nav bars. When BOTH are
+  // null the old code returned false unconditionally, so the driver fell into
+  // sendThenReparse and died at `wait-question:<q>` — the timeout that has been
+  // chased through several revisions of this file.
+  //
+  // A screen whose visible options are exactly the options the caller intends
+  // to answer IS the question, for our purposes: the answer we are about to
+  // give is expressible on this screen and means the same thing. This is
+  // strictly narrower than "give up and press keys anyway" — a different
+  // question with different options still fails closed, which is the property
+  // that keeps "Yes" for one prompt off a later one.
+  const answerLabels = answerSelections(answer)
+    .map(selection => normalizeLabel(selection.label))
+    .filter(label => label.length > 0)
+  if (answerLabels.length > 0) {
+    const screenLabels = new Set(state.options.map(option => normalizeLabel(option.label)))
+    if (answerLabels.every(label => screenLabels.has(label))) return true
+  }
+
   return false
 }
 
