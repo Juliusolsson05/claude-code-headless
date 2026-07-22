@@ -125,12 +125,80 @@ describe('AskUserQuestion truncated-label answering', () => {
     expect(writes.filter(Boolean)).toEqual(['3'])
   })
 
-  it('still fails closed when the number points at a different option', async () => {
-    // The full label of option 1 sent against number 2. The prefix test must
-    // reject it — the duplicate/stale-picker guard the number check exists for.
+  it('fails closed (no keystroke) when the number points at a different option', async () => {
+    // Option 1's full label sent against number 2 — a diverged/stale picker.
+    // Option 2's screen label is not prefix-consistent with option 1's, so this
+    // resolves to null and must write nothing.
     const state = await parsePicker()
-    const { ctx } = mockCtx(state)
+    const { ctx, writes } = mockCtx(state)
     const result = await resolveAskUserQuestionAction(answerAction(FULL_LABELS[0], 2), ctx)
     expect(result?.ok).toBe(false)
+    expect(writes.filter(Boolean)).toEqual([])
+  })
+
+  // The safety case a prior cut got wrong: when two options share a stem long
+  // enough to survive truncation, the screen label alone cannot single one out,
+  // and a diverged number must NOT be trusted to. These are built by hand
+  // because the captured picker happened to have distinct prefixes; the shape
+  // (shared stem past the 12-char floor) is the real hazard.
+  // Both option rows render the SAME first physical line; they diverge only in
+  // the wrapped tail the TUI drops, so the parser reads two options with an
+  // identical truncated label.
+  const SHARED_STEM_PICKER = [
+    ' ☐ Deploy',
+    'How should we deploy?',
+    '❯ 1. We should deploy to staging first and then promote to production once',
+    '     a manual smoke test of the critical paths has passed.',
+    '  2. We should deploy to staging first and then promote to production once',
+    '     the automated health checks pass on their own.',
+    '  4. Type something.',
+    '────────────────',
+    '  5. Chat about this',
+    'Enter to select · ↑/↓ to navigate · Esc to cancel',
+  ]
+  function parseShared(): Promise<ReturnType<typeof detectAskUserQuestion>> {
+    const term = new Terminal({ cols: 80, rows: 24, allowProposedApi: true })
+    return new Promise(resolve => {
+      let remaining = SHARED_STEM_PICKER.length
+      for (const line of SHARED_STEM_PICKER) {
+        term.write(`${line}\r\n`, () => {
+          if (--remaining === 0) resolve(detectAskUserQuestion(term))
+        })
+      }
+    })
+  }
+
+  it('fails closed when two options truncate to the same screen prefix', async () => {
+    const state = await parseShared()
+    // Both option 1 and option 2 render the identical first line, so the parser
+    // sees two options with the same truncated label.
+    expect(state!.options[0].label).toBe(state!.options[1].label)
+    const full1 =
+      'We should deploy to staging first and then promote to production once a manual smoke test of the critical paths has passed.'
+    // Answer option 1 by its full label. Even with the correct number, the
+    // screen cannot confirm which row it is — resolve must fail closed rather
+    // than trust the number and risk the wrong option.
+    const { ctx, writes } = mockCtx(state)
+    const result = await resolveAskUserQuestionAction(
+      {
+        kind: 'custom',
+        id: 'answer',
+        label: 'Answer',
+        name: 'claude.askUserQuestion.answer',
+        payload: {
+          answers: [
+            {
+              question: 'How should we deploy?',
+              multiSelect: false,
+              selectedOptions: [{ label: full1, number: 1 }],
+              selectedLabels: [full1],
+            },
+          ],
+        },
+      },
+      ctx,
+    )
+    expect(result?.ok).toBe(false)
+    expect(writes.filter(Boolean)).toEqual([])
   })
 })
