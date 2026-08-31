@@ -20,31 +20,94 @@
 //   easier to extend than a regex. If CC ships localized versions later
 //   we add the new strings to the marker arrays — no rewrite.
 //
-// Why the parser returns a structured value rather than just a boolean:
-//   A GUI consumer will eventually need the option labels to render
-//   buttons. Returning `{ visible, options }` future-proofs that.
-//   Simpler consumers that only need `visible` can ignore `options`
-//   harmlessly.
+// ── THE 2.1.251 LESSON: NEVER ASSUME THE LAYOUT, REPORT IT ──────────────────
+// This parser used to hardcode the option list as
+// `[{key:'1', label:'Yes…'}, {key:'2', label:'No, exit'}]` and export a
+// constant accept keystroke of a bare Enter, on the reasoning that CC
+// pre-highlights "Yes" so Enter would keep working even if the numbering
+// changed. Claude Code 2.1.251 inverted exactly that assumption: the dialog
+// became unnumbered, listed "No, exit" FIRST, and pre-highlighted it — so the
+// "future-proof" bare Enter confirmed *No, exit* and terminated the CLI
+// (issue agent-code#705, recorded in debug bundle
+// 2026-08-30T23-51-06-471-9bd68e14). The parser therefore now extracts the
+// REAL on-screen order and which row carries the `❯` highlight pointer, and
+// the accept keystrokes are computed by the trust-dialog driver from this
+// observed state (conditions/trustDialogDriver.ts) — there is deliberately no
+// exported constant accept keystroke anymore, because any constant re-encodes
+// a layout assumption that upstream has already changed once.
+
+export type TrustDialogOption = {
+  /** Positional key ('1' = first row on screen). Wire-compat identifier only —
+   * since 2.1.251 the dialog has no visible numbers and the position carries
+   * no meaning; never synthesize keystrokes from this. */
+  key: string
+  label: string
+  /** True when this row carries the selection pointer (`❯`). Exactly the row a
+   * bare Enter would confirm — the fact the old code guessed and now we read. */
+  highlighted: boolean
+}
 
 export type TrustDialogState = {
   /** True if CC is currently showing the trust dialog. */
   visible: boolean
-  /** The selectable options shown in the dialog (best-effort extraction). */
-  options?: Array<{ key: string; label: string }>
+  /** The selectable options in ON-SCREEN order (best-effort extraction). */
+  options?: TrustDialogOption[]
   /** The directory CC is asking the user to trust, if we can extract it. */
   workspace?: string
 }
+
+/** The affirmative option's label — shared vocabulary between this parser, the
+ * trust-dialog condition module, and the driver that has to find this row on
+ * screen before it dares press Enter. */
+export const TRUST_DIALOG_ACCEPT_LABEL = 'Yes, I trust this folder'
+export const TRUST_DIALOG_DECLINE_LABEL = 'No, exit'
 
 // Distinctive substrings from the dialog. ALL of these must be present for
 // us to declare a positive match — being conservative avoids false positives
 // on assistant text that happens to mention "trust" or "workspace".
 const REQUIRED_MARKERS = [
   'Accessing workspace:',
-  'Yes, I trust this folder',
-  'No, exit',
+  TRUST_DIALOG_ACCEPT_LABEL,
+  TRUST_DIALOG_DECLINE_LABEL,
 ] as const
 
-const NEGATIVE_RE = /[\u23F5\u23F6]/ // ⏵ markers only appear in the main UI status row, not the trust dialog
+const NEGATIVE_RE = /[⏵⏶]/ // ⏵ markers only appear in the main UI status row, not the trust dialog
+
+// The selection pointer CC's Select component paints before the highlighted
+// row. `❯` (U+276F) on macOS/Linux; plain `>` is the figures fallback on
+// Windows. It must be the first non-space character of the row — a `>`
+// appearing later in a line is quoted text, not a pointer.
+const HIGHLIGHT_RE = /^\s*[❯>]/
+
+/**
+ * Extract the option row for `label`: its line index (for on-screen ordering)
+ * and whether it carries the highlight pointer.
+ *
+ * Matching is `includes`, not equality, because both known layouts decorate
+ * the label differently: the pre-2.1.251 dialog numbered rows
+ * (`❯ 1. Yes, I trust this folder`) while 2.1.251 paints bare labels with an
+ * indent. The label substring is the one stable part.
+ *
+ * If the same label somehow appears on several lines (should not happen inside
+ * one dialog frame), prefer a highlighted occurrence — the pointer is the
+ * safety-relevant fact and a false "not highlighted" reading is the reading
+ * that could make the driver press an unnecessary (harmless) arrow, while a
+ * missed pointer could make it refuse to act at all.
+ */
+function findOptionRow(
+  lines: string[],
+  label: string,
+): { line: number; highlighted: boolean } | null {
+  let found: { line: number; highlighted: boolean } | null = null
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].includes(label)) continue
+    const highlighted = HIGHLIGHT_RE.test(lines[i])
+    if (found === null || (highlighted && !found.highlighted)) {
+      found = { line: i, highlighted }
+    }
+  }
+  return found
+}
 
 /**
  * Returns the trust-dialog state for a given screen snapshot.
@@ -88,23 +151,30 @@ export function detectTrustDialog(screen: string): TrustDialogState {
     }
   }
 
-  // The two options we know about. We hardcode rather than parse the
-  // numbered list because the parse would be more brittle than the
-  // hardcoded labels — and CC's dialog has had these exact two for
-  // multiple versions running.
-  const options = [
-    { key: '1', label: 'Yes, I trust this folder' },
-    { key: '2', label: 'No, exit' },
-  ]
+  // Extract the two known options in their REAL on-screen order, with the
+  // observed highlight. Order and highlight are the load-bearing facts the
+  // driver acts on; the labels themselves are the detection contract above.
+  // Both labels are guaranteed present by the REQUIRED_MARKERS gate, so the
+  // row lookups cannot both fail; if one somehow does (a pathological wrap
+  // splitting the label), we still report the dialog as visible but omit
+  // `options` — the driver treats missing options as "cannot prove the
+  // layout" and refuses to synthesize keystrokes.
+  const acceptRow = findOptionRow(lines, TRUST_DIALOG_ACCEPT_LABEL)
+  const declineRow = findOptionRow(lines, TRUST_DIALOG_DECLINE_LABEL)
+  if (!acceptRow || !declineRow) {
+    return { visible: true, workspace }
+  }
+
+  const rows = [
+    { label: TRUST_DIALOG_ACCEPT_LABEL, ...acceptRow },
+    { label: TRUST_DIALOG_DECLINE_LABEL, ...declineRow },
+  ].sort((a, b) => a.line - b.line)
+
+  const options = rows.map((row, index) => ({
+    key: String(index + 1),
+    label: row.label,
+    highlighted: row.highlighted,
+  }))
 
   return { visible: true, options, workspace }
 }
-
-/**
- * The keystroke sequence to ACCEPT the trust dialog. Pressing Enter
- * confirms the highlighted option (option 1, "Yes, I trust this folder")
- * because CC pre-selects it. We deliberately don't synthesize "1" + Enter
- * because if CC ever changes the default highlight, "Enter" still picks
- * the highlighted option correctly.
- */
-export const TRUST_DIALOG_ACCEPT_KEYS = '\r'

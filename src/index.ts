@@ -87,9 +87,24 @@ export {
 
 export {
   detectTrustDialog,
-  TRUST_DIALOG_ACCEPT_KEYS,
+  TRUST_DIALOG_ACCEPT_LABEL,
+  TRUST_DIALOG_DECLINE_LABEL,
   type TrustDialogState,
+  type TrustDialogOption,
 } from './parsers/TrustDialogParser.js'
+
+// TRUST_DIALOG_ACCEPT_KEYS is deliberately GONE: a constant accept keystroke
+// encodes a layout assumption Claude Code has already inverted once (2.1.251
+// pre-highlights "No, exit", so the old bare-Enter constant confirmed the exit
+// option — agent-code#705). Accepting now goes through the highlight-aware
+// resolver below / the `claude.trust-dialog` custom action.
+export {
+  TRUST_DIALOG_ACCEPT_RESOLVER,
+} from './conditions/trustDialog.js'
+export {
+  driveTrustDialogAccept,
+  type TrustDialogResolveCtx,
+} from './conditions/trustDialogDriver.js'
 
 export {
   detectPermissionPrompt,

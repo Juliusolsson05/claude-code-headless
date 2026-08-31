@@ -25,7 +25,7 @@ import {
   detectAskUserQuestion,
   type AskUserQuestionState,
 } from './parsers/AskUserQuestionParser.js'
-import { detectTrustDialog, type TrustDialogState, TRUST_DIALOG_ACCEPT_KEYS } from './parsers/TrustDialogParser.js'
+import { detectTrustDialog, type TrustDialogState } from './parsers/TrustDialogParser.js'
 // Conditions framework (PR-3). The long-lived evaluator + ordered module
 // registry that produce the unified `claude` conditions snapshot. Importing from
 // the conditions barrel (not ./conditions/core directly) mirrors how CodexHeadless
@@ -852,8 +852,26 @@ export class ClaudeCodeHeadless extends EventEmitter {
             type: 'trust_dialog',
             ts: Date.now(),
             workspace: trust.workspace,
-            accept: () => this.write(TRUST_DIALOG_ACCEPT_KEYS),
-            reject: () => this.write('2\r'), // option 2 = "No, exit"
+            // Accept routes through the highlight-aware driver, NOT a bare
+            // Enter: Claude Code 2.1.251 pre-highlights "No, exit", so Enter
+            // alone confirms the exit option and kills the session
+            // (agent-code#705). resolveConditionAction hands the driver the
+            // same write/snapshot capabilities the AUQ resolver gets; its
+            // in-flight latch also keeps a double-click from interleaving two
+            // arrow/Enter sequences.
+            accept: () => {
+              void this.resolveConditionAction({
+                kind: 'custom',
+                id: 'accept',
+                label: 'Yes, I trust this folder',
+                name: 'claude.trust-dialog.accept',
+              })
+            },
+            // Esc is the layout-independent decline: the dialog states
+            // "Esc to cancel" and upstream maps cancel to exit. The old
+            // '2\r' selected "option 2" of a numbered list that no longer
+            // exists.
+            reject: () => this.write('\x1b'),
           })
         }
       }

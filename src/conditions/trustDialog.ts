@@ -1,28 +1,35 @@
 // claude-code-headless / conditions / trustDialog.ts
 //
 // The `claude.trust-dialog` condition module. Detects Claude Code's "Quick
-// safety check" trust dialog and exposes the two keystroke actions the UI may
-// dispatch to resolve it.
+// safety check" trust dialog and exposes the two actions the UI may dispatch to
+// resolve it.
 //
 // WHY THIS MODULE EXISTS — IT RESTORES A DEAD MODAL.
 // -------------------------------------------------
-// Until this PR, ClaudeCodeHeadless emitted NO conditions snapshot, so the
-// renderer's `onSessionConditions` path never fired for Claude and
-// `applyConditionSnapshot`'s Claude branch was dead code. The TrustDialogModal
-// (already built in PR-1, wired into CLAUDE_VIEWS) therefore never rendered from
-// the snapshot. This module — together with publishConditionSnapshot in
-// ClaudeCodeHeadless — makes Claude emit `claude.trust-dialog` so that modal
-// finally lights up.
+// Until the conditions-snapshot PR, ClaudeCodeHeadless emitted NO conditions
+// snapshot, so the renderer's `onSessionConditions` path never fired for Claude
+// and `applyConditionSnapshot`'s Claude branch was dead code. The
+// TrustDialogModal (already built in PR-1, wired into CLAUDE_VIEWS) therefore
+// never rendered from the snapshot. This module — together with
+// publishConditionSnapshot in ClaudeCodeHeadless — makes Claude emit
+// `claude.trust-dialog` so that modal lights up.
 //
-// THE KEYSTROKES ARE THE CONTRACT WITH THE TUI — sourced from the modal itself.
-// TrustDialogModal.tsx resolves the dialog by sending exactly:
-//   accept  → '\r'   (Enter confirms the pre-highlighted "Yes, I trust" option)
-//   decline → '\x1b' (ESC dismisses)
-// We mirror those two strings verbatim. If TrustDialogModal's keystrokes ever
-// change, these must change with them — they are the same bytes written to the
-// PTY whether the user clicks the native modal button or dispatches the
-// condition action. (Note the accept keystroke is ALSO '\r' in the parser's
-// TRUST_DIALOG_ACCEPT_KEYS, so all three agree.)
+// WHY ACCEPT IS A `custom` ACTION, NOT A KEYSTROKE (agent-code#705).
+// -----------------------------------------------------------------
+// Accept used to be the pty action '\r', mirroring TrustDialogModal, on the
+// assumption CC pre-highlights "Yes, I trust this folder". Claude Code 2.1.251
+// re-ordered the dialog and pre-highlights "No, exit", so that Enter confirmed
+// the exit option and terminated the CLI. No single keystroke can be correct
+// across layouts, so accept now routes through the trust-dialog driver
+// (trustDialogDriver.ts), which reads the live highlight, walks it onto the
+// affirmative row with verified arrow presses, and only then confirms —
+// failing closed when the screen cannot prove the layout.
+//
+// Decline stays a pty action: the dialog itself states "Esc to cancel" and
+// upstream maps cancel to exit (TrustDialog's Select onCancel → "exit"), and
+// unlike Enter, Escape's meaning does not depend on which row is highlighted.
+// The old decline keystroke '2\r' (numbered-list selection) died with the
+// numbered layout.
 
 import { defineModule } from './core/contract.js'
 import type { ConditionAction } from './core/contract.js'
@@ -31,18 +38,37 @@ import type {
   ClaudeTrustDialogCondition,
 } from './types.js'
 import type { TrustDialogState } from '../parsers/TrustDialogParser.js'
+import {
+  TRUST_DIALOG_ACCEPT_LABEL,
+  TRUST_DIALOG_DECLINE_LABEL,
+} from '../parsers/TrustDialogParser.js'
+import {
+  driveTrustDialogAccept,
+  type TrustDialogResolveCtx,
+} from './trustDialogDriver.js'
+
+// The resolver name is the wire contract between the renderer (which dispatches
+// the custom action through session:resolveCondition) and this module's
+// `resolve` claim below. Exported so agent-code's TrustDialogModal and this
+// module cannot drift apart on a string literal.
+export const TRUST_DIALOG_ACCEPT_RESOLVER = 'claude.trust-dialog.accept'
 
 // The action TEMPLATE — DATA ONLY. `actions()` clones this into a fresh array of
 // fresh objects on every call (see the module below). This mirrors codex's
-// TRUST_DIALOG_ACTIONS pattern exactly. The ids/labels/keystrokes here are the
-// wire contract; nothing in this literal changes without a matching change in
+// TRUST_DIALOG_ACTIONS pattern exactly. The ids/labels here are the wire
+// contract; nothing in this literal changes without a matching change in
 // TrustDialogModal.tsx.
 //
 // `readonly` marks the template as not-for-mutation; the per-call clone is what
 // callers receive and may freely own.
 const TRUST_DIALOG_ACTIONS: readonly ConditionAction[] = [
-  { kind: 'pty', id: 'accept', label: 'Yes, I trust this folder', data: '\r' },
-  { kind: 'pty', id: 'decline', label: 'No, exit', data: '\x1b' },
+  {
+    kind: 'custom',
+    id: 'accept',
+    label: TRUST_DIALOG_ACCEPT_LABEL,
+    name: TRUST_DIALOG_ACCEPT_RESOLVER,
+  },
+  { kind: 'pty', id: 'decline', label: TRUST_DIALOG_DECLINE_LABEL, data: '\x1b' },
 ]
 
 // trustDialogModule — headless-module form of the trust-dialog condition.
@@ -54,7 +80,8 @@ const TRUST_DIALOG_ACTIONS: readonly ConditionAction[] = [
 export const trustDialogModule = defineModule<
   'claude.trust-dialog',
   ClaudeConditionInputs,
-  TrustDialogState
+  TrustDialogState,
+  TrustDialogResolveCtx
 >({
   kind: 'claude.trust-dialog',
   detect: (inputs) =>
@@ -64,6 +91,12 @@ export const trustDialogModule = defineModule<
   // mutating a returned `actions[0]` cannot poison the next evaluation. `{ ...a }`
   // is a sufficient clone because every ConditionAction field is a primitive.
   actions: () => TRUST_DIALOG_ACTIONS.map((a) => ({ ...a })),
+  // Returning `undefined` for foreign names keeps `name` as the routing key —
+  // the evaluator tries each module's resolver in turn (see core/evaluator.ts).
+  resolve: (action, ctx) =>
+    action.name === TRUST_DIALOG_ACCEPT_RESOLVER
+      ? driveTrustDialogAccept(ctx)
+      : undefined,
 })
 
 // Convenience builder mirroring codex's `buildCodex*Condition` helpers, for any
