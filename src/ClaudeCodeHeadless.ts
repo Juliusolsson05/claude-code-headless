@@ -544,71 +544,90 @@ export class ClaudeCodeHeadless extends EventEmitter {
 
     // --- Wire terminal events ---
 
-    // On every screen snapshot, run all parsers and emit structured events.
+    // On every screen snapshot, run the parsers and emit structured events.
     this.terminal.on('screen', (snap) => {
-      // Pass the per-frame cell-attribute descriptor so placeholder text —
-      // prompt suggestions, queue/teammate hints, example commands — is
-      // recognised as an EMPTY composer. The plain snapshot alone cannot tell
-      // model-authored suggestion prose from a human draft, and guessing wrong
-      // latches the prompt gate at 'occupied' with no recovery path.
-      this.composerState = parseClaudeComposerState(
-        snap.plain,
-        this.terminal.snapshotComposerAttributes(),
-      )
-      const trust = detectTrustDialog(snap.plain)
-      const trustKey = trust.visible
-        ? JSON.stringify({
-            workspace: trust.workspace ?? null,
-            options: trust.options ?? [],
-          })
-        : null
-      this.trustDialogState = trust
+      // Spinner-only frames (agent-code#765). HeadlessTerminal flags a frame
+      // `spinnerOnly` when it differs from the last emitted one only in the
+      // rotating glyph, the elapsed timer or the token counter (see
+      // terminal/volatileScreenText.ts). None of the state derived in the
+      // block below can change on such a frame — the composer row, the modal
+      // text, the picker rows and the AskUserQuestion grid all sit outside
+      // the rewritten shapes — so the composer attribute walk, the two
+      // live-grid walks, the four regex detectors and their JSON keys are
+      // skipped and last frame's results stand. Activity detection and the
+      // streaming extractor further down still run on EVERY frame: the
+      // spinner IS the activity signal, and the extractor's own dedupe is a
+      // string compare. An absent flag means "real change", so a synthetic
+      // frame (tests) or an older terminal still runs everything.
+      const spinnerOnly = snap.spinnerOnly === true
+      let trustKey = this.lastTrustKey
+      let resumePromptKey = this.lastResumePromptKey
+      let permissionPromptKey = this.lastPermissionPromptKey
+      let compactionKey = this.lastCompactionKey
+      if (!spinnerOnly) {
+        // Pass the per-frame cell-attribute descriptor so placeholder text —
+        // prompt suggestions, queue/teammate hints, example commands — is
+        // recognised as an EMPTY composer. The plain snapshot alone cannot tell
+        // model-authored suggestion prose from a human draft, and guessing wrong
+        // latches the prompt gate at 'occupied' with no recovery path.
+        this.composerState = parseClaudeComposerState(
+          snap.plain,
+          this.terminal.snapshotComposerAttributes(),
+        )
+        const trust = detectTrustDialog(snap.plain)
+        trustKey = trust.visible
+          ? JSON.stringify({
+              workspace: trust.workspace ?? null,
+              options: trust.options ?? [],
+            })
+          : null
+        this.trustDialogState = trust
 
-      const resumePrompt = detectResumePrompt(snap.plain)
-      const resumePromptKey = resumePrompt.visible
-        ? JSON.stringify({
-            age: resumePrompt.sessionAgeText ?? null,
-            tokens: resumePrompt.tokenCountText ?? null,
-            selectedIndex: resumePrompt.selectedIndex ?? 0,
-          })
-        : null
-      this.resumePromptState = resumePrompt
+        const resumePrompt = detectResumePrompt(snap.plain)
+        resumePromptKey = resumePrompt.visible
+          ? JSON.stringify({
+              age: resumePrompt.sessionAgeText ?? null,
+              tokens: resumePrompt.tokenCountText ?? null,
+              selectedIndex: resumePrompt.selectedIndex ?? 0,
+            })
+          : null
+        this.resumePromptState = resumePrompt
 
-      const permissionPrompt = detectPermissionPrompt(snap.plain)
-      const permissionPromptKey = permissionPrompt.visible
-        ? JSON.stringify({
-            title: permissionPrompt.title ?? null,
-            toolName: permissionPrompt.toolName ?? null,
-            command: permissionPrompt.command ?? null,
-            options: permissionPrompt.options ?? [],
-            selectedIndex: permissionPrompt.selectedIndex ?? 0,
-          })
-        : null
-      this.permissionPromptState = permissionPrompt
+        const permissionPrompt = detectPermissionPrompt(snap.plain)
+        permissionPromptKey = permissionPrompt.visible
+          ? JSON.stringify({
+              title: permissionPrompt.title ?? null,
+              toolName: permissionPrompt.toolName ?? null,
+              command: permissionPrompt.command ?? null,
+              options: permissionPrompt.options ?? [],
+              selectedIndex: permissionPrompt.selectedIndex ?? 0,
+            })
+          : null
+        this.permissionPromptState = permissionPrompt
 
-      const compaction = detectCompaction(snap.plain)
-      const compactionKey = compaction.visible
-        ? JSON.stringify({
-            phase: compaction.phase ?? null,
-            statusText: compaction.statusText ?? null,
-            errorText: compaction.errorText ?? null,
-          })
-        : null
-      this.compactionState = compaction
+        const compaction = detectCompaction(snap.plain)
+        compactionKey = compaction.visible
+          ? JSON.stringify({
+              phase: compaction.phase ?? null,
+              statusText: compaction.statusText ?? null,
+              errorText: compaction.errorText ?? null,
+            })
+          : null
+        this.compactionState = compaction
 
-      const picker = detectSlashPicker(this.terminal.getTerminal())
-      this.pickerState = picker
+        this.pickerState = detectSlashPicker(this.terminal.getTerminal())
 
-      // AskUserQuestion picker (PR-4). Reads the live xterm grid (NOT
-      // snap.plain) for the same reason the slash picker does: detection needs
-      // the cursor `❯` glyph and per-row layout that only survive on the real
-      // terminal buffer, and it must scan the VIEWPORT only (scrollback can hold
-      // a stale picker from an earlier turn — exactly the ghost-render failure
-      // this whole feature kills). No legacy per-event emit and no `lastKey`
-      // latch: this state only feeds the conditions snapshot, whose evaluator
-      // owns dedupe. We store it here so publishConditionSnapshot (below, same
-      // tick) can fold it into the unified snapshot.
-      this.askUserQuestionState = detectAskUserQuestion(this.terminal.getTerminal())
+        // AskUserQuestion picker (PR-4). Reads the live xterm grid (NOT
+        // snap.plain) for the same reason the slash picker does: detection needs
+        // the cursor `❯` glyph and per-row layout that only survive on the real
+        // terminal buffer, and it must scan the VIEWPORT only (scrollback can hold
+        // a stale picker from an earlier turn — exactly the ghost-render failure
+        // this whole feature kills). No legacy per-event emit and no `lastKey`
+        // latch: this state only feeds the conditions snapshot, whose evaluator
+        // owns dedupe. We store it here so publishConditionSnapshot (below, same
+        // tick) can fold it into the unified snapshot.
+        this.askUserQuestionState = detectAskUserQuestion(this.terminal.getTerminal())
+      }
 
       // Forward raw screen (legacy flat surface).
       this.emit('screen', snap)
@@ -845,6 +864,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // Trust dialog detection
       if (trustKey !== this.lastTrustKey) {
         this.lastTrustKey = trustKey
+        const trust = this.trustDialogState
         this.emit('trust-dialog', trust)
         this.screen.publishTrustDialog(trust)
         if (trust.visible) {
@@ -879,6 +899,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // Resume-choice prompt detection
       if (resumePromptKey !== this.lastResumePromptKey) {
         this.lastResumePromptKey = resumePromptKey
+        const resumePrompt = this.resumePromptState
         this.emit('resume-prompt', resumePrompt)
         this.screen.publishResumePrompt(resumePrompt)
         if (resumePrompt.visible) {
@@ -895,6 +916,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // Permission prompt detection
       if (permissionPromptKey !== this.lastPermissionPromptKey) {
         this.lastPermissionPromptKey = permissionPromptKey
+        const permissionPrompt = this.permissionPromptState
         this.emit('permission-prompt', permissionPrompt)
         if (permissionPrompt.visible) {
           this.emit('event', {
@@ -909,6 +931,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
 
       if (compactionKey !== this.lastCompactionKey) {
         this.lastCompactionKey = compactionKey
+        const compaction = this.compactionState
         this.emit('compaction-state', compaction)
         this.screen.publishCompaction(compaction)
         this.emit('event', {
@@ -928,7 +951,16 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // modals (see publishConditionSnapshot) and now carries slash-picker too,
       // so the renderer has one condition snapshot rather than a parallel sticky
       // picker event path.
-      this.publishConditionSnapshot()
+      //
+      // On a spinner-only frame the inputs are the previous frame's objects,
+      // so evaluate + keyOf could only ever reproduce the latch — skip them
+      // and refresh `ts` alone: the snapshot's `ts` is observation time and
+      // a spinner tick is a fresh observation of the same conditions.
+      if (spinnerOnly) {
+        this.conditionSnapshot = { ...this.conditionSnapshot, ts: Date.now() }
+      } else {
+        this.publishConditionSnapshot()
+      }
     })
 
     this.terminal.on('exit', ({ exitCode, signal }) => {

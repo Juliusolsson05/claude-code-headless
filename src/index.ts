@@ -65,6 +65,11 @@ export {
   type ScreenSnapshot,
   terminalToMarkdown,
 } from './terminal/HeadlessTerminal.js'
+// The chrome-blind comparison key behind ScreenSnapshot.spinnerOnly. Exported
+// so a host that gates screen frames itself (agent-code's screenFrameGate)
+// can share ONE definition of "volatile chrome" with the package instead of
+// keeping a copy that drifts.
+export { normalizeVolatileScreenText } from './terminal/volatileScreenText.js'
 
 // --- Parsers ---
 export {
