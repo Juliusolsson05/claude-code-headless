@@ -82,6 +82,18 @@ function terminalWithSpies() {
 }
 
 describe('HeadlessTerminal spinner-only snapshots', () => {
+  it.each([
+    ['wait 5s', 'wait 6s'],
+    ['budget 100 tokens', 'budget 200 tokens'],
+    ['/rc connecting…', '/rc'],
+    ['paste\r\n✻ Working… (5s)', 'paste\r\n✽ Working… (6s)'],
+  ])('rebuilds snapshots for draft edits from %s to %s during a spinner tick', async (before, after) => {
+    const { term, markdownWalk } = terminalWithSpies()
+    await paint(term, frame({ glyph: '✻', secs: 5, tokens: '1.2k', draft: before }))
+    const changed = await paint(term, frame({ glyph: '✽', secs: 6, tokens: '1.3k', draft: after }))
+    expect(changed.spinnerOnly).toBe(false)
+    expect(markdownWalk).toHaveBeenCalledTimes(2)
+  })
   it('emits a spinner tick as spinnerOnly with the raw text but without re-walking cells', async () => {
     const { term, markdownWalk, recentWalk } = terminalWithSpies()
 

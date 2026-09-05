@@ -22,10 +22,21 @@ const CLAUDE_THINKING_NEXT_TICK = [
   '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents                          /rc',
 ].join('\n')
 
-const CODEX_WORKING = ['• Working (12s • esc to interrupt)', '', '› Ask Codex to do anything   '].join('\n')
+const CODEX_WORKING = ['• Working (12s • esc to interrupt)', '', '› Ask Codex to do anything'].join('\n')
 const CODEX_WORKING_NEXT_TICK = ['• Working (13s • esc to interrupt)', '', '› Ask Codex to do anything'].join('\n')
 
 describe('normalizeVolatileScreenText', () => {
+  it.each([
+    ['❯ wait 5s', '❯ wait 6s'],
+    ['❯ budget 100 tokens', '❯ budget 200 tokens'],
+    ['❯ /rc connecting…', '❯ /rc'],
+    ['output took 5s', 'output took 6s'],
+    ['· result 100 tokens', '· result 200 tokens'],
+    ['❯ draft', '❯ draft '],
+    ['───\n❯ paste\n✻ Working… (5s)\n───', '───\n❯ paste\n✽ Working… (6s)\n───'],
+  ])('preserves meaningful content: %s', (before, after) => {
+    expect(normalizeVolatileScreenText(before)).not.toBe(normalizeVolatileScreenText(after))
+  })
   it('maps a spinner tick, timer, token counter and the rc blink to one key', () => {
     expect(normalizeVolatileScreenText(CLAUDE_THINKING)).toBe(
       normalizeVolatileScreenText(CLAUDE_THINKING_NEXT_TICK),

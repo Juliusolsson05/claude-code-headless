@@ -57,6 +57,28 @@ describe('ClaudeCodeHeadless composer classification', () => {
     const headless = await paintComposer('❯ this is a real human draft')
     expect(headless.getComposerState()).toBe('drafted')
   })
+
+  it('refreshes composer attributes when identical draft text accompanies a spinner tick', async () => {
+    const headless = new ClaudeCodeHeadless({ pty: fakePty(), cwd: '/tmp' })
+    const internal = headless as unknown as {
+      terminal: EventEmitter & { writeForTest(data: string): Promise<void> }
+    }
+    const paint = async (glyph: string, seconds: number, draft: string) => {
+      const painted = new Promise<{ spinnerOnly?: boolean }>(resolve => internal.terminal.once('screen', resolve))
+      await internal.terminal.writeForTest('\x1b[2J\x1b[H' + [
+        `${glyph} Working… (${seconds}s)`, '', RULE, `❯ ${draft}`, RULE,
+      ].join('\r\n'))
+      return painted
+    }
+    await paint('✻', 5, dim('same text'))
+    expect(headless.getComposerState()).toBe('empty')
+    const tick = await paint('✽', 6, 'same text')
+    // The text cache legitimately sees only chrome changing, but the real
+    // grid switched from a dim suggestion to a human draft. Skipping the
+    // orchestrator's attribute pass here would leave input ownership stale.
+    expect(tick.spinnerOnly).toBe(true)
+    expect(headless.getComposerState()).toBe('drafted')
+  })
 })
 
 describe('ClaudeCodeHeadless condition publication', () => {

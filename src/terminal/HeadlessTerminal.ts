@@ -105,10 +105,9 @@ export type ScreenSnapshot = {
    *  the token counter (see volatileScreenText.ts). `plain` / `recent`
    *  are still the RAW new text so activity detection sees the live
    *  spinner, but `markdown` / `recentMarkdown` are REUSED from the
-   *  previous frame (they would differ only in that same chrome), and a
-   *  consumer may skip any derived work whose inputs cannot have changed
-   *  (composer attributes, modal detectors, grid walks). Absent or false
-   *  means: a real change, run everything. */
+   *  previous frame. This flag is only a text-cache hint: it says nothing
+   *  about cell attributes, composer ownership or picker selection. Consumers
+   *  must continue evaluating interactive state on every emitted frame. */
   spinnerOnly?: boolean
 }
 
@@ -648,8 +647,8 @@ export class HeadlessTerminal extends EventEmitter {
       //     cost, since nothing renders the terminal from it (the pane
       //     draws from raw PTY data) and the streaming extractor strips
       //     spinner lines as chrome;
-      //   * the frame is flagged `spinnerOnly` so the consumer can skip its
-      //     own derived work (composer attributes, grid walks, detectors).
+      //   * `spinnerOnly` reports this markdown reuse, not permission to skip
+      //     attribute-aware composer or picker/condition parsing (#53).
       // The exact-equality gate above stays in front: it is cheaper and it
       // keeps the emit cadence identical for frames that do not change at
       // all. Anything the rules do not rewrite — a composer keystroke, a
