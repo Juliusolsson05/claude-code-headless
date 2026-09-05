@@ -544,6 +544,12 @@ export class ClaudeCodeHeadless extends EventEmitter {
 
     // --- Wire terminal events ---
 
+    // WHY spinnerOnly does not gate these parsers (#53): the markdown cache
+    // compares text, but composer draft/suggestion classification and picker
+    // selection also depend on cell attributes. A spinner tick may coincide
+    // with an attribute-only change. Reusing decorative markdown is safe for
+    // that cache's contract; reusing input/permission state is not. Keep the
+    // control plane observing every emitted frame even when markdown is reused.
     // On every screen snapshot, run all parsers and emit structured events.
     this.terminal.on('screen', (snap) => {
       // Pass the per-frame cell-attribute descriptor so placeholder text —

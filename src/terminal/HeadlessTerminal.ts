@@ -3,6 +3,7 @@ import type { IPty } from 'node-pty'
 import xtermHeadless from '@xterm/headless'
 
 import { isDividerLine, type ComposerAttributes } from '../parsers/ScreenParser.js'
+import { normalizeVolatileScreenText } from './volatileScreenText.js'
 
 const { Terminal } = xtermHeadless
 type TerminalInstance = InstanceType<typeof Terminal>
@@ -46,7 +47,7 @@ type TerminalInstance = InstanceType<typeof Terminal>
 // "Current screen" parsers (slash picker, trust dialog, activity,
 // streaming text, in-progress assistant) all want the visible viewport
 // only — what the user is looking at right now. Iterating buf.length
-// includes 10k rows of scrollback, which means stale prompts, stale
+// includes the scrollback rows too, which means stale prompts, stale
 // pickers, and stale assistant text from earlier turns leak into the
 // "current state" parsers. snapshotPlain / snapshotMarkdown now scan
 // the viewport region only (viewportY .. viewportY + term.rows). The
@@ -99,6 +100,15 @@ export type ScreenSnapshot = {
   /** Same wider window with markdown emphasis reconstructed. Mirror
    *  of `recent` for renderers that want the bold/italic preserved. */
   recentMarkdown: string
+  /** True when this frame differs from the previously EMITTED frame only
+   *  in volatile spinner chrome — the rotating glyph, the elapsed timer,
+   *  the token counter (see volatileScreenText.ts). `plain` / `recent`
+   *  are still the RAW new text so activity detection sees the live
+   *  spinner, but `markdown` / `recentMarkdown` are REUSED from the
+   *  previous frame. This flag is only a text-cache hint: it says nothing
+   *  about cell attributes, composer ownership or picker selection. Consumers
+   *  must continue evaluating interactive state on every emitted frame. */
+  spinnerOnly?: boolean
 }
 
 export type HeadlessTerminalEvents = {
@@ -239,6 +249,16 @@ export class HeadlessTerminal extends EventEmitter {
   // negligible next to the churn it prevents.
   private lastEmittedPlain: string | null = null
   private lastEmittedRecent: string | null = null
+  // Chrome-blind keys of the last emitted frame plus the markdown strings
+  // emitted with it (agent-code#765). WHY the markdown is retained: a frame
+  // whose normalized keys equal the last emit's differs only in spinner
+  // chrome, so its markdown would differ only in that same chrome —
+  // re-walking every cell to reproduce it is exactly the work the second
+  // gate in scheduleFlush() removes. Two more strings per session, the
+  // same order of size as the plain ones above.
+  private lastEmittedPlainKey: string | null = null
+  private lastEmittedRecentKey: string | null = null
+  private lastEmittedDerived: { markdown: string; recentMarkdown: string } | null = null
 
   constructor(options: HeadlessTerminalOptions) {
     super()
@@ -252,7 +272,16 @@ export class HeadlessTerminal extends EventEmitter {
       cols,
       rows,
       allowProposedApi: true,
-      scrollback: 10000,
+      // WHY 2000 and not the old 10000: nothing reads past the last 200
+      // rows. Every "current screen" parser walks the viewport only (see
+      // file header) and the widest window any consumer asks for is
+      // snapshotRecent(200) / snapshotRecentMarkdown(200). The consumer's
+      // own terminal pane keeps its scrollback from the raw PTY stream, so
+      // this buffer is never what a user scrolls through. xterm stores
+      // ~1.4 KB of cell data per 120-column row, so 8000 never-read rows
+      // were up to ~12 MB retained per live session (agent-code#765). 2000
+      // keeps a 10x margin over the widest read.
+      scrollback: 2000,
     })
     // NOTE: no PTY subscription here. Consumers must call attach()
     // after they've wired up everything that depends on PTY data
@@ -603,13 +632,56 @@ export class HeadlessTerminal extends EventEmitter {
       if (plain === this.lastEmittedPlain && recent === this.lastEmittedRecent) {
         return
       }
+      // Second gate, one level softer (agent-code#765): the text DID change,
+      // but did anything other than spinner chrome change? Normalize both
+      // strings (glyph at line start → fixed token, timers → `Ns`, token
+      // counters → `N tokens`, trailing whitespace trimmed; see
+      // volatileScreenText.ts) and compare with the last EMITTED frame's
+      // keys. Equal keys mean the only difference is the spinner tick, so:
+      //   * the frame is STILL emitted — ClaudeCodeHeadless keys activity
+      //     off the live spinner line, and the raw `plain` / `recent` carry
+      //     the new tick;
+      //   * the two per-cell markdown walks are skipped and the previous
+      //     markdown strings are reused. They would differ only in the same
+      //     chrome; a stale glyph/timer inside `markdown` is the accepted
+      //     cost, since nothing renders the terminal from it (the pane
+      //     draws from raw PTY data) and the streaming extractor strips
+      //     spinner lines as chrome;
+      //   * `spinnerOnly` reports this markdown reuse, not permission to skip
+      //     attribute-aware composer or picker/condition parsing (#53).
+      // The exact-equality gate above stays in front: it is cheaper and it
+      // keeps the emit cadence identical for frames that do not change at
+      // all. Anything the rules do not rewrite — a composer keystroke, a
+      // new output line, a prompt or picker appearing — changes the key
+      // and takes the full path; when in doubt a change is real.
+      //
+      // WHY `recent` is only normalized when it is a different string: for
+      // an alt-screen TUI (Claude) it is byte-identical to `plain` in every
+      // frame, so the second normalization would be pure waste on the hot
+      // path.
+      const plainKey = normalizeVolatileScreenText(plain)
+      const recentKey = recent === plain ? plainKey : normalizeVolatileScreenText(recent)
+      const reusable =
+        this.lastEmittedDerived !== null &&
+        plainKey === this.lastEmittedPlainKey &&
+        recentKey === this.lastEmittedRecentKey
+          ? this.lastEmittedDerived
+          : null
+      const derived = reusable ?? {
+        markdown: this.snapshotMarkdown(),
+        recentMarkdown: this.snapshotRecentMarkdown(),
+      }
       this.lastEmittedPlain = plain
       this.lastEmittedRecent = recent
+      this.lastEmittedPlainKey = plainKey
+      this.lastEmittedRecentKey = recentKey
+      this.lastEmittedDerived = derived
       this.emit('screen', {
         plain,
-        markdown: this.snapshotMarkdown(),
+        markdown: derived.markdown,
         recent,
-        recentMarkdown: this.snapshotRecentMarkdown(),
+        recentMarkdown: derived.recentMarkdown,
+        spinnerOnly: reusable !== null,
       })
     }, this.snapshotIntervalMs)
   }
