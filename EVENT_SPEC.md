@@ -212,9 +212,58 @@ this package must emit:
    `api_error` (hard — `APIError` surfaced to caller).
 10. Diagnostic: `flow_selected` / `flow_ignored` so the consumer can
     observe attribution decisions instead of guessing.
+11. Complete message: `message_completed`, once per assistant message.
 
 All events carry `source: 'proxy' | 'jsonl' | 'screen'` and
 `confidence: 'high' | 'medium' | 'fallback'`.
+
+### `message_completed`
+
+Emitted at `message_stop`, alongside (never instead of) `turn_completed`.
+Ordering within a turn is `turn_stopped` → `turn_completed` (both from
+`message_delta`) → `message_completed` (from `message_stop`).
+
+```
+{ type: 'message_completed', turnId, role: 'assistant',
+  model?, stopReason?, blocks: CompletedBlock[], usage?,
+  source, confidence, ts }
+
+CompletedBlock =
+  | { kind: 'text',              text, index }
+  | { kind: 'thinking',          text, signature?, index }
+  | { kind: 'redacted_thinking', data, index }
+  | { kind: 'tool_use',          toolName, toolInput, index }
+```
+
+`turn_completed.fullText` aggregates `text_delta` and nothing else, so a
+tool-only turn completes as an empty message, thinking is aggregated
+away, and block order is destroyed. `message_completed` is the event a
+consumer folds to answer "what did the assistant produce".
+
+Mapping is lossy by design: `connector_text` reports as `text`;
+`server_tool_use` / `mcp_tool_use` report as `tool_use` (the sub-kind
+survives in `toolName`); `image` / `document` / unknown blocks are
+omitted. `toolInput` is `undefined` when the accumulated JSON did not
+parse — the raw string and the parse error stay on
+`tool_input_finalized`, which is also where the `toolUseId` for a given
+`index` lives.
+
+Never emitted for flows the adapter excludes from the visible stream
+(sidecar title-gen, Task subagents, prompt-suggestion forks), and not
+synthesised for a stream that dies before `message_stop`.
+
+### Concurrent turns
+
+A single source may hold more than one open turn. Claude Code overlaps
+`/v1/messages` flows (a fast turn's `response-end` racing the next
+request), and the proxy adapter publishes each real flow's full semantic
+sequence rather than discarding the loser of an arrival-order race. Only
+`stream_phase` remains single-owner, because one spinner cannot describe
+two streams.
+
+`start_while_active` is therefore now raised only for a start from a
+DIFFERENT source than the open turns — the screen-vs-proxy ownership
+race the strict rule was written for.
 
 ## 11. Design rules
 

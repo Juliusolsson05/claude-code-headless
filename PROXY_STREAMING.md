@@ -617,6 +617,51 @@ One more subtle implementation detail:
 - decoding to text before the app-level parser would risk corrupting
   multi-byte splits across chunks
 
+## Custom Provider Hosts
+
+`allow_hosts` is what decides whether a connection is MITM'd at all; every
+other host is passed through as a raw TCP tunnel. That default is
+first-party Anthropic only:
+
+```
+^api\.anthropic\.com(:443)?$
+```
+
+Claude Code honours `ANTHROPIC_BASE_URL`, so a user can point it at a
+LiteLLM shim, OpenRouter, or a self-hosted gateway. With the host list
+hardcoded, all of that traffic was tunneled: the addon never saw an HTTP
+request, the adapter never saw a `response-chunk`, and the session
+produced **zero** semantic events — no thinking, no text, and no error
+anywhere saying why.
+
+`createProxyServer({ allowedHosts })` takes the list (as `allow_hosts`
+regex fragments) and drives all three gates that have to agree:
+
+1. `mitmdump --set allow_hosts=…` — what gets decrypted. Built by the
+   exported pure `buildMitmdumpArgs`, comma-joined into ONE `--set`,
+   because a second `--set allow_hosts=` replaces the first rather than
+   appending.
+2. `mitmAddon.py` — which requests to body-parse, which responses to
+   stream-tap, and where to force `Accept-Encoding: identity`. Reads the
+   same list from the `PROXY_ALLOWED_HOSTS` env var, the same channel it
+   already gets `PROXY_EVENTS_FILE` on.
+3. The adapter's attribution policy — which captured flows count as the
+   visible turn. Pass the same list as
+   `ClaudeCodeHeadlessOptions.proxy.allowedHosts`, or build the policy
+   yourself with `createDefaultAttributionPolicy({ allowedHosts })`.
+
+Miss gate 1 and the flow is never captured; miss gate 3 and it is
+captured and then classified `'ignore'`. Both are silent. Start from the
+exported `DEFAULT_ALLOWED_HOSTS` and append, rather than replacing it —
+OAuth and quota traffic still goes to `api.anthropic.com` even when
+inference does not.
+
+Patterns are matched against both the bare host and the `host:port`
+authority (mitmproxy's own semantics), so `^localhost:4010$` is a valid
+fragment. A loopback provider still will not be observed by adding it
+here alone, because `spawnClaudeWithProxy` sets a loopback-only
+`NO_PROXY` that sends that traffic straight past the proxy.
+
 ## Why Streaming Still May Look Wrong
 
 Even after chunk-level capture, "we are seeing live text" does not mean
@@ -638,6 +683,19 @@ simply picks "anything whose URL contains `/v1/messages`".
 
 If multiple `/v1/messages` requests are in flight over time, resetting the right
 pane on any `message_start` is incorrect.
+
+Note the adapter no longer resolves overlap by picking a winner. It used
+to hold a single active-flow lock and discard any real flow whose first
+chunk arrived while the lock was held — which threw away whole assistant
+messages on a `response-end`/next-request race, and let an excluded
+Haiku title-gen call hold the lock through the user's next real turn.
+Concurrent real flows now each publish their full semantic sequence
+(turns are keyed by Anthropic message id, so they do not collide), and
+the only thing still single-owner is `stream_phase`, because one spinner
+cannot describe two streams. Filtering — sidecar, subagent,
+prompt-suggestion — is what keeps non-conversation traffic off the
+channel, and those flows release their claim the moment they are
+identified.
 
 We need stronger request attribution and filtering:
 
@@ -740,6 +798,13 @@ the capture is post-hoc instead of live.
 ### 4. Wrong `/v1/messages` Stream
 
 A valid stream can still be the wrong one for the visible assistant answer.
+
+### 4b. Host List Drift
+
+`allow_hosts` (proxy) and `allowedHosts` (adapter) configured
+differently: traffic is either tunneled uncaptured or captured and then
+ignored. Both failures are silent — the session simply streams nothing.
+See "Custom Provider Hosts".
 
 ### 5. Child Tool Noise
 

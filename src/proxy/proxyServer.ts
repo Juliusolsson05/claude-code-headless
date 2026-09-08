@@ -7,7 +7,7 @@ import { spawn, type ChildProcess } from 'child_process'
 import { fileURLToPath } from 'url'
 
 import { canonicalizePath, sanitizePath } from '../transcript/ProjectDir.js'
-import type { ProxyTransportEvent } from './ClaudeProxyAdapter.js'
+import { DEFAULT_ALLOWED_HOSTS, type ProxyTransportEvent } from './ClaudeProxyAdapter.js'
 
 export type ProxyCapturedEvent = ProxyTransportEvent
 
@@ -20,6 +20,14 @@ export type ProxyServerInfo = {
   addonPath: string
   eventsFile: string
   caCertPath: string
+  /** mitmproxy `allow_hosts` regex fragments — the hosts we MITM. Both
+   *  the mitmdump argv and the addon's own per-request gate read this
+   *  one value (the addon via `PROXY_ALLOWED_HOSTS`), so they cannot
+   *  disagree about which traffic is the conversation.
+   *
+   *  Optional so existing callers that build a `ProxyServerInfo` by hand
+   *  keep compiling; absent means DEFAULT_ALLOWED_HOSTS. */
+  allowedHosts?: string[]
 }
 
 export type ProxyServerEvents = {
@@ -58,6 +66,19 @@ export type CreateProxyServerOptions = {
   /** Stable label such as a resumed conversation id or the shell
    *  session id. Used only for directory naming. */
   sessionKey?: string
+  /** Hosts to MITM, as mitmproxy `allow_hosts` regex fragments.
+   *  Defaults to `DEFAULT_ALLOWED_HOSTS` (first-party Anthropic only).
+   *
+   *  WHY this is configurable: Claude Code honours `ANTHROPIC_BASE_URL`,
+   *  so a user can point it at a LiteLLM shim, OpenRouter, or a
+   *  self-hosted gateway. With the host list hardcoded, that traffic was
+   *  passed through as a raw TCP tunnel — the addon never saw an HTTP
+   *  request, the adapter never saw a `response-chunk`, and the session
+   *  produced ZERO semantic events. No thinking, no text, no error to
+   *  explain it. The same list must also be handed to the adapter's
+   *  attribution policy (see `ClaudeCodeHeadlessOptions.proxy.allowedHosts`)
+   *  or the flows arrive and are then classified `'ignore'`. */
+  allowedHosts?: string[]
 }
 
 const caBootstrapLocks = new Map<string, Promise<void>>()
@@ -196,51 +217,32 @@ export class ProxyServer extends EventEmitter {
   }
 
   private async startUnlocked(): Promise<void> {
+    const allowedHosts = this.info.allowedHosts ?? [...DEFAULT_ALLOWED_HOSTS]
     const env = {
       ...process.env,
       MITMPROXY_SSLKEYLOGFILE: join(this.info.workDir, 'sslkeylog.log'),
       PROXY_EVENTS_FILE: this.info.eventsFile,
+      // The addon runs its OWN per-request host checks (which requests to
+      // body-parse, which responses to stream-tap, where to force
+      // Accept-Encoding: identity). Those used to be a hardcoded
+      // `host.endswith("anthropic.com")`, so pointing mitmdump at a
+      // custom host let the flow through the proxy and then dropped it
+      // inside the addon — capture on, events zero. Env is how the addon
+      // already receives its config (PROXY_EVENTS_FILE), so the host list
+      // travels the same boring path rather than through mitmproxy's
+      // custom-option loader.
+      PROXY_ALLOWED_HOSTS: allowedHosts.join(','),
     }
 
     this.child = spawn(
       this.info.mitmDumpPath,
-      [
-        '--listen-host',
-        '127.0.0.1',
-        '--listen-port',
-        String(this.info.proxyPort),
-        '--set',
-        `confdir=${this.info.confDir}`,
-        // Scope MITM to api.anthropic.com only. Every other host
-        // is passed through as a raw TCP tunnel.
-        //
-        // WHY this matters: the agent inherits HTTPS_PROXY through
-        // its env, which cascades into every child process it
-        // spawns (bash tool calls → git, curl, npm, brew, …).
-        // Without scoping, those children hit our proxy, receive a
-        // cert signed by the mitmproxy CA, and fail TLS validation
-        // — the visible symptom is "SSL cert verify failed" on
-        // `git push`.
-        //
-        // WHY allow_hosts and not ignore_hosts: a previous attempt
-        // used ignore_hosts with a negative-lookahead regex
-        // (^(?!api\.anthropic\.com($|:)).*). Python's standalone
-        // re.search agreed with that regex, but mitmproxy 12.2.2
-        // evidently parses the filter differently and tunneled
-        // *every* host including api.anthropic.com — capture went
-        // to zero flows. allow_hosts flips the polarity: we enumerate
-        // the one host we DO want to MITM. Positive match, no
-        // lookaheads, no parser edge cases.
-        //
-        // The (:443)? anchor keeps the match tight — both
-        // "api.anthropic.com" and "api.anthropic.com:443" match,
-        // but spoofed variants like "api.anthropic.com.evil.com"
-        // do not.
-        '--set',
-        String.raw`allow_hosts=^api\.anthropic\.com(:443)?$`,
-        '-s',
-        this.info.addonPath,
-      ],
+      buildMitmdumpArgs({
+        addonPath: this.info.addonPath,
+        allowedHosts,
+        listenHost: '127.0.0.1',
+        listenPort: this.info.proxyPort,
+        confDir: this.info.confDir,
+      }),
       {
         cwd: this.info.workDir,
         env,
@@ -456,6 +458,59 @@ export class ProxyServer extends EventEmitter {
   }
 }
 
+/**
+ * Build the mitmdump argv. Pure, exported, and unit-tested so the one
+ * flag that silently decides whether ANY traffic gets captured
+ * (`allow_hosts`) is verifiable without launching a proxy.
+ *
+ * WHY `allow_hosts` and not `ignore_hosts`: a previous attempt used
+ * ignore_hosts with a negative-lookahead regex
+ * (`^(?!api\.anthropic\.com($|:)).*`). Python's standalone re.search
+ * agreed with that regex, but mitmproxy 12.2.2 evidently parses the
+ * filter differently and tunneled *every* host including
+ * api.anthropic.com — capture went to zero flows. allow_hosts flips the
+ * polarity: we enumerate the hosts we DO want to MITM. Positive match,
+ * no lookaheads, no parser edge cases.
+ *
+ * WHY scoping matters at all: the agent inherits HTTPS_PROXY through its
+ * env, which cascades into every child process it spawns (bash tool
+ * calls → git, curl, npm, brew, …). Without scoping, those children hit
+ * our proxy, receive a cert signed by the mitmproxy CA, and fail TLS
+ * validation — the visible symptom is "SSL cert verify failed" on
+ * `git push`.
+ *
+ * WHY the patterns are comma-joined into ONE `--set`: that is
+ * mitmproxy's own list syntax for the option, and passing two `--set
+ * allow_hosts=` flags makes the second replace the first rather than
+ * append — a silent way to lose the first-party host while adding a
+ * custom one.
+ *
+ * The listen/confdir arguments are optional so the builder can be
+ * exercised (and reasoned about) as "the addon + host gate", which is
+ * the part that carries the policy; `startUnlocked` passes all of them.
+ */
+export function buildMitmdumpArgs(options: {
+  addonPath: string
+  allowedHosts?: string[]
+  listenHost?: string
+  listenPort?: number
+  confDir?: string
+}): string[] {
+  const args: string[] = []
+  if (options.listenHost) args.push('--listen-host', options.listenHost)
+  if (options.listenPort !== undefined) args.push('--listen-port', String(options.listenPort))
+  if (options.confDir) args.push('--set', `confdir=${options.confDir}`)
+
+  const allowedHosts =
+    options.allowedHosts && options.allowedHosts.length > 0
+      ? options.allowedHosts
+      : [...DEFAULT_ALLOWED_HOSTS]
+  args.push('--set', `allow_hosts=${allowedHosts.join(',')}`)
+
+  args.push('-s', options.addonPath)
+  return args
+}
+
 export async function createProxyServer(
   options?: string | CreateProxyServerOptions,
 ): Promise<ProxyServer> {
@@ -481,6 +536,7 @@ export async function createProxyServer(
       addonPath,
       eventsFile,
       caCertPath,
+      allowedHosts: opts.allowedHosts,
     })
   } catch (error) {
     // Same durability rationale as ProxyServer.writeStartupError: failures in

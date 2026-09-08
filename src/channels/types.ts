@@ -420,6 +420,147 @@ export type SemanticBlockCompletedEvent = SemanticBlockRef & {
 }
 
 // ---------------------------------------------------------------------------
+// Complete-message aggregate.
+// ---------------------------------------------------------------------------
+//
+// WHY this event exists at all (and why `turn_completed` is not enough):
+//
+// `turn_completed.fullText` aggregates `text_delta` and nothing else. That
+// makes three whole classes of assistant message unrepresentable on this
+// channel:
+//
+//   * a tool-only turn (no text blocks) completes with `fullText:
+//     undefined` — the consumer sees "the assistant said nothing" when it
+//     actually issued three Bash calls;
+//   * thinking is aggregated away entirely — there is no settled
+//     "here is the reasoning block, with its signature" payload, only the
+//     delta stream you had to have been subscribed for;
+//   * block ORDER is destroyed — "text, tool, text, tool" flattens into one
+//     string, so a late subscriber cannot rebuild what Claude produced.
+//
+// Worse, the per-block state that COULD have answered this was deleted at
+// `content_block_stop` by the proxy adapter, so no aggregate could be built
+// even in principle. `message_completed` fixes the shape: one event per
+// assistant message, at `message_stop`, carrying every block in order.
+//
+// This is an ADDITION, never a replacement: `turn_completed` keeps firing
+// with exactly the payload it always had, because existing consumers fold
+// it into markdown cards and a breaking change there is not worth the
+// tidiness.
+
+/** One settled content block from a completed assistant message.
+ *
+ *  WHY the union is narrower than `SemanticBlockKind`: this aggregate
+ *  answers "what did the assistant produce", and that question only has
+ *  four answers on the Anthropic wire — prose, reasoning, redacted
+ *  reasoning, and tool invocations. Structural block variants (`image`,
+ *  `document`, `tool_result`, `container_upload`, future/unknown types)
+ *  never appear in an assistant STREAM response; they are request-side or
+ *  committed-channel shapes. Keeping them out means a consumer can
+ *  exhaustively switch on `kind` without a defensive default branch.
+ *
+ *  Mapping rules the adapter applies (documented here because the mapping
+ *  is lossy and the loss must be discoverable from the type):
+ *   * `connector_text` → `text`. It IS assistant prose; dropping it would
+ *     recreate the very "you cannot reconstruct the message" bug this
+ *     event exists to fix.
+ *   * `server_tool_use` / `mcp_tool_use` → `tool_use`. The distinction
+ *     survives in `toolName` (MCP tools are always `mcp__server__tool`),
+ *     and every consumer that needs the raw sub-kind still has
+ *     `block_completed`.
+ *   * anything else → omitted from `blocks`.
+ */
+export type CompletedTextBlock = {
+  kind: 'text'
+  text: string
+  /** Upstream block index. Preserved so a consumer can join back to the
+   *  `block_started` / `text_delta` events it may have rendered live. */
+  index: number
+}
+
+export type CompletedThinkingBlock = {
+  kind: 'thinking'
+  /** Concatenated `thinking_delta` content. */
+  text: string
+  /** Concatenated `signature_delta`. Absent when upstream never sent one
+   *  (it does not on every model/beta combination), NOT empty-string, so
+   *  "no signature" and "empty signature" stay distinguishable. */
+  signature?: string
+  index: number
+}
+
+export type CompletedRedactedThinkingBlock = {
+  kind: 'redacted_thinking'
+  /** Opaque upstream blob. Carried verbatim: it is meaningless to us but
+   *  must survive a round-trip if a consumer ever replays the message
+   *  back to the API. */
+  data: string
+  index: number
+}
+
+export type CompletedToolUseBlock = {
+  kind: 'tool_use'
+  toolName: string
+  /** Parsed `input_json_delta` accumulation. `undefined` when the
+   *  accumulated JSON did not parse — the raw string is NOT substituted
+   *  here because a consumer branching on object-vs-string would be a
+   *  worse trap than an explicit absence. The lossless raw payload plus
+   *  the parse error stay on `tool_input_finalized`.
+   *
+   *  NOTE the deliberate absence of `toolUseId`: this shape is pinned by
+   *  the contract test in
+   *  `src/proxy/ClaudeProxyAdapter.messageCompleted.test.ts`, which
+   *  asserts block equality exactly. Consumers pairing tool results join
+   *  on `block_completed` / `tool_input_finalized`, both of which carry
+   *  the id for the same `index`. */
+  toolInput: unknown
+  index: number
+}
+
+export type CompletedBlock =
+  | CompletedTextBlock
+  | CompletedThinkingBlock
+  | CompletedRedactedThinkingBlock
+  | CompletedToolUseBlock
+
+/** One complete assistant message, emitted once at `message_stop`.
+ *
+ *  Fires ALONGSIDE `turn_completed`, not instead of it. Ordering within a
+ *  turn is `turn_stopped` → `turn_completed` (both from `message_delta`)
+ *  → `message_completed` (from `message_stop`), because that is the order
+ *  the upstream frames arrive in and we never reorder the wire.
+ *
+ *  Never emitted for flows the adapter excluded from the visible stream —
+ *  sidecars (title-gen), Task subagents, prompt-suggestion forks. Those
+ *  are not assistant messages in this session's conversation. */
+export type SemanticMessageCompletedEvent = {
+  type: 'message_completed'
+  /** Anthropic `message_start.id`, same value as the surrounding
+   *  `turn_started` / `turn_completed` pair. */
+  turnId: string
+  /** Always `'assistant'` today — only assistant messages come back over
+   *  the SSE stream. Typed as a literal rather than the `'user' |
+   *  'assistant'` union so consumers do not write dead branches. */
+  role: 'assistant'
+  /** Model id from `message_start`. Absent if the frame omitted it. */
+  model?: string
+  /** Normalized `message_delta.stop_reason`. Absent when the stream ended
+   *  without one (severed mid-message) — that case is already reported as
+   *  a medium-confidence `turn_stopped`. */
+  stopReason?: SemanticTurnStoppedEvent['stopReason']
+  /** Every representable block, in upstream index order. Empty only for a
+   *  message that genuinely produced no content. */
+  blocks: CompletedBlock[]
+  /** Merged usage as of `message_stop`. Same shape as
+   *  `usage_updated.usage` — deliberately reusing that type rather than an
+   *  untyped bag, so a consumer has ONE usage shape to learn. */
+  usage?: SemanticUsageEvent['usage']
+  source: SemanticSource
+  confidence: SemanticConfidence
+  ts: number
+}
+
+// ---------------------------------------------------------------------------
 // Tool-result linkage.
 // ---------------------------------------------------------------------------
 //
@@ -764,6 +905,7 @@ export type SemanticEvent =
   | SemanticToolInputDeltaEvent
   | SemanticToolInputFinalizedEvent
   | SemanticBlockCompletedEvent
+  | SemanticMessageCompletedEvent
   | SemanticToolResultEvent
   | SemanticTurnStoppedEvent
   | SemanticUsageEvent
