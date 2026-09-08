@@ -7,6 +7,70 @@ from mitmproxy import http
 
 OUT_PATH = os.environ.get("PROXY_EVENTS_FILE")
 
+# Hosts this addon treats as "the conversation", as mitmproxy
+# `allow_hosts` regex fragments, comma-separated.
+#
+# WHY the addon needs its own copy of the host list: mitmdump's
+# `allow_hosts` decides which connections are MITM'd at the TLS layer,
+# but every hook below runs a SECOND, independent host check to decide
+# what to body-parse, what to stream-tap, and where to force
+# `Accept-Encoding: identity`. Those checks used to be a hardcoded
+# `host.endswith("anthropic.com")`. The result for anyone pointing
+# Claude Code at a LiteLLM shim or OpenRouter via ANTHROPIC_BASE_URL was
+# a proxy that decrypted their traffic and then ignored it: no
+# `response-chunk` events, so no thinking and no text, with nothing
+# anywhere saying why. One env var, set by proxyServer.ts from the same
+# list it hands mitmdump, keeps the two gates from drifting.
+#
+# Env (not mitmproxy's custom-option loader) because that is how this
+# addon already receives PROXY_EVENTS_FILE — one configuration
+# mechanism, not two.
+_DEFAULT_ALLOWED_HOSTS = r"^api\.anthropic\.com(:443)?$"
+
+
+def _compile_allowed_hosts():
+    """Compile PROXY_ALLOWED_HOSTS into a list of patterns.
+
+    A bad pattern is dropped rather than raised: an addon that fails to
+    load takes the whole proxy — and therefore the whole session — down,
+    which is a far worse outcome than one host fragment that matches
+    nothing. If every pattern is bad we fall back to the first-party
+    default so the common case still works.
+    """
+    raw = os.environ.get("PROXY_ALLOWED_HOSTS") or _DEFAULT_ALLOWED_HOSTS
+    compiled = []
+    for fragment in raw.split(","):
+        fragment = fragment.strip()
+        if not fragment:
+            continue
+        try:
+            compiled.append(re.compile(fragment))
+        except re.error:
+            continue
+    if not compiled:
+        compiled.append(re.compile(_DEFAULT_ALLOWED_HOSTS))
+    return compiled
+
+
+_ALLOWED_HOST_PATTERNS = _compile_allowed_hosts()
+
+
+def _is_allowed_host(request) -> bool:
+    """Whether this request targets a host we treat as the conversation.
+
+    Matched against BOTH the bare host and `host:port`, because that is
+    what mitmproxy's own allow_hosts sees — a fragment like
+    `^localhost:4010$` is legal and useful for a local gateway, and would
+    never match if we only tested the hostname.
+    """
+    host = request.host or ""
+    candidates = (host, "%s:%s" % (host, request.port))
+    for pattern in _ALLOWED_HOST_PATTERNS:
+        for candidate in candidates:
+            if pattern.search(candidate):
+                return True
+    return False
+
 
 def _write(payload):
     if not OUT_PATH:
@@ -438,9 +502,7 @@ def _extract_request_shape(content: bytes):
 def request(flow: http.HTTPFlow) -> None:
     request = flow.request
     path = request.path or ""
-    is_messages = (
-        request.host.endswith("anthropic.com") and "/v1/messages" in path
-    )
+    is_messages = _is_allowed_host(request) and "/v1/messages" in path
     if is_messages:
         request.headers["Accept-Encoding"] = "identity"
 
@@ -499,7 +561,7 @@ def responseheaders(flow: http.HTTPFlow) -> None:
     path = request.path or ""
     content_type = flow.response.headers.get("content-type", "")
 
-    if request.host.endswith("anthropic.com") and "/v1/messages" in path and "text/event-stream" in content_type:
+    if _is_allowed_host(request) and "/v1/messages" in path and "text/event-stream" in content_type:
         flow.response.stream = _make_stream_tap(flow)
 
 
@@ -568,9 +630,7 @@ def response(flow: http.HTTPFlow) -> None:
     # when the client didn't set stream=true) we still emit a short
     # preview so run.ts / diagnostics can inspect failure bodies
     # without decrypting traffic manually.
-    if "text/event-stream" not in content_type and request.host.endswith(
-        "anthropic.com"
-    ):
+    if "text/event-stream" not in content_type and _is_allowed_host(request):
         try:
             payload["body_preview"] = response.get_text(strict=False)[:4000]
         except Exception as exc:

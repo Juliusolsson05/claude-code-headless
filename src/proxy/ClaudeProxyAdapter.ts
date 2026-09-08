@@ -33,6 +33,7 @@ import { TextDecoder } from 'node:util'
 
 import type { SemanticChannel } from '../channels/SemanticChannel.js'
 import type {
+  CompletedBlock,
   SemanticBlockKind,
   SemanticConfidence,
   SemanticSource,
@@ -170,19 +171,38 @@ export type ProxyTransportEvent = {
  *  we learn more about it:
  *
  *    request arrives  → 'candidate' (eligible, not yet streaming)
- *    first SSE chunk  → 'active' (promote — we know it's a live
- *                       stream, and no other flow held the slot)
- *                    OR 'secondary' (demote — another flow was
- *                       already streaming when our chunks arrived).
- *    response-end     → release the 'active' slot for the next flow.
+ *    first SSE chunk  → 'active' (we know it's a live stream)
+ *    message_start    → stays 'active', OR drops to 'secondary' when the
+ *                       request shape identifies it as traffic that is
+ *                       not part of this conversation (sidecar title-gen,
+ *                       Task subagent, prompt-suggestion fork).
+ *    response-end     → teardown.
  *
- *  Locking on first-chunk-arrival instead of at request time is what
+ *  Promoting on first-chunk-arrival instead of at request time is what
  *  protects against Claude Code's auth/warmup preflight `POST
  *  /v1/messages` (non-streaming, tiny body, response Content-Type
- *  `application/json` not `text/event-stream`) stealing the slot
- *  from the real turn. The warmup never emits a `response-chunk`
- *  because the mitmproxy addon only streams-tap SSE responses, so
- *  its `candidate` status simply expires when the flow ends. */
+ *  `application/json` not `text/event-stream`). The warmup never emits a
+ *  `response-chunk` because the mitmproxy addon only streams-tap SSE
+ *  responses, so its `candidate` status simply expires when the flow
+ *  ends.
+ *
+ *  HISTORY — what 'secondary' used to mean, and why it no longer means
+ *  it: a single `activeStreamingFlowId` lock let exactly ONE flow be
+ *  active at a time, and any real flow whose first chunk arrived while
+ *  the lock was held was demoted to 'secondary' and silently discarded
+ *  for its entire life. Two things made that indefensible:
+ *
+ *    1. Claude Code genuinely overlaps `/v1/messages` flows (a fast
+ *       turn's `response-end` racing the next request), so the demotion
+ *       threw away whole assistant messages.
+ *    2. Excluded flows (Haiku title-gen especially) HELD the lock until
+ *       their own `response-end`. A title-gen call that overlapped the
+ *       user's next real turn therefore killed that turn outright.
+ *
+ *  'secondary' is now reserved for flows we deliberately exclude, and
+ *  those release their claim the moment they're identified. Concurrency
+ *  is handled by letting flows run in parallel — see
+ *  `phaseOwnerFlowId`. */
 export type FlowAttribution =
   | 'candidate'
   | 'active'
@@ -217,20 +237,95 @@ export type AttributionPolicy = {
   classify: (ctx: AttributionContext) => 'candidate' | 'ignore'
 }
 
-/** Default: accept any anthropic.com `/v1/messages` request as a
+/** The hosts we MITM by default, as mitmproxy `allow_hosts` regex
+ *  fragments.
+ *
+ *  WHY this constant lives in the adapter and not in `proxyServer.ts`
+ *  (which is where it is handed to mitmdump): there are THREE gates that
+ *  have to agree on "which hosts carry the conversation" — the mitmdump
+ *  `allow_hosts` argv, the addon's own per-request host checks, and this
+ *  adapter's attribution policy. When they disagree the failure is
+ *  silent: traffic is captured but every flow classifies as `'ignore'`,
+ *  so the semantic channel simply produces nothing and the UI looks
+ *  "connected but dead". One exported constant, imported by
+ *  `proxyServer.ts` and forwarded to the addon via `PROXY_ALLOWED_HOSTS`,
+ *  makes drift impossible rather than merely unlikely.
+ *
+ *  The `(:443)?` anchor keeps the match tight: both `api.anthropic.com`
+ *  and `api.anthropic.com:443` match, but `api.anthropic.com.evil.com`
+ *  does not. */
+export const DEFAULT_ALLOWED_HOSTS: readonly string[] = [
+  String.raw`^api\.anthropic\.com(:443)?$`,
+]
+
+/** Compile `allow_hosts` fragments once. Invalid patterns are dropped
+ *  rather than thrown: a bad host regex in a consumer's config should
+ *  degrade to "that pattern matches nothing", not take down session
+ *  startup. */
+function compileHostPatterns(patterns: readonly string[]): RegExp[] {
+  const compiled: RegExp[] = []
+  for (const pattern of patterns) {
+    try {
+      compiled.push(new RegExp(pattern))
+    } catch {
+      // Ignore — see docstring.
+    }
+  }
+  return compiled
+}
+
+/** Default: accept any `/v1/messages` request to an allowed host as a
  *  candidate. The adapter will reject non-streaming ones automatically
- *  by virtue of never seeing a `response-chunk` for them. */
-export function createDefaultAttributionPolicy(): AttributionPolicy {
+ *  by virtue of never seeing a `response-chunk` for them.
+ *
+ *  WHY this takes host PATTERNS rather than keeping the old
+ *  `host.endsWith('anthropic.com')` literal: routing Claude Code at a
+ *  LiteLLM shim or OpenRouter (`ANTHROPIC_BASE_URL`) produces a real
+ *  conversation on a non-Anthropic host. The old gate classified all of
+ *  it as `'ignore'`, so those users got zero semantic events — no
+ *  thinking, no text — with no error anywhere to explain it.
+ *
+ *  Patterns are matched against BOTH the bare host and the `host:port`
+ *  authority, because that is the shape mitmproxy's own `allow_hosts`
+ *  sees (`^localhost:4010$` is a legal and useful fragment) while the
+ *  transport event's `host` field carries no port. */
+export function createDefaultAttributionPolicy(options?: {
+  /** mitmproxy `allow_hosts` regex fragments. Defaults to
+   *  DEFAULT_ALLOWED_HOSTS. */
+  allowedHosts?: readonly string[]
+}): AttributionPolicy {
+  const patterns = compileHostPatterns(options?.allowedHosts ?? DEFAULT_ALLOWED_HOSTS)
   return {
     classify: ({ url, path, host }) => {
       const target = url ?? path ?? ''
       if (!target.includes('/v1/messages')) return 'ignore'
       // Strict host match so stray flows that mention /v1/messages
       // in a body or URL can't hijack the semantic channel.
-      if (host && !host.endsWith('anthropic.com')) return 'ignore'
+      if (host && !hostMatchesAny(host, url, patterns)) return 'ignore'
       return 'candidate'
     },
   }
+}
+
+/** True when `host` (or the `host:port` authority parsed out of `url`)
+ *  matches any compiled pattern. Falls back to the bare host when the URL
+ *  is absent or unparseable — the transport event's `host` field is
+ *  always present in practice, the URL is the optional enrichment. */
+function hostMatchesAny(
+  host: string,
+  url: string | undefined,
+  patterns: RegExp[],
+): boolean {
+  const candidates = [host]
+  if (url) {
+    try {
+      const authority = new URL(url).host
+      if (authority && authority !== host) candidates.push(authority)
+    } catch {
+      // Not a parseable absolute URL; the bare host is enough.
+    }
+  }
+  return patterns.some(pattern => candidates.some(candidate => pattern.test(candidate)))
 }
 
 /** Back-compat export. */
@@ -276,7 +371,18 @@ type BlockState =
       toolUseId: string
       inputJson: string
     }
-  | { kind: 'other'; index: number; rawType: string; citations?: unknown[] }
+  | {
+      kind: 'other'
+      index: number
+      rawType: string
+      /** Opaque payload of a `redacted_thinking` block, captured at
+       *  content_block_start. `redacted_thinking` classifies as 'other'
+       *  here (it has no deltas and no per-block accumulation to do),
+       *  but the complete-message aggregate has to carry it verbatim —
+       *  so the one field it does have gets kept. */
+      data?: string
+      citations?: unknown[]
+    }
 
 type ParsedRequestShape = {
   /** Caller-supplied generation cap. Title-gen requests typically set
@@ -363,8 +469,43 @@ type FlowState = {
   turnId: string | null
   decoder: TextDecoder
   sseParser: IncrementalSseParser
-  /** Per-block state keyed by upstream `index`. */
+  /** Per-block state keyed by upstream `index`, for blocks that are
+   *  still accumulating deltas. */
   blocks: Map<number, BlockState>
+  /** Blocks that reached `content_block_stop`, in arrival order, kept
+   *  until `message_stop`.
+   *
+   *  WHY this array exists: the aggregate published at `message_stop`
+   *  needs every block of the message, and until now `content_block_stop`
+   *  DELETED each block the moment it settled. That deletion is the
+   *  single reason no complete-message event could exist — by the time
+   *  the message ended, the message was gone.
+   *
+   *  WHY an append-ordered array rather than keeping entries in `blocks`
+   *  (the obvious alternative):
+   *
+   *    * The map is keyed by `index`, and a severed-then-resumed stream
+   *      can hand us a SECOND `content_block_start` for an index that
+   *      already settled. Keyed storage silently overwrites the earlier
+   *      content — exactly the "message quietly loses half its text"
+   *      class of bug this whole event is meant to close.
+   *    * Arrival order already IS index order on the real wire (indexes
+   *      arrive contiguously, one stop per start), so the array needs no
+   *      reordering in the normal case; the stable sort at assembly time
+   *      is pure defence.
+   *
+   *  Bounded by one message's content and cleared at `message_stop` /
+   *  flow teardown, so it holds no more than the `fullText` aggregate
+   *  next to it already did. */
+  settledBlocks: CompletedBlock[]
+  /** Model id from `message_start`, carried onto the complete-message
+   *  aggregate. Distinct from the session model: this is what actually
+   *  served THIS message. */
+  model: string | null
+  /** Normalized `message_delta.stop_reason`. Recorded on the flow (not
+   *  just published) because `message_stop` — one frame later — needs it
+   *  for the aggregate. */
+  stopReason: SemanticTurnStopReason
   /** Running text aggregate across ALL text blocks for `turn_delta`
    *  backward compat. */
   fullText: string
@@ -486,16 +627,18 @@ const MAX_TOKENS_SIDECAR_THRESHOLD = 1024
  *  exists when a user starts a new pane). */
 const AUXILIARY_MESSAGE_COUNT_THRESHOLD = 3
 
-// Watchdog window for activeStreamingFlowId.
+// Watchdog window for abandoned streaming flows.
 //
-// activeStreamingFlowId is normally released only by an explicit
-// response-end transport event (see onEnd). That contract breaks when
-// the SSE stream is severed mid-response — the proxy doesn't always
-// observe the disconnect, no `response-end` is published, and the lock
-// stays held. Every later real turn hits the gate in onChunk and gets
-// emitted as flow_ignored. See debug bundle
-// 2026-05-01T10-07-21-3357bfc7 where a flow held the lock for 14+
-// hours and blocked all subsequent semantic events.
+// A flow is normally torn down by an explicit response-end transport
+// event (see onEnd). That contract breaks when the SSE stream is severed
+// mid-response — the proxy doesn't always observe the disconnect and no
+// `response-end` is published. Historically that also pinned the single
+// active-flow lock, so every later real turn was emitted as flow_ignored
+// (see debug bundle 2026-05-01T10-07-21-3357bfc7, where one flow held
+// the lock for 14+ hours and blocked all subsequent semantic events).
+// Parallel flows removed that failure mode, but the abandoned flow's
+// SEMANTIC TURN is still open — turn_started with no turn_completed,
+// which hangs the consumer's live-turn state. Reaping closes it out.
 //
 // The window is intentionally generous. A live Claude turn chunks
 // continuously while streaming and pauses for at most a few seconds
@@ -597,18 +740,72 @@ export function headerMarksSubagent(systemPrefix: string | undefined | null): bo
   return typeof systemPrefix === 'string' && /cc_is_subagent=true/.test(systemPrefix)
 }
 
+/**
+ * Detect the subagent flag on the TRANSPORT headers of a request.
+ *
+ * WHY a second detection surface for one flag: `cc_is_subagent` is
+ * per-request and decides whether a whole flow belongs in the parent's
+ * visible turn stream, so a miss is expensive — a Task subagent's Read /
+ * Bash / prose paints as if the main agent did it. The flag can reach us
+ * two ways and we must honour both:
+ *
+ *   * inside the request body's billing block (`system[0]`), which is
+ *     what our own mitm addon parses into `request_shape.is_subagent`;
+ *   * as a raw header, for any transport that forwards
+ *     `x-anthropic-billing-header` verbatim or hoists the flag into a
+ *     header of its own. Our addon filters the billing header out of the
+ *     event by allowlist, but this adapter is explicitly usable with
+ *     other proxy runtimes.
+ *
+ * Two shapes are accepted: a dedicated `cc_is_subagent: true` header, and
+ * the `…; cc_is_subagent=true;` fragment embedded in a larger header
+ * value (shared with `headerMarksSubagent`, so both spellings can never
+ * drift apart).
+ */
+export function headersMarkSubagent(
+  headers: Record<string, string> | undefined,
+): boolean {
+  if (!headers) return false
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value !== 'string') continue
+    if (key.toLowerCase() === 'cc_is_subagent') {
+      if (value.trim().toLowerCase() === 'true') return true
+      continue
+    }
+    if (headerMarksSubagent(value)) return true
+  }
+  return false
+}
+
 export class ClaudeProxyAdapter {
   private readonly channel: SemanticChannel
   private readonly policy: AttributionPolicy
   private readonly onDiagnostic: (message: string) => void
   private readonly flows = new Map<string, FlowState>()
   private readonly observedProviderSessionIds = new Set<string>()
-  /** The id of the flow currently holding the "active streaming"
-   *  lock. Null when no flow is streaming. A new candidate flow's
-   *  first chunk promotes it to 'active' iff this is null; otherwise
-   *  the new flow is demoted to 'secondary'. Released on
-   *  response-end of whichever flow was holding it. */
-  private activeStreamingFlowId: string | null = null
+  /** Flows that are currently streaming as part of the visible
+   *  conversation, in promotion order. Every one of them publishes its
+   *  full semantic sequence — there is no "one winner" any more (see the
+   *  FlowAttribution history note). Entries are removed on teardown
+   *  (response-end, terminal API error, watchdog reap) and on demotion
+   *  (sidecar / subagent / suggestion fork). */
+  private readonly streamingFlowIds = new Set<string>()
+
+  /** The one flow allowed to publish `stream_phase`.
+   *
+   *  WHY a lock survives at all after the concurrency fix: `stream_phase`
+   *  is a SINGLETON UI state — one spinner, one "Calling Bash" label. Two
+   *  concurrent flows publishing phases would flap it between their block
+   *  boundaries, and the channel's phase dedupe cannot help because the
+   *  transitions genuinely differ. Everything else on the channel is
+   *  turn-keyed and composes fine in parallel, so the lock shrank from
+   *  "who may publish" to "who may drive the spinner" — the smallest
+   *  scope that still keeps the phase coherent.
+   *
+   *  Ownership is first-come and hands over to the next streaming flow
+   *  when the owner leaves, so an excluded or dead flow can never
+   *  permanently freeze the phase. */
+  private phaseOwnerFlowId: string | null = null
 
   /** Sidecar-flow filter — see ClaudeProxyAdapterOptions for why this
    *  exists. A `null` callback means no opt-in and the filter is
@@ -670,7 +867,8 @@ export class ClaudeProxyAdapter {
   dispose(): void {
     this.flows.clear()
     this.observedProviderSessionIds.clear()
-    this.activeStreamingFlowId = null
+    this.streamingFlowIds.clear()
+    this.phaseOwnerFlowId = null
   }
 
   // -----------------------------------------------------------------------
@@ -708,6 +906,9 @@ export class ClaudeProxyAdapter {
       decoder: new TextDecoder('utf-8'),
       sseParser: new IncrementalSseParser(),
       blocks: new Map(),
+      settledBlocks: [],
+      model: null,
+      stopReason: null,
       fullText: '',
       usage: {},
       requestShape: null,
@@ -740,6 +941,23 @@ export class ClaudeProxyAdapter {
       this.parseRequestBody(
         typeof event.body_b64 === 'string' ? event.body_b64 : undefined,
       )
+    // Header-sourced subagent flag ORs into whatever the body said. It
+    // can only ever turn the flag ON: a header saying "subagent" while a
+    // body says nothing is a subagent (the body signal is best-effort —
+    // oversized bodies and older addons produce no shape at all), but a
+    // missing header is not evidence of a main-agent flow.
+    if (headersMarkSubagent(event.headers)) {
+      state.requestShape = state.requestShape
+        ? { ...state.requestShape, isSubagent: true }
+        : {
+            maxTokens: null,
+            messageCount: null,
+            systemPrefixes: [],
+            isCompactionSynthesis: false,
+            isPromptSuggestion: false,
+            isSubagent: true,
+          }
+    }
     this.flows.set(flowId, state)
     this.onDiagnostic(`flow ${flowId} accepted as candidate`)
   }
@@ -788,45 +1006,48 @@ export class ClaudeProxyAdapter {
     // reliable "this is live streaming" signal — unlike the request
     // headers, which don't distinguish warmup from real turns.
     if (state.attribution === 'candidate') {
-      // Watchdog gate: if the held active flow has been silent past
-      // the window, the SSE stream almost certainly died without a
-      // clean response-end. Free the lock here so this candidate can
-      // promote — otherwise we'd flow_ignored every later turn until
-      // the session restarts. See the STALE_ACTIVE_FLOW_MS comment
-      // for the full incident this prevents.
-      if (this.activeStreamingFlowId !== null && this.activeStreamingFlowId !== flowId) {
-        const stale = this.flows.get(this.activeStreamingFlowId)
+      // Watchdog: a stream that died without a clean response-end leaves
+      // a semantic turn open forever (turn_started, no turn_completed).
+      // A new flow arriving is our cue to check for that — reap anything
+      // that has been silent past the window so its turn gets closed out.
+      // See the STALE_ACTIVE_FLOW_MS comment for the incident. This no
+      // longer gates promotion (nothing does), but the cleanup it does is
+      // still the only thing that closes an abandoned turn.
+      for (const otherFlowId of [...this.streamingFlowIds]) {
+        if (otherFlowId === flowId) continue
+        const stale = this.flows.get(otherFlowId)
         if (stale && Date.now() - stale.lastChunkAt > STALE_ACTIVE_FLOW_MS) {
           this.reapStaleActiveFlow(stale)
         }
       }
 
-      if (this.activeStreamingFlowId === null) {
-        this.activeStreamingFlowId = flowId
-        state.attribution = 'active'
-        this.channel.publishFlowSelected({
-          turnId: null,
-          flowId,
-          reason: 'first-chunk (no competing active flow)',
-          source: 'proxy',
-          confidence: 'high',
-        })
-        // First-chunk promotion → emit 'requesting' with a null turnId.
-        // We don't have the Anthropic `message_id` yet (it arrives on
-        // the first `message_start` frame); the renderer treats a null
-        // turnId phase as "attached to the current session, not a
-        // specific turn" and upgrades it when the next phase event
-        // arrives with a real turnId.
-        this.publishPhase(state, 'requesting')
-      } else {
-        state.attribution = 'secondary'
-        this.channel.publishFlowIgnored({
-          flowId,
-          reason: `concurrent with active flow ${this.activeStreamingFlowId}`,
-          source: 'proxy',
-          confidence: 'medium',
-        })
-      }
+      // Unconditional promotion. Every candidate that actually streams is
+      // part of the conversation until its request shape proves otherwise
+      // at message_start — that check (sidecar / subagent / suggestion) is
+      // evidence-based, whereas the old "someone else got here first" rule
+      // was pure arrival-order luck and threw away real messages.
+      const parallelWith = this.phaseOwnerFlowId
+      this.streamingFlowIds.add(flowId)
+      state.attribution = 'active'
+      if (this.phaseOwnerFlowId === null) this.phaseOwnerFlowId = flowId
+      this.channel.publishFlowSelected({
+        turnId: null,
+        flowId,
+        reason:
+          parallelWith === null
+            ? 'first-chunk (no competing active flow)'
+            : `first-chunk (parallel with active flow ${parallelWith})`,
+        source: 'proxy',
+        confidence: 'high',
+      })
+      // First-chunk promotion → emit 'requesting' with a null turnId.
+      // We don't have the Anthropic `message_id` yet (it arrives on
+      // the first `message_start` frame); the renderer treats a null
+      // turnId phase as "attached to the current session, not a
+      // specific turn" and upgrades it when the next phase event
+      // arrives with a real turnId. Only the phase owner gets through
+      // publishPhase, so a parallel flow stays silent here.
+      this.publishPhase(state, 'requesting')
     }
 
     // Decode via streaming TextDecoder so multi-byte UTF-8 codepoints
@@ -867,6 +1088,13 @@ export class ClaudeProxyAdapter {
     // a turn_stopped so the renderer can close out the live turn
     // instead of hanging on a never-terminating state. This is a soft
     // failure — mark it as medium confidence so consumers can tell.
+    //
+    // We deliberately do NOT synthesise a `message_completed` here.
+    // That event's contract is "one per assistant message, at
+    // message_stop"; a severed stream has no message to report, and the
+    // partial text it did produce already reaches the consumer through
+    // the finishTurn below. Emitting a truncated aggregate would hand
+    // consumers something that looks authoritative and isn't.
     if (state.attribution === 'active' && state.turnStarted && !state.turnStopped) {
       this.channel.publishTurnStopped({
         turnId: state.turnId ?? flowId,
@@ -895,12 +1123,28 @@ export class ClaudeProxyAdapter {
     }
 
     this.flows.delete(flowId)
-    // Release the active-streaming lock so the next candidate flow
-    // (typically a tool-use iteration) can be promoted. Guarded on
-    // identity: flows that ended without ever chunking (warmups)
-    // won't have taken the lock in the first place.
-    if (this.activeStreamingFlowId === flowId) {
-      this.activeStreamingFlowId = null
+    this.releaseStreamingFlow(flowId)
+  }
+
+  /** Drop a flow from the streaming set and hand phase ownership to
+   *  whichever streaming flow is next in line.
+   *
+   *  WHY handover instead of just clearing: leaving `phaseOwnerFlowId`
+   *  null while another flow is mid-stream would strand the spinner —
+   *  that flow already published its `requesting` phase (or was silenced
+   *  because it wasn't the owner) and won't re-announce a phase it has
+   *  already passed. Handing the slot over means the next `content_block_
+   *  start` on the surviving flow drives the UI again.
+   *
+   *  Safe to call for flows that never streamed (warmups): both the set
+   *  delete and the ownership check are no-ops for them. */
+  private releaseStreamingFlow(flowId: string): void {
+    this.streamingFlowIds.delete(flowId)
+    if (this.phaseOwnerFlowId !== flowId) return
+    this.phaseOwnerFlowId = null
+    for (const next of this.streamingFlowIds) {
+      this.phaseOwnerFlowId = next
+      break
     }
   }
 
@@ -937,9 +1181,7 @@ export class ClaudeProxyAdapter {
       `flow ${state.flowId} reaped (no chunk for ${Math.round(silentMs / 1000)}s)`,
     )
     this.flows.delete(state.flowId)
-    if (this.activeStreamingFlowId === state.flowId) {
-      this.activeStreamingFlowId = null
-    }
+    this.releaseStreamingFlow(state.flowId)
   }
 
   private closeTurnAfterTerminalApiError(
@@ -1007,21 +1249,20 @@ export class ClaudeProxyAdapter {
         // tool results would have arrived.
         this.publishPhase(state, 'idle')
         this.closeTurnAfterTerminalApiError(state, source, confidence)
-        // Release the stream lock immediately on provider-level SSE
-        // errors. The normal happy path frees `activeStreamingFlowId`
-        // in `onEnd`, but the overloaded-error incident that exposed
-        // this bug did not produce a useful follow-up end event before
-        // the user retried. That left the failed flow holding the
-        // active slot, so every later real turn was emitted as
+        // Tear the flow down immediately on provider-level SSE errors.
+        // The normal happy path does this in `onEnd`, but the
+        // overloaded-error incident that exposed this bug did not
+        // produce a useful follow-up end event before the user retried.
+        // That left the failed flow holding the (then single) active
+        // slot, so every later real turn was emitted as
         // `flow_ignored: concurrent with active flow ...` even though
-        // the network and proxy were healthy again. An Anthropic
-        // `error` event is terminal for this stream by contract; after
-        // we surface it and put the UI phase back to idle, keeping the
-        // lock buys nothing and poisons the session.
+        // the network and proxy were healthy again. Parallel flows made
+        // that specific symptom impossible, but an Anthropic `error`
+        // event is still terminal for this stream by contract — holding
+        // phase ownership or a settled-block buffer for a dead stream
+        // buys nothing.
         this.flows.delete(state.flowId)
-        if (this.activeStreamingFlowId === state.flowId) {
-          this.activeStreamingFlowId = null
-        }
+        this.releaseStreamingFlow(state.flowId)
         return
       }
 
@@ -1032,6 +1273,10 @@ export class ClaudeProxyAdapter {
         // downstream maps between them).
         if (!ev.messageId) return
         state.turnId = ev.messageId
+        // Recorded per-flow (not just used for the sidecar check) because
+        // the complete-message aggregate reports which model actually
+        // served this message — a session can switch models mid-run.
+        state.model = typeof ev.model === 'string' ? ev.model : null
         if (ev.usage) state.usage = mergeUsage(state.usage, ev.usage)
 
         // Sidecar demotion. message_start is the first SSE frame that
@@ -1060,12 +1305,17 @@ export class ClaudeProxyAdapter {
         //      (at that point we didn't yet know the model — the
         //      model only ships in `message_start`).
         //
-        // We do NOT release `activeStreamingFlowId` here. The lock is
-        // released by `onEnd` when this flow's response-end arrives,
-        // matching the lifetime of any other flow. Releasing earlier
-        // would let a concurrent real-turn flow promote during the
-        // sidecar's tail and produce two competing 'active'
-        // attributions for the same wall-clock window.
+        // Every demotion below ALSO releases the flow's streaming claim
+        // (`releaseStreamingFlow`). This inverts the previous rule, which
+        // deliberately held the lock until response-end to stop a real
+        // turn promoting during a sidecar's tail. That reasoning only
+        // held while exactly one flow could be active: it traded a
+        // theoretical double-attribution for a real, reproducible
+        // outage — a Haiku title-gen call overlapping the user's next
+        // prompt kept the lock and turned that entire turn into a
+        // `flow_ignored`. Parallel flows make double-attribution a
+        // non-issue (turns are keyed by message id), so an excluded flow
+        // has no reason to keep holding anything.
         // Prompt-suggestion routing. The fork reuses the parent's cache
         // params (same model/tools/system/max_tokens), so isSidecarFlow
         // can't see it — the only tell is requestShape.isPromptSuggestion,
@@ -1106,6 +1356,7 @@ export class ClaudeProxyAdapter {
         if (isActive && state.requestShape?.isSubagent === true) {
           this.publishPhase(state, 'idle')
           state.attribution = 'secondary'
+          this.releaseStreamingFlow(state.flowId)
           this.channel.publishFlowIgnored({
             flowId: state.flowId,
             reason: 'subagent',
@@ -1119,6 +1370,7 @@ export class ClaudeProxyAdapter {
           state.isPromptSuggestionFlow = true
           this.publishPhase(state, 'idle')
           state.attribution = 'secondary'
+          this.releaseStreamingFlow(state.flowId)
           this.channel.publishFlowIgnored({
             flowId: state.flowId,
             reason: 'prompt_suggestion',
@@ -1141,6 +1393,7 @@ export class ClaudeProxyAdapter {
           // first-chunk a few ms ago.
           this.publishPhase(state, 'idle')
           state.attribution = 'secondary'
+          this.releaseStreamingFlow(state.flowId)
           this.channel.publishFlowIgnored({
             flowId: state.flowId,
             reason: this.describeSidecarReason(state, ev.model),
@@ -1245,6 +1498,10 @@ export class ClaudeProxyAdapter {
               kind: 'other',
               index: ev.index,
               rawType: ev.block.type,
+              // `redacted_thinking` ships its whole payload on the start
+              // frame (no deltas follow), so this is the only chance to
+              // capture it for the complete-message aggregate.
+              data: typeof ev.block.data === 'string' ? ev.block.data : undefined,
             })
             break
         }
@@ -1489,6 +1746,13 @@ export class ClaudeProxyAdapter {
           return
         }
 
+        // Retain the settled block for the message_stop aggregate. Done
+        // BEFORE the publish switch so an early return added to a branch
+        // later can't silently start losing blocks — the aggregate is the
+        // only record of the message once the map entry is deleted below.
+        const settled = toCompletedBlock(block)
+        if (settled) state.settledBlocks.push(settled)
+
         switch (block.kind) {
           case 'text':
           case 'connector_text':
@@ -1575,6 +1839,10 @@ export class ClaudeProxyAdapter {
 
       case 'message_delta': {
         if (ev.usage) state.usage = mergeUsage(state.usage, ev.usage)
+        // Recorded before the isActive gate: this is per-flow
+        // bookkeeping, and `message_stop` (one frame later) reads it for
+        // the complete-message aggregate.
+        state.stopReason = normaliseStopReason(ev.stopReason)
         if (!isActive || !state.turnId) return
 
         // Usage published before stop_reason so a consumer that treats
@@ -1587,7 +1855,7 @@ export class ClaudeProxyAdapter {
           confidence,
         })
 
-        const stopReason = normaliseStopReason(ev.stopReason)
+        const stopReason = state.stopReason
         const synthetic = syntheticErrorForStopReason(stopReason)
         this.channel.publishTurnStopped({
           turnId: state.turnId,
@@ -1648,8 +1916,41 @@ export class ClaudeProxyAdapter {
           }
           return
         }
-        // Terminal marker. We've already fired `turn_stopped` on
-        // `message_delta`; nothing to do here.
+
+        // Complete-message aggregate. This is the ONLY event that can
+        // answer "what did the assistant actually produce this message"
+        // — `turn_completed.fullText` is text-only, so a tool-only turn
+        // reads as an empty message and block order is gone.
+        //
+        // WHY here and not at `message_delta` (where turn_stopped /
+        // turn_completed fire): `message_stop` is the frame that says the
+        // message is over. A `message_delta` can precede trailing
+        // content_block frames in principle, and publishing an aggregate
+        // that is missing the tail would be worse than not publishing
+        // one. This also puts the event strictly after the turn-level
+        // pair, which is the ordering the event spec documents.
+        //
+        // WHY the isActive gate: excluded flows (sidecar, subagent) reach
+        // this line as 'secondary' and must stay out of the conversation.
+        // The suggestion fork returns above for the same reason.
+        if (isActive && state.turnId) {
+          this.channel.publishMessageCompleted({
+            turnId: state.turnId,
+            role: 'assistant',
+            model: state.model ?? undefined,
+            stopReason: state.stopReason ?? undefined,
+            blocks: assembleMessageBlocks(state),
+            usage: coerceUsageForPublish(state.usage),
+            source,
+            confidence,
+          })
+        }
+        // Free the retained blocks now that the aggregate has shipped.
+        // A flow is one HTTP response is one message, so nothing after
+        // this frame can need them, and `onEnd` may be a long way off
+        // for a stream the proxy never sees close.
+        state.settledBlocks = []
+        state.blocks.clear()
         return
 
       case 'other':
@@ -2007,9 +2308,23 @@ export class ClaudeProxyAdapter {
   }
 
   /** Emit a stream-phase event on behalf of this flow, but ONLY if the
-   *  flow is the active producer. Secondary flows must stay silent so
-   *  a concurrent warmup or retry can't flip the renderer's phase
-   *  mid-turn. Channel-level dedupe (see `SemanticChannel.publishStreamPhase`)
+   *  flow both is an active producer AND holds phase ownership.
+   *
+   *  Two gates, two different jobs. `attribution !== 'active'` keeps
+   *  excluded flows (warmups, sidecars, subagents, suggestion forks)
+   *  from flipping the renderer's phase mid-turn. The ownership gate
+   *  keeps two legitimately-concurrent real flows from flapping the
+   *  single spinner between their block boundaries — see
+   *  `phaseOwnerFlowId`. Everything else the adapter publishes is
+   *  turn-keyed and composes fine in parallel; the phase is the one
+   *  genuinely singleton signal.
+   *
+   *  The one deliberate exception is the demotion path, which calls this
+   *  with 'idle' while attribution is still 'active' to clear the
+   *  spinner it emitted a few ms earlier — hence "clear BEFORE flipping"
+   *  at each demotion site.
+   *
+   *  Channel-level dedupe (see `SemanticChannel.publishStreamPhase`)
    *  swallows no-op transitions, so we don't bother guarding here. */
   private publishPhase(
     state: FlowState,
@@ -2017,6 +2332,7 @@ export class ClaudeProxyAdapter {
     extras: { toolName?: string; toolUseId?: string } = {},
   ): void {
     if (state.attribution !== 'active') return
+    if (this.phaseOwnerFlowId !== state.flowId) return
     this.channel.publishStreamPhase({
       turnId: state.turnId,
       phase,
@@ -2031,6 +2347,88 @@ export class ClaudeProxyAdapter {
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
+
+/** Project one settled `BlockState` onto the complete-message block
+ *  union, or null when the block has no representation there.
+ *
+ *  The mapping is deliberately lossy and the losses are listed on
+ *  `CompletedBlock` in channels/types.ts — read that first. The rules
+ *  worth restating at the call site:
+ *
+ *    * `connector_text` collapses into `text` because it IS assistant
+ *      prose; omitting it would put us right back to "the aggregate
+ *      cannot reconstruct the message".
+ *    * `server_tool_use` / `mcp_tool_use` collapse into `tool_use`; the
+ *      sub-kind survives in the tool name and on `block_completed`.
+ *    * `redacted_thinking` arrives as an 'other' block (it carries no
+ *      deltas), so it is recognised by `rawType` rather than by kind.
+ *    * Every other 'other' block (`image`, `document`, future variants)
+ *      returns null. Those are request-side / committed-channel shapes
+ *      that never appear in an assistant stream response; inventing a
+ *      representation for them here would be speculative.
+ *
+ *  Absent-vs-empty matters for `signature`: we omit the key entirely
+ *  when upstream never sent a `signature_delta`, so "no signature" and
+ *  "empty signature" stay distinguishable by a consumer. */
+function toCompletedBlock(block: BlockState): CompletedBlock | null {
+  switch (block.kind) {
+    case 'text':
+    case 'connector_text':
+      return { kind: 'text', text: block.text, index: block.index }
+    case 'thinking':
+      return {
+        kind: 'thinking',
+        text: block.thinking,
+        ...(block.signature ? { signature: block.signature } : {}),
+        index: block.index,
+      }
+    case 'tool_use':
+    case 'server_tool_use':
+    case 'mcp_tool_use': {
+      // Same parse the `tool_input_finalized` publisher performs. Re-run
+      // rather than threaded through so this function stays callable from
+      // any settle path; the input is a short JSON string and the parse is
+      // not on a hot loop.
+      const { parsed } = tryParseJson(block.inputJson)
+      return {
+        kind: 'tool_use',
+        toolName: block.toolName,
+        toolInput: parsed,
+        index: block.index,
+      }
+    }
+    case 'other':
+      if (block.rawType === 'redacted_thinking') {
+        return { kind: 'redacted_thinking', data: block.data ?? '', index: block.index }
+      }
+      return null
+  }
+}
+
+/** Build the ordered block list for the complete-message aggregate.
+ *
+ *  Ordering: stable sort by upstream `index`. On the real wire the
+ *  settled list is ALREADY in index order (indexes arrive contiguously,
+ *  one `content_block_stop` per `content_block_start`), so the sort is a
+ *  no-op there — it exists so a stream that reconnects and replays out of
+ *  order still assembles correctly. Stability is the load-bearing part:
+ *  when a severed-and-resumed stream produces two blocks at the SAME
+ *  index, arrival order is the only thing that says which half of the
+ *  text came first, and V8's sort preserves it.
+ *
+ *  Blocks still open at `message_stop` (a start with no stop — a protocol
+ *  violation upstream) are appended from the live map rather than
+ *  dropped: half a thinking block is more useful to a reader than a
+ *  silently missing one. They sort into place by index like everything
+ *  else. */
+function assembleMessageBlocks(state: FlowState): CompletedBlock[] {
+  const blocks = [...state.settledBlocks]
+  for (const open of state.blocks.values()) {
+    const completed = toCompletedBlock(open)
+    if (completed) blocks.push(completed)
+  }
+  return blocks.sort((a, b) => a.index - b.index)
+}
 
 function classifyBlockKind(raw: string): SemanticBlockKind {
   switch (raw) {

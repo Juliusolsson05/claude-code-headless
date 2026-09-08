@@ -209,6 +209,7 @@ channel continues to fire for terminal mirroring and overlays.
 | `onDiagnostic` | `(message: string) => void` | no-op | Sink for free-form adapter decision logs. |
 | `getSessionModel` | `() => string \| null \| undefined` | unset | Returns the user-selected primary model (e.g. `'claude-opus-4-7'`). Used to identify and suppress auxiliary Haiku "sidecar" calls. When omitted, sidecar filtering is inert. |
 | `sidecarModelPattern` | `RegExp \| null` | `/haiku/i` | Pattern identifying a sidecar model. Pass `null` to disable sidecar filtering even when `getSessionModel` is provided. |
+| `allowedHosts` | `string[]` | `DEFAULT_ALLOWED_HOSTS` | Hosts whose `/v1/messages` flows count as this session's conversation, as `allow_hosts` regex fragments. Must match what `createProxyServer` was given. Ignored when `attributionPolicy` is supplied. |
 
 ### 3.2 Public fields
 
@@ -539,13 +540,22 @@ channel's job.
 
 The channel is a **strict transport, not a healer**:
 
-- `startTurn` while a different turn is active → **dropped**, emits
-  `lifecycle_violation` (`kind: 'start_while_active'`). Same-turn
-  re-entry is an idempotent no-op.
-- `applyDelta` for a turnId that is not the active turn → **dropped**,
-  emits `lifecycle_violation` (`kind: 'delta_mismatched_turn'`).
-- `finishTurn` for a mismatched turnId → **dropped**, emits
+- `startTurn` while a turn from a **different source** is open →
+  **dropped**, emits `lifecycle_violation` (`kind:
+  'start_while_active'`). Same-turn re-entry is an idempotent no-op.
+- `startTurn` while a turn from the **same source** is open → allowed;
+  the turns run in parallel. One source multiplexing is not two sources
+  disagreeing, and Claude Code genuinely overlaps `/v1/messages` flows.
+  Under the old blanket rule the second flow lost its `turn_started`,
+  every delta and its completion — a whole assistant message dropped to
+  protect an invariant aimed at something else.
+- `applyDelta` for a turnId that is not open → **dropped**, emits
+  `lifecycle_violation` (`kind: 'delta_mismatched_turn'`).
+- `finishTurn` for a turnId that is not open → **dropped**, emits
   `lifecycle_violation` (`kind: 'finish_mismatched_turn'`).
+- `publishMessageCompleted` is deliberately lifecycle-free: it fires at
+  `message_stop`, i.e. after `finishTurn` has already closed the turn,
+  and it mutates no channel state.
 
 Producer coherence is enforced by the orchestrator's ownership model
 (§3.5), not by the channel.
@@ -554,9 +564,9 @@ Producer coherence is enforced by the orchestrator's ownership model
 
 | Method | Returns | Description |
 | --- | --- | --- |
-| `getActiveTurnId()` | `string \| null` | Currently active turnId on the wire. |
+| `getActiveTurnId()` | `string \| null` | The **oldest** open turn (identical to "the active turn" in the single-turn case). |
 | `getLastSource()` | `SemanticSource \| null` | Source of the most recent delta. |
-| `getLastFullText()` | `string` | Last known full text for the active turn. |
+| `getLastFullText()` | `string` | Last known full text for the oldest open turn. |
 | `getLastPhase()` | `StreamPhase` | Last published stream phase. |
 
 #### Publish methods
@@ -567,7 +577,8 @@ orchestrator's screen fallback) call: `startTurn`, `applyDelta`,
 `publishThinkingDelta`, `publishSignature`,
 `publishConnectorTextDelta`, `publishCitationsDelta`,
 `publishToolInputDelta`, `publishToolInputFinalized`,
-`publishBlockCompleted`, `publishToolResult`, `publishTurnStopped`,
+`publishBlockCompleted`, `publishMessageCompleted`,
+`publishToolResult`, `publishTurnStopped`,
 `publishUsageUpdated`, `publishStreamError`, `publishApiError`,
 `publishFlowSelected`, `publishFlowIgnored`, `publishStreamPhase`.
 Each takes a `params` object whose fields mirror the corresponding
@@ -716,6 +727,28 @@ Block events carry `SemanticBlockRef` fields `turnId: string` and
 | `signature?` | `string` | For `thinking`. |
 | `toolName?`, `toolUseId?`, `inputJson?`, `parsed?` | | For tool_use kinds. |
 | `raw?` | `Record<string, unknown>` | Full upstream block for `other`. |
+
+**`message_completed`** → `SemanticMessageCompletedEvent`
+
+One settled assistant message, emitted at `message_stop` alongside (never
+instead of) `turn_completed`. This is the event to fold when you need
+"what did the assistant produce" — `turn_completed.fullText` is text-only,
+so tool-only turns look empty and block order is lost. See EVENT_SPEC.md
+§10 for the mapping rules and exclusions.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `type` | `'message_completed'` | |
+| `turnId` | `string` | Anthropic message id, same as the turn pair. |
+| `role` | `'assistant'` | |
+| `model?` | `string` | Model that served this message. |
+| `stopReason?` | same union as `turn_stopped.stopReason` | |
+| `blocks` | `CompletedBlock[]` | Every representable block, in index order. |
+| `usage?` | same shape as `usage_updated.usage` | Merged usage at `message_stop`. |
+
+`CompletedBlock` is `{ kind: 'text', text, index }` \| `{ kind:
+'thinking', text, signature?, index }` \| `{ kind: 'redacted_thinking',
+data, index }` \| `{ kind: 'tool_use', toolName, toolInput, index }`.
 
 ##### Cross-turn linkage
 
@@ -1212,6 +1245,11 @@ You can also instantiate it directly.
 | `getSessionModel` | `() => string \| null \| undefined` | unset | The session's primary model. Enables sidecar (Haiku) filtering. |
 | `sidecarModelPattern` | `RegExp \| null` | `/haiku/i` | Sidecar model pattern. `null` disables filtering even with `getSessionModel`. |
 
+`createDefaultAttributionPolicy({ allowedHosts })` builds the default
+policy over a custom host list; with no argument it uses
+`DEFAULT_ALLOWED_HOSTS`. Patterns are matched against both the bare host
+and the `host:port` authority, so `^localhost:4010$` works.
+
 #### Methods
 
 | Method | Signature | Description |
@@ -1321,8 +1359,9 @@ events become `{ type: 'other' }` so the stream keeps flowing.
 ### 8.4 Proxy runtime — `ProxyServer` / `createProxyServer`
 
 `src/proxy/proxyServer.ts`. The mitmproxy launcher. Spawns `mitmdump`,
-scopes MITM to `api.anthropic.com` only, runs `mitmAddon.py`, and
-surfaces captured events by polling the addon's JSONL output file.
+scopes MITM to `api.anthropic.com` by default (see `allowedHosts`), runs
+`mitmAddon.py`, and surfaces captured events by polling the addon's JSONL
+output file.
 Marked experimental — `mitmdump` is an external dependency the caller
 must have installed (via `pip` or a system package manager).
 
@@ -1334,7 +1373,8 @@ createProxyServer(
 
 A bare string is treated as `{ baseDir }`. `CreateProxyServerOptions`:
 `baseDir?`, `storageRoot?`, `runDir?`, `confDir?`, `eventsFile?`,
-`mitmDumpPath?`, `addonPath?`, `cwd?`, `sessionKey?`. With no options it
+`mitmDumpPath?`, `addonPath?`, `cwd?`, `sessionKey?`, `allowedHosts?`.
+With no options it
 writes runtime state under `os.tmpdir()/claude-code-headless/proxy/`.
 `mitmdump` discovery order: explicit `mitmDumpPath` →
 `$CLAUDE_HEADLESS_MITMDUMP` / `$CC_PROXY_TEST_MITMDUMP` →
@@ -1350,8 +1390,41 @@ not directly.
 | `stop()` | `Promise<void>` | SIGTERM the child, SIGKILL after 2 s, stop polling. |
 
 `ProxyServerInfo`: `{ workDir, confDir, mitmDumpPath, proxyPort,
-proxyUrl, addonPath, eventsFile, caCertPath }` (all strings except
-`proxyPort: number`).
+proxyUrl, addonPath, eventsFile, caCertPath, allowedHosts? }` (all
+strings except `proxyPort: number` and `allowedHosts?: string[]`).
+
+#### `allowedHosts`
+
+Which hosts get MITM'd, as mitmproxy `allow_hosts` regex fragments.
+Defaults to `DEFAULT_ALLOWED_HOSTS` (`['^api\\.anthropic\\.com(:443)?$']`),
+which is exported so callers **extend** rather than replace it — dropping
+the first-party host breaks OAuth and quota traffic that still goes to
+Anthropic.
+
+```ts
+import { createProxyServer, DEFAULT_ALLOWED_HOSTS } from 'claude-code-headless'
+
+const allowedHosts = [...DEFAULT_ALLOWED_HOSTS, String.raw`^gateway\.internal(:8443)?$`]
+const proxy = await createProxyServer({ cwd, allowedHosts })
+```
+
+The same list must be handed to the adapter
+(`ClaudeCodeHeadlessOptions.proxy.allowedHosts`). The two gates fail
+differently and both fail silently: a host missing from the *proxy's*
+list is tunneled and never captured; a host missing from the *adapter's*
+list is captured and then classified `'ignore'`. Either way the session
+streams nothing and reports no error — which is exactly what a
+`ANTHROPIC_BASE_URL` user pointed at LiteLLM or OpenRouter used to get.
+
+Internally the list reaches three places from this one value: the
+`mitmdump --set allow_hosts=` argv (built by the exported pure
+`buildMitmdumpArgs`), the addon's own per-request gates via the
+`PROXY_ALLOWED_HOSTS` env var, and — when you pass it on — the adapter's
+attribution policy.
+
+A loopback provider (a shim on `127.0.0.1`) is **not** observable by
+adding it here alone: `spawnClaudeWithProxy` sets a loopback-only
+`NO_PROXY`, so that traffic bypasses the proxy entirely.
 
 `ProxyServerEvents`:
 
@@ -1380,9 +1453,25 @@ to route HTTPS through the proxy and trust its CA. `SpawnClaudeWithProxyOptions`
 | `cols` | `number` | `120` | |
 | `rows` | `number` | `40` | |
 | `binary` | `string` | `'claude'` | The CLI binary. |
+| `args` | `string[]` | `[]` | CLI flags appended verbatim after the binary (e.g. `['--permission-mode', 'acceptEdits', '--model', 'opus']`). |
+| `env` | `Record<string,string>` | `{}` | Environment overrides merged over the inherited env. |
 
 It sets `HTTPS_PROXY`/`HTTP_PROXY` (+ lowercase), `NODE_EXTRA_CA_CERTS`,
 and a loopback-only `NO_PROXY`.
+
+Env layering is: inherited `process.env` → presentation defaults (`TERM`,
+`COLORTERM`, `CLAUDE_CODE_ENTRYPOINT`) → your `env` → the proxy
+variables. The proxy variables go **last on purpose**: they are
+load-bearing for observation, and a consumer override (or an inherited
+shell `HTTPS_PROXY`) that pointed the child elsewhere would silently kill
+the mitm tap — the session would still work, it would just produce no
+semantic events at all.
+
+`buildSpawnPlan(options)` is the exported pure builder behind it,
+returning `{ file, args, env }` without spawning anything. It takes a
+`Partial<SpawnClaudeWithProxyOptions>` because it is a translator, not a
+validator: each field it reads contributes independently, and it never
+touches `cwd` / `cols` / `rows`, which are spawn-time concerns.
 
 It deliberately does **not** set `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` or
 `CURL_CA_BUNDLE`. Those three *replace* the process's entire root trust

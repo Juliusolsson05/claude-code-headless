@@ -220,6 +220,13 @@ export type {
   SemanticToolInputDeltaEvent,
   SemanticToolInputFinalizedEvent,
   SemanticBlockCompletedEvent,
+  // Complete-message aggregate (see EVENT_SPEC.md §10)
+  SemanticMessageCompletedEvent,
+  CompletedBlock,
+  CompletedTextBlock,
+  CompletedThinkingBlock,
+  CompletedRedactedThinkingBlock,
+  CompletedToolUseBlock,
   // Cross-turn + lifecycle
   SemanticToolResultEvent,
   SemanticTurnStoppedEvent,
@@ -260,6 +267,14 @@ export {
   ClaudeProxyAdapter,
   createDefaultAttributionPolicy,
   defaultAttributionPolicy,
+  // The shared host allowlist. Exported because a consumer configuring a
+  // custom provider needs to EXTEND the first-party default rather than
+  // replace it (dropping api.anthropic.com breaks OAuth/quota flows that
+  // still go first-party), and hand the same list to BOTH
+  // `createProxyServer({ allowedHosts })` and the headless proxy options.
+  DEFAULT_ALLOWED_HOSTS,
+  headerMarksSubagent,
+  headersMarkSubagent,
   type ClaudeProxyAdapterOptions,
   type ProxyTransportEvent,
   type AttributionContext,
@@ -279,13 +294,16 @@ export {
 export {
   ProxyServer,
   createProxyServer,
+  buildMitmdumpArgs,
   type ProxyServerInfo,
   type ProxyServerEvents,
   type ProxyCapturedEvent,
 } from './proxy/proxyServer.js'
 export {
   spawnClaudeWithProxy,
+  buildSpawnPlan,
   type SpawnClaudeWithProxyOptions,
+  type ClaudeSpawnPlan,
 } from './proxy/spawnClaudeWithProxy.js'
 
 export {

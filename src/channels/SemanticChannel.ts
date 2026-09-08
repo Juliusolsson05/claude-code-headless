@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events'
 
 import type {
+  CompletedBlock,
   SemanticApiErrorEvent,
   SemanticBlockCompletedEvent,
   SemanticBlockKind,
@@ -12,6 +13,7 @@ import type {
   SemanticFlowIgnoredEvent,
   SemanticFlowSelectedEvent,
   SemanticLifecycleViolationEvent,
+  SemanticMessageCompletedEvent,
   SemanticProviderSessionObservedEvent,
   SemanticPromptSuggestionEvent,
   SemanticSignatureEvent,
@@ -116,6 +118,11 @@ export type SemanticChannelEvents = {
   tool_input_delta: [SemanticToolInputDeltaEvent]
   tool_input_finalized: [SemanticToolInputFinalizedEvent]
   block_completed: [SemanticBlockCompletedEvent]
+  /** One complete assistant message, emitted once at `message_stop`
+   *  alongside (never instead of) `turn_completed`. See
+   *  SemanticMessageCompletedEvent for why the turn-level aggregate
+   *  could not answer "what did the assistant actually produce". */
+  message_completed: [SemanticMessageCompletedEvent]
 
   // Cross-turn linkage
   tool_result: [SemanticToolResultEvent]
@@ -167,25 +174,66 @@ export interface SemanticChannel {
   ): boolean
 }
 
-export class SemanticChannel extends EventEmitter {
-  private activeTurnId: string | null = null
-  private activeRole: 'user' | 'assistant' | null = null
-  private lastSource: SemanticSource | null = null
-  private lastFullText = ''
+/** Bookkeeping for one open turn. Fields mirror what the single-turn
+ *  implementation kept in instance fields; they moved into a per-turn
+ *  record when parallel turns became legal (see `startTurn`). */
+type OpenTurn = {
+  turnId: string
+  role: 'user' | 'assistant'
+  /** Source that most recently published for THIS turn. Drives
+   *  `source_changed`, which is a per-turn statement ("proxy took over
+   *  from screen for turn X"), not a channel-wide one. */
+  source: SemanticSource
+  /** Running text for THIS turn — the delta-dedupe comparand and the
+   *  `finishTurn` fallback when the caller passes no `fullText`. */
+  fullText: string
+}
 
+export class SemanticChannel extends EventEmitter {
+  // -------------------------------------------------------------------
+  // Open-turn registry.
+  //
+  // WHY a Map instead of the previous single `activeTurnId` field:
+  //
+  // The single slot made the channel structurally unable to carry two
+  // concurrent assistant messages, and Claude Code genuinely produces
+  // them — a fast turn whose `response-end` races the next request leaves
+  // two `/v1/messages` flows overlapping on the wire. Under the old rule
+  // the second flow's `startTurn` was dropped as a `start_while_active`
+  // violation, and with it every delta and the whole completion: an
+  // entire assistant message vanished from the channel with only a
+  // diagnostic to show for it. Silently losing real model output is a
+  // worse failure than the ownership confusion the strict rule was
+  // written to prevent.
+  //
+  // Insertion order is load-bearing: `getActiveTurnId()` /
+  // `getLastFullText()` report the OLDEST open turn so that single-turn
+  // callers (every existing consumer) observe byte-identical behaviour.
+  // -------------------------------------------------------------------
+  private readonly openTurns = new Map<string, OpenTurn>()
+  private lastSource: SemanticSource | null = null
+
+  /** The oldest still-open turn, or null when nothing is live.
+   *
+   *  "Oldest" rather than "newest" because the overwhelmingly common
+   *  case is exactly one open turn, where the two are identical, and the
+   *  overlap case is a tail race — the older turn is the one a caller
+   *  asking "what is live right now?" has already been rendering. */
   getActiveTurnId(): string | null {
-    return this.activeTurnId
+    for (const turnId of this.openTurns.keys()) return turnId
+    return null
   }
 
   getLastSource(): SemanticSource | null {
     return this.lastSource
   }
 
-  /** Last known text for the active turn. Handy for late subscribers
-   *  or for building a screen/proxy reconciler that needs to know
-   *  what's already been published. */
+  /** Last known text for the oldest open turn (see `getActiveTurnId`).
+   *  Handy for late subscribers or for building a screen/proxy
+   *  reconciler that needs to know what's already been published. */
   getLastFullText(): string {
-    return this.lastFullText
+    for (const turn of this.openTurns.values()) return turn.fullText
+    return ''
   }
 
   /**
@@ -198,16 +246,29 @@ export class SemanticChannel extends EventEmitter {
    *     duplicate `message_start` on SSE reconnect) must see
    *     unchanged state.
    *
-   *   * Attempting to open a turn while a DIFFERENT turn is already
-   *     active is a protocol violation. We DROP the new start and
-   *     emit a `lifecycle_violation` event so dashboards can see it.
-   *     The previous auto-seal behaviour was removed because it hid
-   *     cross-source ownership bugs (see the Codex semantic flicker
-   *     plan, 2026-04-17-codex-semantic-flicker-fix.md).
+   *   * A start from a DIFFERENT source than an already-open turn is
+   *     still a protocol violation: DROP it and emit
+   *     `lifecycle_violation`. This is the case the strict rule was
+   *     actually written for (screen and proxy fighting over the live
+   *     slot — see 2026-04-17-codex-semantic-flicker-fix.md), and the
+   *     orchestrator's LiveOwner model is what resolves it.
    *
-   * Callers who legitimately need to replace the active turn must
-   * call `finishTurn(activeTurnId, …)` first — the orchestrator's
-   * ownership helpers do this as part of `transitionLiveOwner`.
+   *   * A start from the SAME source as the open turns is ALLOWED and
+   *     opens a parallel turn. WHY this was relaxed: one source
+   *     multiplexing is not two sources disagreeing. The proxy adapter
+   *     legitimately observes two overlapping `/v1/messages` flows when
+   *     a fast turn's `response-end` races the next request, and under
+   *     the old blanket rule the second flow lost its `turn_started`,
+   *     every delta, and its completion — a whole assistant message
+   *     dropped on the floor to protect an invariant that was aimed at
+   *     something else. Attribution (which flows are even eligible) is
+   *     the producer's job; the adapter's sidecar / subagent /
+   *     suggestion filters already keep non-conversation traffic off
+   *     this channel.
+   *
+   * Callers who legitimately need to REPLACE a turn (rather than run
+   * beside it) must still `finishTurn(turnId, …)` first — the
+   * orchestrator's ownership helpers do this in `transitionLiveOwner`.
    */
   startTurn(params: {
     turnId: string
@@ -222,14 +283,21 @@ export class SemanticChannel extends EventEmitter {
      *  full rationale. */
     isCompactionSynthesis?: boolean
   }): void {
-    if (this.activeTurnId === params.turnId) return
+    if (this.openTurns.has(params.turnId)) return
 
-    if (this.activeTurnId) {
+    // Cross-source start = the violation this guard was written for.
+    // We only need to look at ONE open turn to decide: turns from
+    // different sources can never coexist here precisely because of
+    // this check, so every open turn shares a source.
+    const foreign = [...this.openTurns.values()].find(
+      turn => turn.source !== params.source,
+    )
+    if (foreign) {
       const violation: SemanticLifecycleViolationEvent = {
         type: 'lifecycle_violation',
         kind: 'start_while_active',
         attemptedTurnId: params.turnId,
-        activeTurnId: this.activeTurnId,
+        activeTurnId: foreign.turnId,
         source: params.source,
         ts: Date.now(),
       }
@@ -237,10 +305,13 @@ export class SemanticChannel extends EventEmitter {
       return
     }
 
-    this.activeTurnId = params.turnId
-    this.activeRole = params.role
+    this.openTurns.set(params.turnId, {
+      turnId: params.turnId,
+      role: params.role,
+      source: params.source,
+      fullText: '',
+    })
     this.lastSource = params.source
-    this.lastFullText = ''
 
     const ev: SemanticTurnStartedEvent = {
       type: 'turn_started',
@@ -293,12 +364,13 @@ export class SemanticChannel extends EventEmitter {
     source: SemanticSource
     confidence?: SemanticTurnDeltaEvent['confidence']
   }): void {
-    if (this.activeTurnId !== params.turnId) {
+    const turn = this.openTurns.get(params.turnId)
+    if (!turn) {
       const violation: SemanticLifecycleViolationEvent = {
         type: 'lifecycle_violation',
         kind: 'delta_mismatched_turn',
         attemptedTurnId: params.turnId,
-        activeTurnId: this.activeTurnId,
+        activeTurnId: this.getActiveTurnId(),
         source: params.source,
         ts: Date.now(),
       }
@@ -306,18 +378,18 @@ export class SemanticChannel extends EventEmitter {
       return
     }
 
-    if (this.lastFullText === params.fullText && !params.textDelta) {
+    if (turn.fullText === params.fullText && !params.textDelta) {
       return
     }
 
-    if (
-      this.lastSource !== null &&
-      this.lastSource !== params.source
-    ) {
+    // Per-turn, not channel-wide: with parallel turns legal, comparing
+    // against a global "last source" would fire a bogus `source_changed`
+    // every time two turns from different sources interleaved deltas.
+    if (turn.source !== params.source) {
       const ev: SemanticSourceChangedEvent = {
         type: 'source_changed',
         turnId: params.turnId,
-        previousSource: this.lastSource,
+        previousSource: turn.source,
         source: params.source,
         confidence: params.confidence ?? 'high',
         ts: Date.now(),
@@ -326,8 +398,9 @@ export class SemanticChannel extends EventEmitter {
       this.emit('event', ev)
     }
 
+    turn.source = params.source
+    turn.fullText = params.fullText
     this.lastSource = params.source
-    this.lastFullText = params.fullText
 
     const ev: SemanticTurnDeltaEvent = {
       type: 'turn_delta',
@@ -359,12 +432,13 @@ export class SemanticChannel extends EventEmitter {
     source: SemanticSource
     confidence?: SemanticTurnCompletedEvent['confidence']
   }): void {
-    if (this.activeTurnId !== params.turnId) {
+    const turn = this.openTurns.get(params.turnId)
+    if (!turn) {
       const violation: SemanticLifecycleViolationEvent = {
         type: 'lifecycle_violation',
         kind: 'finish_mismatched_turn',
         attemptedTurnId: params.turnId,
-        activeTurnId: this.activeTurnId,
+        activeTurnId: this.getActiveTurnId(),
         source: params.source,
         ts: Date.now(),
       }
@@ -375,7 +449,7 @@ export class SemanticChannel extends EventEmitter {
     const ev: SemanticTurnCompletedEvent = {
       type: 'turn_completed',
       turnId: params.turnId,
-      fullText: params.fullText ?? (this.lastFullText || undefined),
+      fullText: params.fullText ?? (turn.fullText || undefined),
       source: params.source,
       confidence: params.confidence ?? (params.source === 'screen' ? 'fallback' : 'high'),
       ts: Date.now(),
@@ -383,10 +457,12 @@ export class SemanticChannel extends EventEmitter {
     this.emit('turn_completed', ev)
     this.emit('event', ev)
 
-    this.activeTurnId = null
-    this.activeRole = null
-    this.lastSource = null
-    this.lastFullText = ''
+    this.openTurns.delete(params.turnId)
+    // `lastSource` describes "who is producing on this channel", so it
+    // only clears when nothing is left producing. Clearing it while a
+    // parallel turn is still streaming would make the next delta on that
+    // turn look like a source change.
+    if (this.openTurns.size === 0) this.lastSource = null
   }
 
   // ---------------------------------------------------------------------
@@ -404,6 +480,10 @@ export class SemanticChannel extends EventEmitter {
   // helpers: proxy/jsonl → 'high', screen → 'fallback'. Caller can
   // override when they know better (e.g. proxy with an unselected
   // flow would be 'medium').
+  //
+  // `publishMessageCompleted` lives down here for the same reason even
+  // though it is turn-shaped: it is a settled aggregate, not a mutation
+  // of live turn state.
   // ---------------------------------------------------------------------
 
   private defaultConfidence(source: SemanticSource): SemanticConfidence {
@@ -627,6 +707,52 @@ export class SemanticChannel extends EventEmitter {
       ts: Date.now(),
     }
     this.emit('block_completed', ev)
+    this.emit('event', ev)
+  }
+
+  /**
+   * Publish the settled content of one complete assistant message.
+   *
+   * WHY this does NOT require an active turn (the one publisher on this
+   * class that is deliberately lifecycle-free):
+   *
+   * The upstream frame order is `message_delta` → `message_stop`, and the
+   * adapter's `message_delta` handler already calls `finishTurn`. By the
+   * time `message_stop` arrives the turn is CLOSED by construction, so any
+   * "must match the active turn" gate would reject every single normal
+   * message and the event would be dead on arrival. The gate would also be
+   * pointless: this event mutates no channel state and can be folded by a
+   * consumer in isolation — it is a report about a message that is already
+   * over, not a claim on the live slot. The lifecycle rules exist to stop
+   * producers from fighting over `activeTurnId`; there is nothing here to
+   * fight over.
+   *
+   * Emitting a `lifecycle_violation` instead of the event would therefore
+   * turn a complete-message report into a diagnostic nobody asked for.
+   */
+  publishMessageCompleted(params: {
+    turnId: string
+    role: 'assistant'
+    model?: string
+    stopReason?: SemanticMessageCompletedEvent['stopReason']
+    blocks: CompletedBlock[]
+    usage?: SemanticUsageEvent['usage']
+    source: SemanticSource
+    confidence?: SemanticConfidence
+  }): void {
+    const ev: SemanticMessageCompletedEvent = {
+      type: 'message_completed',
+      turnId: params.turnId,
+      role: params.role,
+      model: params.model,
+      stopReason: params.stopReason,
+      blocks: params.blocks,
+      usage: params.usage,
+      source: params.source,
+      confidence: params.confidence ?? this.defaultConfidence(params.source),
+      ts: Date.now(),
+    }
+    this.emit('message_completed', ev)
     this.emit('event', ev)
   }
 

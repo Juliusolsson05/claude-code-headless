@@ -68,6 +68,7 @@ import type {
 } from './channels/types.js'
 import {
   ClaudeProxyAdapter,
+  createDefaultAttributionPolicy,
   type AttributionPolicy,
   type ProxyTransportEvent,
 } from './proxy/ClaudeProxyAdapter.js'
@@ -144,6 +145,22 @@ export type ClaudeCodeHeadlessOptions = {
      *  `null` to disable sidecar filtering even when
      *  `getSessionModel` is provided. */
     sidecarModelPattern?: RegExp | null
+    /** Hosts whose `/v1/messages` flows count as this session's
+     *  conversation, as mitmproxy `allow_hosts` regex fragments.
+     *  Defaults to first-party Anthropic only.
+     *
+     *  MUST match what the proxy runtime was given
+     *  (`createProxyServer({ allowedHosts })`). The two gates fail
+     *  differently and both fail silently: a host missing from the
+     *  PROXY's list is tunneled and never captured; a host missing
+     *  from THIS list is captured and then classified `'ignore'` by
+     *  the attribution policy. Either way the session streams nothing
+     *  and reports no error, which is why the value is threaded rather
+     *  than guessed.
+     *
+     *  Ignored when `attributionPolicy` is supplied — a caller who
+     *  brought their own policy owns host matching entirely. */
+    allowedHosts?: string[]
   }
 }
 
@@ -471,7 +488,13 @@ export class ClaudeCodeHeadless extends EventEmitter {
     this.proxy = options.proxy
       ? new ClaudeProxyAdapter({
           channel: this.semantic,
-          attributionPolicy: options.proxy.attributionPolicy,
+          // An explicit policy wins outright; otherwise build the
+          // default one over the caller's host list so a custom
+          // provider endpoint is classified as a real turn instead of
+          // being dropped as "not anthropic.com".
+          attributionPolicy:
+            options.proxy.attributionPolicy ??
+            createDefaultAttributionPolicy({ allowedHosts: options.proxy.allowedHosts }),
           onDiagnostic: options.proxy.onDiagnostic,
           // Pass-throughs for sidecar Haiku filtering. The adapter
           // owns the decision logic; this class is just plumbing the

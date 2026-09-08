@@ -5,8 +5,12 @@
       "label": "Claude Code",
       "pkg": "@anthropic-ai/claude-code",
       "changelog": "https://github.com/anthropics/claude-code/releases",
-      "accepted": "2.1.143",
-      "checkedAt": "2026-05-16"
+      "accepted": "2.1.263",
+      "checkedAt": "2026-09-08",
+      "notes": [
+        "2.1.263 — permission dialogs changed shape and broke detectPermissionPrompt, which had been pinned to 2.1.143's wording. Two independent breaks, both fixed in src/parsers/PermissionPromptParser.ts: (1) the reject option's label is now a bare 'No' in the Write/Edit/Bash/NotebookEdit/Sed dialogs (FilePermissionDialog/permissionOptions.tsx and BashPermissionRequest/bashToolUseOptions.tsx both push { label: 'No' }); the old 'No, and tell Claude what to do differently' survives only in the Sandbox and WebFetch dialogs, and as the placeholder of the Tab-to-amend input variant — which is not a label and is not on screen until a human presses Tab. (2) The question line is no longer always 'Do you want to proceed?': the file dialogs override it with 'Do you want to create <file>?', '…overwrite <file>?' and 'Do you want to make this edit to <file>?'. Requiring either string made the parser report visible:false on live prompts, which left the SDK blind and hung the turn. Detection is now a shape test — a 'Do you want to …?' line followed by numbered Yes-then-No option rows — rather than a substring list.",
+        "STILL OUTSTANDING at 2.1.263: PERMISSION_PROMPT_DENY_KEYS ('3\\r') assumes the reject option is row 3. That holds for the file dialogs and for a Bash prompt that got an always-allow suggestion, but a Bash prompt without suggestions renders only Yes/No and rejects at row 2. Fixing it means teaching the consumers to read the reject row's key out of PermissionPromptState.options."
+      ]
     }
   }
 }
