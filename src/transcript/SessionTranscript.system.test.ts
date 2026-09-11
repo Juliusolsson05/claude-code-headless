@@ -173,7 +173,11 @@ describe('live Claude transcript relocation', () => {
     const line = Buffer.from(user(2).replace('prompt 2', 'prompt 🌳'))
     const split = line.indexOf(Buffer.from('🌳')) + 2
     let sawRelocation = false
+    let acceptedEntry: unknown
     headless.on('jsonl-entry', entry => { if (entry.type === 'relocated') sawRelocation = true })
+    headless.on('jsonl-entry', entry => {
+      if (entry.type === 'user' && entry.uuid === 'user-2') acceptedEntry = entry
+    })
     await appendFile(original, Buffer.concat([Buffer.from(moved(worktree)), line.subarray(0, split)]))
     // Wait for the durable relocation marker: its callback proves that the
     // same read consumed the partial record into the reader's pending buffer.
@@ -182,6 +186,7 @@ describe('live Claude transcript relocation', () => {
     await appendFile(actual, line.subarray(split))
     await waitFor(() => seen.includes(2))
     expect(seen).toEqual([1, 2])
+    expect(acceptedEntry).toMatchObject({ message: { content: 'prompt 🌳' } })
   })
 
   it('refuses divergent history instead of reusing a cursor in different bytes', async () => {
