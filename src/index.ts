@@ -327,3 +327,5 @@ export {
   type AnthropicUsage,
   type ParsedContentBlockStart,
 } from './proxy/anthropicEvents.js'
+
+export { resolveClaudeTranscriptPath } from './transcript/SessionTranscript.js'

@@ -11,6 +11,7 @@ import {
 } from 'fs'
 import { mkdir, readdir } from 'fs/promises'
 import { basename, join } from 'path'
+import { StringDecoder } from 'node:string_decoder'
 
 // Node-only (chokidar + fs). Used by downstream applications that need
 // to tail CC's transcript files. NOT importable from browser contexts.
@@ -53,6 +54,9 @@ import { basename, join } from 'path'
 export class FileTailer<T> {
   private offset = 0
   private buffer = ''
+  private decoder = new StringDecoder('utf8')
+  private anchor = Buffer.alloc(0)
+  private idleWaiters: Array<() => void> = []
   private closed = false
   // Poll interval for fs.watchFile in milliseconds. 100ms gives
   // reliable pickup with imperceptible latency and negligible CPU.
@@ -72,6 +76,7 @@ export class FileTailer<T> {
   private static readonly BOOTSTRAP_TAIL_BYTES = 512 * 1024
   private reading = false
   private pendingRead = false
+  private relocating = false
   /**
    * The stat listener MUST be stored and passed to unwatchFile on close.
    * WHY: `unwatchFile(path)` with no listener removes EVERY stat-watcher
@@ -88,7 +93,7 @@ export class FileTailer<T> {
   private watchdog: ReturnType<typeof setInterval> | null = null
 
   constructor(
-    private readonly filePath: string,
+    private filePath: string,
     private readonly onEntry: (entry: T) => void,
     private readonly onError?: (err: Error) => void,
     options?: {
@@ -205,13 +210,15 @@ export class FileTailer<T> {
       // best-effort close
     }
 
-    let text = buf.toString('utf8')
+    let text = this.decoder.write(buf)
     if (start > 0) {
       const firstNewline = text.indexOf('\n')
       text = firstNewline === -1 ? '' : text.slice(firstNewline + 1)
     }
 
-    const lines = text
+    const lastNewline = text.lastIndexOf('\n')
+    this.buffer = text.slice(lastNewline + 1)
+    const lines = text.slice(0, lastNewline + 1)
       .split('\n')
       .map(line => line.trim())
       .filter(line => line.length > 0)
@@ -229,12 +236,14 @@ export class FileTailer<T> {
     // Start live tailing from EOF after the bootstrap snapshot. Any
     // later append will be picked up by the poll watcher below.
     this.offset = stat.size
-    this.buffer = ''
+    this.anchor = Buffer.from(buf.subarray(Math.max(0, buf.length - 256)))
+    // Keep any incomplete final JSONL/UTF-8 record for the first live read.
+    // Consuming EOF without this buffer loses a prompt committed during startup.
   }
 
   private readNew(): void {
     if (this.closed) return
-    if (this.reading) {
+    if (this.reading || this.relocating) {
       // A read is in flight; queue a re-run instead of starting a
       // concurrent stream. See the class block comment for why
       // concurrent reads are unsafe.
@@ -267,15 +276,18 @@ export class FileTailer<T> {
     const stream = createReadStream(this.filePath, {
       start: this.offset,
       end: stat.size - 1,
-      encoding: 'utf8',
     })
 
     let chunk = ''
+    let anchor = Buffer.from(this.anchor)
     stream.on('data', d => {
-      chunk += d
+      const bytes = typeof d === 'string' ? Buffer.from(d) : d
+      chunk += this.decoder.write(bytes)
+      anchor = Buffer.concat([anchor, bytes]).subarray(-256)
     })
     stream.on('end', () => {
       this.offset = stat.size
+      this.anchor = Buffer.from(anchor)
       this.buffer += chunk
       const lines = this.buffer.split('\n')
       // Last element is either '' (clean newline) or a partial line.
@@ -291,6 +303,7 @@ export class FileTailer<T> {
         }
       }
       this.reading = false
+      for (const resolve of this.idleWaiters.splice(0)) resolve()
       // Drain any queued re-run. This is the load-bearing bit for
       // serialization: when a write lands while we were reading the
       // previous chunk, the watcher sets pendingRead but can't do
@@ -303,12 +316,50 @@ export class FileTailer<T> {
     })
     stream.on('error', err => {
       this.reading = false
+      for (const resolve of this.idleWaiters.splice(0)) resolve()
       this.onError?.(err)
     })
   }
 
+  /**
+   * Retarget an exact-session file without resetting the consumed byte cursor.
+   * Native relocation preserves the transcript prefix, whether moved by rename
+   * or copied to a new inode. Verify bytes at the cursor before reusing it: a
+   * bootstrap replay can duplicate user prompts, while starting at EOF loses
+   * every append made between the move and our discovery tick.
+   *
+   * Identity validation belongs to SessionTranscript; this lower-level reader
+   * checks a bounded 256-byte anchor immediately before the cursor. This is a
+   * continuity check for native append-only moves, not a full-file integrity
+   * hash. A mismatch is explicit rather than guessing where rewritten history
+   * ends, and large sessions do not require rereading their consumed prefix.
+   */
+  async relocate(filePath: string): Promise<void> {
+    this.relocating = true
+    try {
+      if (this.reading) await new Promise<void>(resolve => this.idleWaiters.push(resolve))
+      if (this.closed) return
+      const fd = openSync(filePath, 'r')
+      try {
+        const actual = Buffer.alloc(this.anchor.length)
+        const bytes = readSync(fd, actual, 0, actual.length, this.offset - actual.length)
+        if (bytes !== actual.length || !actual.equals(this.anchor)) {
+          throw new Error('Claude transcript diverged during relocation; cursor cannot be reused')
+        }
+      } finally { closeSync(fd) }
+      if (this.statListener) unwatchFile(this.filePath, this.statListener)
+      this.filePath = filePath
+      if (this.statListener) watchFile(filePath, { interval: FileTailer.POLL_INTERVAL_MS, persistent: true }, this.statListener)
+    } finally {
+      this.relocating = false
+      this.pendingRead = false
+      this.readNew()
+    }
+  }
+
   async close(): Promise<void> {
     this.closed = true
+    if (this.reading) await new Promise<void>(resolve => this.idleWaiters.push(resolve))
     if (this.watchdog !== null) clearInterval(this.watchdog)
     // Scoped unwatch — see statListener's WHY. Passing the listener is
     // the entire fix; do not "simplify" back to unwatchFile(path).

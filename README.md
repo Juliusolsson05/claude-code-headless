@@ -165,3 +165,19 @@ proxy, and to report a vulnerability.
 ## License
 
 [MIT](LICENSE) © Julius Olsson
+
+## Exact sessions and worktree relocation
+
+`resolveClaudeTranscriptPath(cwd, sessionId)` resolves an exact session across
+native worktree moves. It follows Claude's `relocated` metadata and discovers
+the exact UUID in other project directories when the original file is gone.
+It returns `null` for a missing transcript and throws for ambiguous identities,
+unverified files, or invalid/unavailable relocation targets.
+
+`ClaudeCodeHeadless` uses the same resolver for `resumeSessionId` and follows
+live moves while preserving its byte cursor. A move whose bytes immediately
+before the consumed cursor no longer match is reported through `jsonl-error`;
+it is never silently replayed.
+A missing resumed file rejects `start()`. Consumers assigning a fresh CLI
+`--session-id` must pass that UUID as `resumeSessionId` with
+`allowMissingTranscript: true`, so the reader can wait for its first write.

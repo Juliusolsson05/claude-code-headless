@@ -1,6 +1,6 @@
 # Claude worktree transcript continuity
 
-Status: implementation planned.
+Status: implemented and locally verified; coordinated PR review/CI next.
 
 ## Problem and constraints
 
@@ -20,4 +20,10 @@ Package system tests own resolver/watcher behavior. App system tests own history
 
 ## Completion record
 
-Update with final design decisions, checks, limitations, linked Issues and PRs before delivery.
+Issue: https://github.com/Juliusolsson05/claude-code-headless/issues/57. Host integration: https://github.com/Juliusolsson05/agent-code/issues/883.
+
+- Exact-session discovery inspects bounded head/tail slices, follows native relocation markers (including terminal self-pointers), and rejects ambiguous or foreign identities. Missing resumes fail explicitly; an assigned fresh UUID may wait for its first write, including a move before its first observation.
+- The live follower keeps one byte cursor and pending JSONL/UTF-8 data through rename/copy moves. A 256-byte anchor before the cursor checks continuity without hashing the entire consumed history. Inode/shrink detection covers redirect stubs. Revision counters preserve relocation signals received during asynchronous discovery; bounded backoff permits late destinations to recover.
+- Regression tests were observed failing before the fixes. Final local `npm run check` passes: contract, types, 132 tests, build and installed-package smoke. `npm run test:coverage` passes the baseline.
+- Tests use real temporary filesystem operations through the public headless API and a consumer-owned fake PTY. Native provider execution/UI verification remains a separate live check. The resolver also found the real incident transcript in a read-only check; no private transcript data is committed.
+- Local verification used Node 25.5.0; package CI additionally checks supported Node 20.19 and 24. No merge is authorized.

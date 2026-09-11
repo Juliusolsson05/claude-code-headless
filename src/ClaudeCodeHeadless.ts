@@ -1,6 +1,6 @@
+import { followClaudeTranscript } from './transcript/SessionTranscript.js'
 import { EventEmitter } from 'events'
 import type { IPty } from 'node-pty'
-import { join } from 'path'
 
 import {
   HeadlessTerminal,
@@ -44,7 +44,6 @@ import {
 } from './conditions/index.js'
 import {
   tailNewSessionFile,
-  tailSessionFile,
   type JsonlEntry,
 } from './transcript/JsonlTailer.js'
 import { type Entry, isConversationEntry } from './transcript/TranscriptTypes.js'
@@ -102,6 +101,8 @@ export type ClaudeCodeHeadlessOptions = {
   /** If set, tail the existing session file instead of waiting for
    *  CC to create a new one. Used for --resume flows. */
   resumeSessionId?: string
+  /** Only for a consumer-assigned fresh UUID, whose first file may not exist yet. */
+  allowMissingTranscript?: boolean
   /** Timestamp captured by the consumer immediately before spawning
    *  the Claude PTY for a fresh session. This lets the fresh-session
    *  tailer recover if Claude creates `<sessionId>.jsonl` before the
@@ -255,6 +256,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
   private readonly terminal: HeadlessTerminal
   private readonly cwd: string
   private readonly resumeSessionId: string | null
+  private readonly allowMissingTranscript: boolean
   private readonly freshSessionStartedAtMs: number | null
   private stopJsonlTail: (() => Promise<void>) | null = null
   private lastActivity: string | null = null
@@ -465,6 +467,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
     super()
     this.cwd = options.cwd
     this.resumeSessionId = options.resumeSessionId ?? null
+    this.allowMissingTranscript = options.allowMissingTranscript === true
     this.freshSessionStartedAtMs = options.freshSessionStartedAtMs ?? null
 
     this.terminal = new HeadlessTerminal({
@@ -1218,7 +1221,7 @@ export class ClaudeCodeHeadless extends EventEmitter {
    * processing PTY data so we don't miss any transcript entries.
    */
   async start(): Promise<{ projectDir: string }> {
-    const projectDir = await getProjectDirForCwd(this.cwd)
+    let projectDir = await getProjectDirForCwd(this.cwd)
 
     // Single JSONL sink. Deduplicated here because on the fresh and
     // resume paths we want identical channel routing: the committed
@@ -1322,16 +1325,15 @@ export class ClaudeCodeHeadless extends EventEmitter {
     }
 
     if (this.resumeSessionId) {
-      const filePath = join(projectDir, `${this.resumeSessionId}.jsonl`)
-      const stop = tailSessionFile<Entry>(
-        filePath,
-        (entry) => onJsonlEntry(entry, filePath),
-        onJsonlError,
+      const follower = await followClaudeTranscript<Entry>(
+        this.cwd, this.resumeSessionId, onJsonlEntry, onJsonlError,
         {
           bootstrapTailLines: ClaudeCodeHeadless.RESUME_BOOTSTRAP_TAIL_LINES,
+          allowMissing: this.allowMissingTranscript,
         },
       )
-      this.stopJsonlTail = stop
+      projectDir = follower.projectDir
+      this.stopJsonlTail = follower.stop
     } else {
       this.stopJsonlTail = await tailNewSessionFile<Entry>(
         projectDir,
