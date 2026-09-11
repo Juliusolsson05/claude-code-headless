@@ -1,6 +1,6 @@
 # Claude worktree transcript continuity
 
-Status: implemented and locally verified; coordinated PR review/CI next.
+Status: review findings resolved and re-reviewed; final CI pending before the authorized merge.
 
 ## Problem and constraints
 
@@ -22,8 +22,14 @@ Package system tests own resolver/watcher behavior. App system tests own history
 
 Issue: https://github.com/Juliusolsson05/claude-code-headless/issues/57. Host integration: https://github.com/Juliusolsson05/agent-code/issues/883.
 
-- Exact-session discovery inspects bounded head/tail slices, follows native relocation markers (including terminal self-pointers), and rejects ambiguous or foreign identities. Missing resumes fail explicitly; an assigned fresh UUID may wait for its first write, including a move before its first observation.
+- Exact-session discovery scans backward in fixed I/O chunks, follows the newest native relocation marker (including terminal self-pointers), and rejects ambiguous or foreign current identities. Legacy fork ancestry is allowed during validated historical bootstrap. Missing resumes fail explicitly; an assigned fresh UUID may wait for its first write, including a move before its first observation.
 - The live follower keeps one byte cursor and pending JSONL/UTF-8 data through rename/copy moves. A 256-byte anchor before the cursor checks continuity without hashing the entire consumed history. Inode/shrink detection covers redirect stubs. Revision counters preserve relocation signals received during asynchronous discovery; bounded backoff permits late destinations to recover.
-- Regression tests were observed failing before the fixes. Final local `npm run check` passes: contract, types, 132 tests, build and installed-package smoke. `npm run test:coverage` passes the baseline.
+- Regression tests were observed failing before the fixes. Final local `npm run check` passes: contract, types, 138 tests, build and installed-package smoke. `npm run test:coverage` passed the baseline before the final additional large-record test; final CI repeats coverage.
 - Tests use real temporary filesystem operations through the public headless API and a consumer-owned fake PTY. Native provider execution/UI verification remains a separate live check. The resolver also found the real incident transcript in a read-only check; no private transcript data is committed.
-- Local verification used Node 25.5.0; package CI additionally checks supported Node 20.19 and 24. No merge is authorized.
+- Local verification used Node 25.5.0; package CI additionally checks supported Node 20.19 and 24.
+
+## Review resolution
+
+Reverse inspection must find the newest relocation record even when it lies in the middle of a large transcript. Reads must validate the opened inode and cursor before decoding replacement bytes. Discovery must accept legacy fork ancestors stamped with their source session while retaining current-session validation for new live entries. Add public-API filesystem regressions, rerun checks/coverage and obtain follow-up review before the authorized merge.
+
+All review reproductions now pass. Follow-up review also caught and verified the fix for generic tailers without a relocation owner: matching-prefix atomic replacements continue, divergent prefixes report an error. Both reviewing agents cleared their scopes. The app consumes the merged package commit before its own final CI and authorized merge.

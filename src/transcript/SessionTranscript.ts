@@ -1,4 +1,4 @@
-import { open, readdir, stat } from 'node:fs/promises'
+import { open, readdir, stat, type FileHandle } from 'node:fs/promises'
 import { dirname, isAbsolute, join } from 'node:path'
 import { FileTailer, type JsonlEntry } from './JsonlTailer.js'
 import { getProjectDirForCwd, getProjectsDir } from './ProjectDir.js'
@@ -10,6 +10,38 @@ import { getProjectDirForCwd, getProjectsDir } from './ProjectDir.js'
 const INSPECTION_BYTES = 256 * 1024
 const MAX_RELOCATION_HOPS = 16
 
+async function* newestLines(handle: FileHandle, size: number): AsyncGenerator<string> {
+  // Sampling two windows made an old move in the head outrank the actual last
+  // move in the omitted middle. Read backward without gaps instead. Keep fixed
+  // I/O chunks and assemble only one record, including UTF-8 split across chunks;
+  // memory scales with the largest JSONL record, not the whole session. Keeping
+  // fragments avoids repeatedly copying a multi-megabyte tool-result line.
+  let position = size
+  let fragments: Buffer[] = []
+  while (position > 0) {
+    const start = Math.max(0, position - INSPECTION_BYTES)
+    const chunk = Buffer.alloc(position - start)
+    let read = 0
+    while (read < chunk.length) {
+      const { bytesRead } = await handle.read(chunk, read, chunk.length - read, start + read)
+      if (bytesRead === 0) throw new Error('Claude transcript changed during inspection')
+      read += bytesRead
+    }
+    let end = chunk.length
+    for (let i = end - 1; i >= 0; i--) {
+      if (chunk[i] !== 10) continue
+      const prefix = chunk.subarray(i + 1, end)
+      const line = fragments.length ? Buffer.concat([prefix, ...fragments.reverse()]) : prefix
+      if (line.length) yield line.toString('utf8')
+      fragments = []
+      end = i
+    }
+    if (end > 0) fragments.push(chunk.subarray(0, end))
+    position = start
+  }
+  if (fragments.length) yield Buffer.concat(fragments.reverse()).toString('utf8')
+}
+
 async function inspect(file: string, sessionId: string): Promise<{ relocatedCwd: string | null } | null> {
   const handle = await open(file, 'r').catch((error: NodeJS.ErrnoException) => {
     if (error.code === 'ENOENT') return null
@@ -19,37 +51,39 @@ async function inspect(file: string, sessionId: string): Promise<{ relocatedCwd:
   try {
     const { size } = await handle.stat()
     if (size === 0) return null // a just-created fresh file has no identity yet
-    const head = Buffer.alloc(Math.min(size, INSPECTION_BYTES))
-    await handle.read(head, 0, head.length, 0)
-    let text = head.toString('utf8')
-    if (size > head.length) {
-      text = text.slice(0, text.lastIndexOf('\n') + 1)
-      const start = Math.max(head.length, size - INSPECTION_BYTES)
-      const tail = Buffer.alloc(size - start)
-      await handle.read(tail, 0, tail.length, start)
-      const tailText = tail.toString('utf8')
-      text += start === head.length ? tailText : tailText.slice(tailText.indexOf('\n') + 1)
-    }
-    let matched = false
+    let conversationSessionId: string | null = null
+    let metadataSessionId: string | null = null
     let relocatedCwd: string | null = null
-    for (const line of text.split('\n')) {
+    for await (const line of newestLines(handle, size)) {
+      // After finding the current conversation record, only native relocation
+      // metadata matters. JSON.stringify emits this literal discriminator;
+      // avoid parsing every old tool payload just to establish there was no move.
+      if (conversationSessionId && !line.includes('"relocated"')) continue
       let value: Record<string, unknown>
       try { value = JSON.parse(line) } catch { continue }
       if (!value || typeof value !== 'object') continue
       if (typeof value.sessionId !== 'string') continue
-      if (value.sessionId !== sessionId) {
-        throw new Error(`Claude transcript identity mismatch for ${sessionId}`)
+      metadataSessionId ??= value.sessionId
+      // Legacy native forks preserve source stamps on their ancestors. Claude
+      // itself identifies the current conversation from its latest leaf (native
+      // sessionStorage.loadFullLog), not from every historical record. Only the
+      // newest conversation record in this append-only file owns discovery;
+      // metadata is a fallback for redirect stubs with no conversation records.
+      if (!conversationSessionId && (value.type === 'user' || value.type === 'assistant')) {
+        conversationSessionId = value.sessionId
+        if (conversationSessionId !== sessionId) {
+          throw new Error(`Claude transcript identity mismatch for ${sessionId}`)
+        }
       }
-      matched = true
-      if (value.type === 'relocated' && typeof value.relocatedCwd === 'string') {
+      if (relocatedCwd === null && value.sessionId === sessionId && value.type === 'relocated' && typeof value.relocatedCwd === 'string') {
         if (!isAbsolute(value.relocatedCwd)) throw new Error('Invalid Claude transcript relocation directory')
         relocatedCwd = value.relocatedCwd
       }
+      if (conversationSessionId && relocatedCwd !== null) break
     }
-    // A matching filename alone is insufficient: copied/exported transcripts
-    // can retain another identity. Bounded inspection fails explicitly rather
-    // than selecting unreadable data or parsing every multi-megabyte tool result.
-    if (!matched) throw new Error(`Claude transcript identity is unverified for ${sessionId}`)
+    const owner = conversationSessionId ?? metadataSessionId
+    if (!owner) throw new Error(`Claude transcript identity is unverified for ${sessionId}`)
+    if (owner !== sessionId) throw new Error(`Claude transcript identity mismatch for ${sessionId}`)
     return { relocatedCwd }
   } finally { await handle.close() }
 }
@@ -130,17 +164,24 @@ export async function followClaudeTranscript<T extends JsonlEntry>(
   let lastError: string | null = null
   let timer: ReturnType<typeof setTimeout> | null = null
   let running: Promise<void> | null = null
+  let bootstrapping = true
   const tailer = new FileTailer<T>(file, entry => {
     if (closed) return
     hasObservedEntry = true
-    // Identity is checked for every live record as well as initial discovery.
-    // A foreign record must never enter a host's prompt-acceptance observer.
-    if (typeof entry.sessionId === 'string' && entry.sessionId !== sessionId) {
+    // The resolver proved the resumed file's current identity. Its synchronous
+    // historical bootstrap may include native fork ancestors with source IDs.
+    // That allowance ends before start() returns and a host can arm acceptance;
+    // fresh sessions and every new live record retain strict identity checks.
+    if ((!bootstrapping || options.allowMissing) && typeof entry.sessionId === 'string' && entry.sessionId !== sessionId) {
       onError(new Error(`Claude transcript identity mismatch for ${sessionId}`)); return
     }
     if (entry.type === 'relocated') relocationRevision += 1
     onEntry(entry, file)
-  }, onError, { bootstrapTailLines: options.bootstrapTailLines })
+  }, onError, {
+    bootstrapTailLines: options.bootstrapTailLines,
+    onDiscontinuity: () => { relocationRevision += 1 },
+  })
+  bootstrapping = false
   const check = async (): Promise<void> => {
     try {
       const currentStat = await stat(file).catch(() => null)
@@ -167,7 +208,7 @@ export async function followClaudeTranscript<T extends JsonlEntry>(
       // A move may replace its original file with a short redirect stub. The
       // byte tail cannot see a shorter file's marker, so inode/size changes also
       // trigger resolution. Merely checking existence would strand that shape.
-      if (next !== file || replaced) {
+      if (next !== file || replaced || revision !== checkedRelocationRevision) {
         await tailer.relocate(next)
         file = next
         lastFileStat = await stat(file).catch(() => null)

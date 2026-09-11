@@ -67,6 +67,46 @@ describe('exact Claude transcript identity across worktrees', () => {
     await appendFile(actual, user(2))
     expect(await resolveClaudeTranscriptPath(cwd, ID)).toBe(actual)
   })
+  it('finds the newest move even when it lies between large blocks of history', async () => {
+    const actual = await pathFor(worktree)
+    const previous = join(root, 'previous-worktree')
+    const progress = (JSON.stringify({ type: 'progress', sessionId: ID, data: { message: 'synthetic progress' } }) + '\n').repeat(3000)
+    // Both ends contain valid records, but only the middle contains the latest
+    // move. Sampling head/tail selected the older, now unavailable destination.
+    await writeFile(actual, moved(previous) + user(1) + progress + moved(worktree) + progress + user(2))
+    expect(await resolveClaudeTranscriptPath(cwd, ID)).toBe(actual)
+  })
+  it('identifies the current fork leaf when its UTF-8 record spans several inspection chunks', async () => {
+    const actual = await pathFor(worktree)
+    const leaf = { ...JSON.parse(user(2)), parentUuid: 'user-1', message: { role: 'user', content: '🌳'.repeat(300_000) } }
+    // A chunk boundary cannot turn an intact large current record into a
+    // skipped line and let a smaller foreign ancestor decide session identity.
+    await writeFile(actual, user(1, 'source-session') + moved(worktree) + JSON.stringify(leaf) + '\n')
+    expect(await resolveClaudeTranscriptPath(cwd, ID)).toBe(actual)
+  })
+  it('replays legacy fork ancestry but rejects foreign records appended live', async () => {
+    const file = await pathFor(cwd)
+    const ancestor = JSON.parse(user(1, 'source-session'))
+    const leaf = { ...JSON.parse(user(2)), parentUuid: ancestor.uuid }
+    // Native Claude's older fork writer retained source IDs on ancestors.
+    // The selected conversation leaf identifies this file; live foreign writes
+    // must still fail rather than acknowledging input to another session.
+    const inheritedMove = { type: 'relocated', sessionId: 'source-session', relocatedCwd: join(root, 'removed-source-worktree') }
+    await writeFile(file, JSON.stringify(ancestor) + '\n' + JSON.stringify(inheritedMove) + '\n' + JSON.stringify(leaf) + '\n')
+    expect(await resolveClaudeTranscriptPath(cwd, ID)).toBe(file)
+    const { headless, seen, errors } = session()
+    await headless.start()
+    expect(seen).toEqual([1, 2]); expect(errors).toEqual([])
+    await appendFile(file, user(3, 'foreign-session'))
+    await waitFor(() => errors.some(error => /identity/i.test(error)))
+    await appendFile(file, user(4))
+    await waitFor(() => seen.includes(4))
+    expect(seen).toEqual([1, 2, 4])
+  })
+  it('rejects a foreign current leaf even when earlier history and metadata match', async () => {
+    await writeFile(await pathFor(cwd), user(1) + user(2, 'foreign-session') + moved(cwd))
+    await expect(resolveClaudeTranscriptPath(cwd, ID)).rejects.toThrow(/identity/i)
+  })
   it('rejects ambiguous copies instead of choosing the newest transcript', async () => {
     await writeFile(await pathFor(worktree), user(1))
     await writeFile(await pathFor(join(root, 'other')), user(2))
@@ -152,6 +192,19 @@ describe('live Claude transcript relocation', () => {
     await appendFile(actual, user(10))
     await waitFor(() => seen.includes(10))
     expect(seen).toEqual(Array.from({ length: 11 }, (_, n) => n))
+  })
+
+  it('does not consume a replacement redirect larger than its previous cursor', async () => {
+    const destinationCwd = join(root, 'w'.repeat(100)); await mkdir(destinationCwd)
+    const original = await pathFor(cwd); const actual = await pathFor(destinationCwd)
+    expect(Buffer.byteLength(moved(destinationCwd))).toBeGreaterThan(Buffer.byteLength(user(1)))
+    await writeFile(original, user(1))
+    const { headless, seen, errors } = session(); await headless.start()
+    await rename(original, actual)
+    await writeFile(original, moved(destinationCwd))
+    await appendFile(actual, user(2))
+    await waitFor(() => seen.includes(2))
+    expect(seen).toEqual([1, 2]); expect(errors).toEqual([])
   })
 
   it('recovers when a redirect destination appears after the first failed lookup', async () => {

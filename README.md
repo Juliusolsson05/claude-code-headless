@@ -174,10 +174,19 @@ the exact UUID in other project directories when the original file is gone.
 It returns `null` for a missing transcript and throws for ambiguous identities,
 unverified files, or invalid/unavailable relocation targets.
 
+Inspection walks backward in fixed I/O chunks to find the latest move, even in
+the middle of a large transcript. It assembles at most one JSONL record at a
+time, so memory depends on the largest record rather than total file size.
+The newest conversation record identifies a native session; legacy fork
+ancestors may retain their source session ID during historical bootstrap.
+
 `ClaudeCodeHeadless` uses the same resolver for `resumeSessionId` and follows
 live moves while preserving its byte cursor. A move whose bytes immediately
 before the consumed cursor no longer match is reported through `jsonl-error`;
 it is never silently replayed.
+The reader checks the opened file and cursor before decoding replacement bytes.
+New live records still require the selected session ID, including after a legacy
+fork's historical bootstrap has finished.
 A missing resumed file rejects `start()`. Consumers assigning a fresh CLI
 `--session-id` must pass that UUID as `resumeSessionId` with
 `allowMissingTranscript: true`, so the reader can wait for its first write.
