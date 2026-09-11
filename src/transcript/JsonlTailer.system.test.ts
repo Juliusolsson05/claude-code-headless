@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, rmSync, unwatchFile, writeFileSync } from 'fs'
+import { appendFileSync, mkdtempSync, renameSync, rmSync, unwatchFile, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -55,6 +55,20 @@ afterEach(async () => {
 })
 
 describe('FileTailer scoped unwatch', () => {
+  it('continues a prefix-preserving atomic replacement without a relocation owner', async () => {
+    const file = makeFile(); const seen: number[] = []; const diagnostics: string[] = []
+    tail(file, seen, undefined, error => diagnostics.push(error.message))
+    expect(await waitFor(() => seen.includes(0), 5_000)).toBe(true)
+    // The generic public tail helpers have no exact-session relocation callback.
+    // A copied prefix on a new inode remains a valid append-only continuation.
+    writeFileSync(file + '.next', [0, 1].map(seq => JSON.stringify({ seq })).join('\n') + '\n')
+    renameSync(file + '.next', file)
+    expect(await waitFor(() => seen.includes(1), 5_000)).toBe(true)
+    appendFileSync(file, JSON.stringify({ seq: 2 }) + '\n')
+    expect(await waitFor(() => seen.includes(2), 5_000)).toBe(true)
+    expect(seen).toEqual([0, 1, 2]); expect(diagnostics).toEqual([])
+  }, 10_000)
+
   it(
     'a second tailer on the same path survives the first one closing',
     async () => {
