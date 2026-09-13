@@ -37,6 +37,7 @@ import type {
   SemanticBlockKind,
   SemanticConfidence,
   SemanticSource,
+  SemanticTurnStoppedEvent,
   StreamPhase,
 } from '../channels/types.js'
 import {
@@ -1159,11 +1160,15 @@ export class ClaudeProxyAdapter {
    *  flow_selected on a new flow with no obvious reason the previous
    *  active was let go). Caller is responsible for then promoting the
    *  new candidate normally. */
-  private reapStaleActiveFlow(state: FlowState): void {
+  private reapStaleActiveFlow(
+    state: FlowState,
+    interruption?: SemanticTurnStoppedEvent['interruption'],
+  ): void {
     if (state.attribution === 'active' && state.turnStarted && !state.turnStopped) {
       this.channel.publishTurnStopped({
         turnId: state.turnId ?? state.flowId,
         stopReason: null,
+        interruption,
         source: 'proxy',
         confidence: 'medium',
       })
@@ -1175,13 +1180,51 @@ export class ClaudeProxyAdapter {
         confidence: 'medium',
       })
       this.publishPhase(state, 'idle')
+    } else if (state.attribution === 'active') {
+      // A flow that streamed its first chunk (publishing `requesting`) but died
+      // before `message_start` has no turn to stop, yet it still owns the
+      // spinner. Without this the phase it published stays on screen after the
+      // flow is gone. publishPhase is a no-op unless it is the phase owner.
+      this.publishPhase(state, 'idle')
     }
     const silentMs = Date.now() - state.lastChunkAt
     this.onDiagnostic(
-      `flow ${state.flowId} reaped (no chunk for ${Math.round(silentMs / 1000)}s)`,
+      `flow ${state.flowId} ${interruption ? `sealed (${interruption})` : 'reaped'} (no chunk for ${Math.round(silentMs / 1000)}s)`,
     )
     this.flows.delete(state.flowId)
     this.releaseStreamingFlow(state.flowId)
+  }
+
+  /** Seal every streaming flow that has had no transport activity since
+   *  `silentSince` (#963, agent-code decomposition "agent-working-time").
+   *
+   *  WHY this exists: the stale-flow reap above only runs inside the NEXT flow's
+   *  first chunk. When the machine sleeps, the stream's connection dies with it
+   *  and `response-end` never arrives; if Claude Code does not retry after wake,
+   *  no next flow ever comes and the turn stays open — the in-feed indicator read
+   *  `Thinking` indefinitely. The host calls this after it learns the machine was
+   *  suspended, passing the moment the suspension began.
+   *
+   *  WHY the caller owns the timing and this is synchronous: whether to wait for
+   *  a retry first is host policy (Agent Code waits a grace period so a retry can
+   *  reap the flow the normal way), and keeping timers out of the adapter keeps it
+   *  a pure function of the events it is given — which is what makes it testable
+   *  against recorded wire sequences.
+   *
+   *  Only flows silent for the WHOLE window are sealed: a chunk after the
+   *  suspension began proves the stream survived, and sealing it would cut off a
+   *  live turn. Flows that never streamed hold no phase and are left to the
+   *  normal paths. */
+  sealFlowsSilentSince(
+    silentSince: number,
+    interruption: NonNullable<SemanticTurnStoppedEvent['interruption']>,
+  ): void {
+    for (const flowId of [...this.streamingFlowIds]) {
+      const state = this.flows.get(flowId)
+      if (state && state.lastChunkAt <= silentSince) {
+        this.reapStaleActiveFlow(state, interruption)
+      }
+    }
   }
 
   private closeTurnAfterTerminalApiError(

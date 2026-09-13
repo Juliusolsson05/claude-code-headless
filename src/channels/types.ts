@@ -597,6 +597,16 @@ export type SemanticToolResultEvent = {
 export type SemanticTurnStoppedEvent = {
   type: 'turn_stopped'
   turnId: string
+  /** Why a turn was stopped by the adapter rather than by upstream, when the
+   *  adapter knows. `'system-suspended'`: the machine slept, the stream's
+   *  connection died with it, and no retry or chunk arrived after wake, so the
+   *  adapter sealed the flow (see `ClaudeProxyAdapter.sealFlowsSilentSince`).
+   *
+   *  WHY a separate field instead of a new `stopReason`: `stopReason` is the
+   *  upstream value exactly as delivered, and consumers switch on that
+   *  vocabulary. A synthetic cause mixed into it would look like something
+   *  Anthropic sent. Absent for every upstream-terminated turn. */
+  interruption?: 'system-suspended'
   /** Upstream value exactly as delivered. Null means "stream ended
    *  without a message_delta", which is a soft error. */
   stopReason:
