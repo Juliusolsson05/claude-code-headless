@@ -206,7 +206,10 @@ this package must emit:
    user turn; emitted on semantic channel so the renderer can pair it
    to the previous tool_started by id).
 7. Stop: `turn_stopped` with `stop_reason`, `isRefusal`, and whether
-   the turn should be treated as an error surface.
+   the turn should be treated as an error surface. A turn the adapter
+   sealed because the machine slept (`sealFlowsSilentSince`, called by the
+   host after a suspension) carries `interruption: 'system-suspended'` and
+   `stopReason: null`; `stopReason` itself stays upstream's vocabulary.
 8. Usage: `usage_updated` with the merged usage shape.
 9. Error: `stream_error` (soft — streaming defensive errors),
    `api_error` (hard — `APIError` surfaced to caller).

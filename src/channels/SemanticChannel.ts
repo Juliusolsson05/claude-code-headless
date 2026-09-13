@@ -782,12 +782,16 @@ export class SemanticChannel extends EventEmitter {
     turnId: string
     stopReason: SemanticTurnStoppedEvent['stopReason']
     syntheticErrorText?: string
+    interruption?: SemanticTurnStoppedEvent['interruption']
     source: SemanticSource
     confidence?: SemanticConfidence
   }): void {
     const ev: SemanticTurnStoppedEvent = {
       type: 'turn_stopped',
       turnId: params.turnId,
+      // Spread only when present: an upstream-stopped turn must not carry an
+      // `interruption: undefined` key that a strict consumer could misread.
+      ...(params.interruption ? { interruption: params.interruption } : {}),
       stopReason: params.stopReason,
       isRefusal: params.stopReason === 'refusal',
       syntheticErrorText: params.syntheticErrorText,

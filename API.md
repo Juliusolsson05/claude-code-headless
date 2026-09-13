@@ -776,6 +776,7 @@ data, index }` \| `{ kind: 'tool_use', toolName, toolInput, index }`.
 | --- | --- | --- |
 | `type` | `'turn_stopped'` | |
 | `turnId` | `string` | |
+| `interruption?` | `'system-suspended'` | Present only when the adapter, not upstream, stopped the turn because the machine slept (see `sealFlowsSilentSince`). Kept out of `stopReason`, which is upstream's vocabulary. |
 | `stopReason` | `'end_turn' \| 'tool_use' \| 'max_tokens' \| 'model_context_window_exceeded' \| 'pause_turn' \| 'refusal' \| 'stop_sequence' \| null` | Authoritative end-of-generation from `message_delta`. `null` = stream ended without one (soft error). |
 | `isRefusal` | `boolean` | Convenience for `stopReason === 'refusal'`. |
 | `syntheticErrorText?` | `string` | Error text Claude would inject for `max_tokens` / `model_context_window_exceeded` / `refusal`. |
@@ -1255,6 +1256,7 @@ and the `host:port` authority, so `^localhost:4010$` works.
 | Method | Signature | Description |
 | --- | --- | --- |
 | `handleTransportEvent(event)` | `(ProxyTransportEvent): void` | Entry point. Feed every transport event here. |
+| `sealFlowsSilentSince(silentSince, interruption)` | `(number, 'system-suspended'): void` | Stop every streaming flow that has had no chunk since `silentSince` (wall-clock ms): `turn_stopped` with `interruption`, `turn_completed`, phase `idle`. For hosts that learn the machine slept — the stream's connection died with it and no `response-end` will come. Synchronous; the host decides whether to wait for a retry first. Flows with a chunk after `silentSince` are untouched. |
 | `dispose()` | `(): void` | Release per-flow state (decoders, SSE buffers, accumulators). |
 
 #### `ProxyTransportEvent`
