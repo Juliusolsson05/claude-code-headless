@@ -606,7 +606,10 @@ export type SemanticTurnStoppedEvent = {
    *  upstream value exactly as delivered, and consumers switch on that
    *  vocabulary. A synthetic cause mixed into it would look like something
    *  Anthropic sent. Absent for every upstream-terminated turn. */
-  interruption?: 'system-suspended'
+  /** Why the turn stopped without a stop reason of its own.
+   *  `client-disconnected`: the transport died mid-stream, which is what an
+   *  Esc interrupt looks like from the proxy (agent-code #1040). */
+  interruption?: 'system-suspended' | 'client-disconnected'
   /** Upstream value exactly as delivered. Null means "stream ended
    *  without a message_delta", which is a soft error. */
   stopReason:

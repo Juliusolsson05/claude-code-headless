@@ -53,7 +53,7 @@ import { shouldFilterSuggestion } from './suggestionFilter.js'
 // ---------------------------------------------------------------------------
 
 export type ProxyTransportEvent = {
-  kind: 'request' | 'response' | 'response-chunk' | 'response-end'
+  kind: 'request' | 'response' | 'response-chunk' | 'response-end' | 'response-error'
   flow_id: number | string
   method?: string
   url?: string
@@ -851,6 +851,16 @@ export class ClaudeProxyAdapter {
       case 'response-end':
         this.onEnd(flowId)
         return
+      case 'response-error':
+        // The transport died before the stream ended — overwhelmingly, the
+        // user pressed Esc and Claude Code closed the connection (#1040).
+        // There is no future frame that can finish this turn, and nothing
+        // else will tell us: `response-end` fires only on a clean end of
+        // message. Seal it exactly as the stale-flow watchdog would, but now
+        // rather than after its silence window, so the pane stops saying
+        // `Thinking` and an idle edge exists for anything waiting on one.
+        this.onTransportError(flowId)
+        return
       case 'response':
         // Buffered body is not consumed — chunks are the single
         // source of truth for streaming. We stay silent here instead
@@ -860,6 +870,16 @@ export class ClaudeProxyAdapter {
         // every one would drown any signal in noise.
         return
     }
+  }
+
+  private onTransportError(flowId: string): void {
+    const state = this.flows.get(flowId)
+    // Every flow reports its error, and the adapter only ever tracks the ones
+    // it cares about, so an unknown id is the common case and not a problem.
+    if (!state) return
+    this.reapStaleActiveFlow(state, 'client-disconnected')
+    this.flows.delete(flowId)
+    this.releaseStreamingFlow(flowId)
   }
 
   /** Tear down all flow state. Call when the session ends. Clears

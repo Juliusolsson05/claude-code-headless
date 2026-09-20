@@ -597,6 +597,37 @@ def _make_stream_tap(flow: http.HTTPFlow):
     return tap
 
 
+def error(flow: http.HTTPFlow) -> None:
+    """A flow died before its stream ended.
+
+    WHY this hook has to exist (agent-code #1040): when the user presses Esc
+    while Claude is streaming, Claude Code closes the HTTP connection.
+    mitmproxy reports that ONLY here — `_http1.py`'s `wait()` raises
+    `RequestProtocolError("Client disconnected.")`, which goes to
+    `handle_protocol_error`, while the stream tap's end-of-stream call (the
+    `response-end` above) runs only on a NORMAL end of message
+    (`http/__init__.py:460-462`). With no `error` hook the consumer heard
+    nothing at all, so the adapter never tore the flow down: the pane kept
+    showing `Thinking` until the next prompt, and a goal loop whose turn ended
+    that way had no idle edge to resume from.
+
+    Emitted for every flow, allowed host or not, because the flow id is the
+    only thing the consumer needs to release state it is already holding; it
+    ignores ids it never saw.
+    """
+    _write(
+        {
+            "kind": "response-error",
+            "flow_id": id(flow),
+            "method": flow.request.method if flow.request else None,
+            "url": flow.request.pretty_url if flow.request else None,
+            "host": flow.request.host if flow.request else None,
+            "path": flow.request.path if flow.request else None,
+            "error": str(flow.error) if flow.error else "flow error",
+        }
+    )
+
+
 def response(flow: http.HTTPFlow) -> None:
     request = flow.request
     response = flow.response
