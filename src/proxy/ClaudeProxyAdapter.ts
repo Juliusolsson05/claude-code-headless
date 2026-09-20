@@ -872,6 +872,9 @@ export class ClaudeProxyAdapter {
     }
   }
 
+  /** See noteSuspension. Null until the host reports one. */
+  private suspendedSince: number | null = null
+
   private onTransportError(flowId: string): void {
     const state = this.flows.get(flowId)
     // An id we never tracked: nothing to release.
@@ -885,6 +888,18 @@ export class ClaudeProxyAdapter {
     // an upstream connection failure does not establish. `onEnd` observes
     // the same rule; only the transport bookkeeping is released here.
     if (state.attribution === 'active' && state.turnStarted && !state.turnStopped) {
+      // A stream that was already silent when the machine went to sleep is a
+      // SLEEP casualty, whichever signal reports it first (review, round 3).
+      // The host's seal runs a minute after wake; a transport error can
+      // arrive seconds after it, and the first one to speak decides what the
+      // user reads.
+      const sleptThrough = this.suspendedSince !== null && state.lastChunkAt <= this.suspendedSince
+      if (sleptThrough) {
+        this.reapStaleActiveFlow(state, 'system-suspended')
+        this.flows.delete(flowId)
+        this.releaseStreamingFlow(flowId)
+        return
+      }
       // ONE neutral value, deliberately (review of this change, round 2).
       //
       // The first version read mitmproxy's message and called
@@ -1265,6 +1280,22 @@ export class ClaudeProxyAdapter {
    *  suspension began proves the stream survived, and sealing it would cut off a
    *  live turn. Flows that never streamed hold no phase and are left to the
    *  normal paths. */
+  /**
+   * The machine was suspended at `suspendedAt`. Recorded immediately, ahead
+   * of the grace period the host waits before sealing (#963), because the
+   * transport can report its death FIRST.
+   *
+   * WHY it matters that the adapter knows early (review of #1040's change):
+   * a sleep-severed stream often surfaces as a `response-error` seconds after
+   * wake, while the host's seal runs a minute later. Whoever gets there first
+   * decides what the user is told, and without this the error path called a
+   * slept-through turn a transport error, the later seal found no flow left
+   * to attribute, and the ledger lost "Interrupted while asleep."
+   */
+  noteSuspension(suspendedAt: number): void {
+    this.suspendedSince = suspendedAt
+  }
+
   sealFlowsSilentSince(
     silentSince: number,
     interruption: NonNullable<SemanticTurnStoppedEvent['interruption']>,

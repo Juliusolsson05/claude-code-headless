@@ -153,6 +153,31 @@ describe('a stream the client severed', () => {
     }
   })
 
+  it('still calls a slept-through stream a sleep, whichever signal arrives first', () => {
+    // The host seals sleep-severed flows a minute after wake (#963), but the
+    // transport can report the death seconds after it — and whoever speaks
+    // first decides what the user reads. Without this the error path called
+    // it a transport error, the later seal found no flow left to attribute,
+    // and the ledger lost "Interrupted while asleep" (review, round 3).
+    const { adapter, events, request, chunk, severed } = mount()
+    request(1)
+    chunk(1, streaming('msg_asleep'))
+    // The machine slept AFTER that chunk, and woke.
+    adapter.noteSuspension(Date.now() + 1)
+    severed(1)
+    expect(events.filter(ev => ev.type === 'turn_stopped')[0]).toMatchObject({ interruption: 'system-suspended' })
+  })
+
+  it('does not call an ordinary interruption a sleep just because one happened earlier', () => {
+    const { adapter, events, request, chunk, severed } = mount()
+    adapter.noteSuspension(Date.now() - 60_000)
+    request(1)
+    // This chunk arrives AFTER the suspension: the stream plainly survived it.
+    chunk(1, streaming('msg_after_wake'))
+    severed(1)
+    expect(events.filter(ev => ev.type === 'turn_stopped')[0]).toMatchObject({ interruption: 'transport-error' })
+  })
+
   it('ignores an error for a flow it never tracked', () => {
     const { events, severed } = mount()
     severed(999)
