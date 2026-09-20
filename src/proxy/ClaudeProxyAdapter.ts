@@ -53,7 +53,7 @@ import { shouldFilterSuggestion } from './suggestionFilter.js'
 // ---------------------------------------------------------------------------
 
 export type ProxyTransportEvent = {
-  kind: 'request' | 'response' | 'response-chunk' | 'response-end'
+  kind: 'request' | 'response' | 'response-chunk' | 'response-end' | 'response-error'
   flow_id: number | string
   method?: string
   url?: string
@@ -63,6 +63,9 @@ export type ProxyTransportEvent = {
   headers?: Record<string, string>
   /** Base64-encoded transport bytes on `response-chunk`. */
   chunk_b64?: string
+  /** mitmproxy's own message on `response-error` — "Client disconnected." for
+   *  an Esc, something else for an upstream failure. Never request content. */
+  error?: string
   /** Base64-encoded REQUEST body, populated by the mitm addon for
    *  /v1/messages calls only and capped at 256 KiB. Used by the sidecar
    *  filter to detect title-gen / compaction / hook-agent calls that
@@ -851,6 +854,13 @@ export class ClaudeProxyAdapter {
       case 'response-end':
         this.onEnd(flowId)
         return
+      case 'response-error':
+        // The transport died before the stream ended — most often the user
+        // pressed Esc and Claude Code closed the connection (#1040). There is
+        // no future frame that can finish this turn, and nothing else will
+        // say so: `response-end` fires only on a clean end of message.
+        this.onTransportError(flowId)
+        return
       case 'response':
         // Buffered body is not consumed — chunks are the single
         // source of truth for streaming. We stay silent here instead
@@ -860,6 +870,61 @@ export class ClaudeProxyAdapter {
         // every one would drown any signal in noise.
         return
     }
+  }
+
+  /** See noteSuspension. Null until the host reports one. */
+  private suspendedSince: number | null = null
+
+  private onTransportError(flowId: string): void {
+    const state = this.flows.get(flowId)
+    // An id we never tracked: nothing to release.
+    if (!state) return
+
+    // A turn that already STOPPED keeps its phase. The review found this:
+    // a complete tool message publishes `message_delta(stop_reason:
+    // 'tool_use')` and `message_stop`, leaving the pane `awaiting-tool`
+    // while the tool runs locally — and the HTTP flow can die after that.
+    // Publishing idle there would claim the tool stopped executing, which
+    // an upstream connection failure does not establish. `onEnd` observes
+    // the same rule; only the transport bookkeeping is released here.
+    if (state.attribution === 'active' && state.turnStarted && !state.turnStopped) {
+      // A stream that was already silent when the machine went to sleep is a
+      // SLEEP casualty, whichever signal reports it first (review, round 3).
+      // The host's seal runs a minute after wake; a transport error can
+      // arrive seconds after it, and the first one to speak decides what the
+      // user reads.
+      const sleptThrough = this.suspendedSince !== null && state.lastChunkAt <= this.suspendedSince
+      if (sleptThrough) {
+        this.reapStaleActiveFlow(state, 'system-suspended')
+        this.flows.delete(flowId)
+        this.releaseStreamingFlow(flowId)
+        return
+      }
+      // ONE neutral value, deliberately (review of this change, round 2).
+      //
+      // The first version read mitmproxy's message and called
+      // `Client disconnected.` an Esc. The reviewer then reproduced a proxy
+      // INACTIVITY timeout against 12.2.2 with `tcp_timeout=1`: the client's
+      // socket is still open, mitmproxy logs "Closing connection due to
+      // inactivity" — and hands the error hook the string
+      // `Client disconnected.` all the same. The message cannot establish who
+      // went away, and the observed vocabulary has no other discriminator:
+      //
+      //   client close during streaming   -> "Client disconnected."
+      //   proxy inactivity timeout        -> "Client disconnected."
+      //   upstream refusal                -> "[Errno 61] Connect call failed…"
+      //   TLS against a plaintext upstream-> "The remote server does not speak TLS."
+      //
+      // A consumer displays this as fact, so it says only what is true: the
+      // transport died before the stream ended.
+      this.reapStaleActiveFlow(state, 'transport-error')
+    } else if (state.attribution === 'active' && !state.turnStarted) {
+      // A flow that published `requesting` on its first chunk and died before
+      // `message_start` owns the spinner with no turn behind it.
+      this.publishPhase(state, 'idle')
+    }
+    this.flows.delete(flowId)
+    this.releaseStreamingFlow(flowId)
   }
 
   /** Tear down all flow state. Call when the session ends. Clears
@@ -1215,6 +1280,22 @@ export class ClaudeProxyAdapter {
    *  suspension began proves the stream survived, and sealing it would cut off a
    *  live turn. Flows that never streamed hold no phase and are left to the
    *  normal paths. */
+  /**
+   * The machine was suspended at `suspendedAt`. Recorded immediately, ahead
+   * of the grace period the host waits before sealing (#963), because the
+   * transport can report its death FIRST.
+   *
+   * WHY it matters that the adapter knows early (review of #1040's change):
+   * a sleep-severed stream often surfaces as a `response-error` seconds after
+   * wake, while the host's seal runs a minute later. Whoever gets there first
+   * decides what the user is told, and without this the error path called a
+   * slept-through turn a transport error, the later seal found no flow left
+   * to attribute, and the ledger lost "Interrupted while asleep."
+   */
+  noteSuspension(suspendedAt: number): void {
+    this.suspendedSince = suspendedAt
+  }
+
   sealFlowsSilentSince(
     silentSince: number,
     interruption: NonNullable<SemanticTurnStoppedEvent['interruption']>,
