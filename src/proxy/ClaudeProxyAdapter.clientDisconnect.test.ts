@@ -59,17 +59,10 @@ function mount() {
       chunk_b64: Buffer.from(sse(frames)).toString('base64'),
     })
   }
-  // The shape mitmAddon.py's `error` hook writes.
-  const severed = (flowId: number): void => {
-    adapter.handleTransportEvent({
-      kind: 'response-error',
-      flow_id: flowId,
-      method: 'POST',
-      url: 'https://api.anthropic.com/v1/messages',
-      host: 'api.anthropic.com',
-      path: '/v1/messages',
-      error: 'Client disconnected.',
-    })
+  // The shape mitmAddon.py's `error` hook writes: the flow id and
+  // mitmproxy's own message, and deliberately nothing else.
+  const severed = (flowId: number, error = 'Client disconnected.'): void => {
+    adapter.handleTransportEvent({ kind: 'response-error', flow_id: flowId, error })
   }
   return { adapter, events, request, chunk, severed }
 }
@@ -107,12 +100,53 @@ describe('a stream the client severed', () => {
     request(1)
     chunk(1, streaming('msg_first'))
     severed(1)
+    // The interrupted turn is CLOSED before the retry starts — without that,
+    // this test passed on concurrent-turn behaviour alone (review of this
+    // change).
+    expect(events.filter(ev => ev.type === 'turn_stopped')).toHaveLength(1)
+    expect(phases(events).at(-1)).toBe('idle')
 
     request(2)
     chunk(2, streaming('msg_retry'))
-    expect(phases(events).at(-1)).toBe('responding')
-    // One turn per flow: the severed one is closed, the retry is its own.
-    expect(events.filter(ev => ev.type === 'turn_started')).toHaveLength(2)
+    const started = events.filter(ev => ev.type === 'turn_started')
+    expect(started).toHaveLength(2)
+    // The phase after the retry's first chunk belongs to the RETRY's turn.
+    const lastPhase = [...events].reverse().find(ev => ev.type === 'stream_phase')
+    expect(lastPhase).toMatchObject({ phase: 'responding', turnId: started[1]?.turnId })
+  })
+
+  it('leaves a completed turn waiting for its tool instead of calling it idle', () => {
+    // A tool message ends cleanly — `message_delta(stop_reason: 'tool_use')`
+    // then `message_stop` — and the pane waits on the tool that is now running
+    // locally. The HTTP flow can die AFTER that, and an upstream socket
+    // failure says nothing about whether the delivered tool is still running
+    // (review of this change). Only transport bookkeeping is released.
+    const { events, request, chunk, severed } = mount()
+    request(1)
+    chunk(1, [
+      { type: 'message_start', message: { id: 'msg_tool', model: MODEL, usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+      { type: 'message_stop' },
+    ])
+    const before = phases(events).at(-1)
+    expect(before).toBe('awaiting-tool')
+
+    severed(1, 'Server disconnected.')
+    expect(phases(events).at(-1)).toBe(before)
+    expect(events.filter(ev => ev.type === 'turn_stopped')).toHaveLength(1)
+  })
+
+  it('does not blame the client for an upstream failure', () => {
+    // Teardown is right either way, but the attribution is displayed, so it
+    // has to be earned: only mitmproxy saying the CLIENT went away means the
+    // user pressed Esc.
+    const { events, request, chunk, severed } = mount()
+    request(1)
+    chunk(1, streaming('msg_upstream'))
+    severed(1, 'Client TLS handshake failed')
+    expect(events.filter(ev => ev.type === 'turn_stopped')[0]).toMatchObject({ interruption: 'transport-error' })
   })
 
   it('ignores an error for a flow it never tracked', () => {

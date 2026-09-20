@@ -63,6 +63,9 @@ export type ProxyTransportEvent = {
   headers?: Record<string, string>
   /** Base64-encoded transport bytes on `response-chunk`. */
   chunk_b64?: string
+  /** mitmproxy's own message on `response-error` — "Client disconnected." for
+   *  an Esc, something else for an upstream failure. Never request content. */
+  error?: string
   /** Base64-encoded REQUEST body, populated by the mitm addon for
    *  /v1/messages calls only and capped at 256 KiB. Used by the sidecar
    *  filter to detect title-gen / compaction / hook-agent calls that
@@ -852,14 +855,11 @@ export class ClaudeProxyAdapter {
         this.onEnd(flowId)
         return
       case 'response-error':
-        // The transport died before the stream ended — overwhelmingly, the
-        // user pressed Esc and Claude Code closed the connection (#1040).
-        // There is no future frame that can finish this turn, and nothing
-        // else will tell us: `response-end` fires only on a clean end of
-        // message. Seal it exactly as the stale-flow watchdog would, but now
-        // rather than after its silence window, so the pane stops saying
-        // `Thinking` and an idle edge exists for anything waiting on one.
-        this.onTransportError(flowId)
+        // The transport died before the stream ended — most often the user
+        // pressed Esc and Claude Code closed the connection (#1040). There is
+        // no future frame that can finish this turn, and nothing else will
+        // say so: `response-end` fires only on a clean end of message.
+        this.onTransportError(flowId, typeof event.error === 'string' ? event.error : '')
         return
       case 'response':
         // Buffered body is not consumed — chunks are the single
@@ -872,12 +872,31 @@ export class ClaudeProxyAdapter {
     }
   }
 
-  private onTransportError(flowId: string): void {
+  private onTransportError(flowId: string, error: string): void {
     const state = this.flows.get(flowId)
-    // Every flow reports its error, and the adapter only ever tracks the ones
-    // it cares about, so an unknown id is the common case and not a problem.
+    // An id we never tracked: nothing to release.
     if (!state) return
-    this.reapStaleActiveFlow(state, 'client-disconnected')
+
+    // A turn that already STOPPED keeps its phase. The review found this:
+    // a complete tool message publishes `message_delta(stop_reason:
+    // 'tool_use')` and `message_stop`, leaving the pane `awaiting-tool`
+    // while the tool runs locally — and the HTTP flow can die after that.
+    // Publishing idle there would claim the tool stopped executing, which
+    // an upstream connection failure does not establish. `onEnd` observes
+    // the same rule; only the transport bookkeeping is released here.
+    if (state.attribution === 'active' && state.turnStarted && !state.turnStopped) {
+      // mitmproxy's own message is the only thing that distinguishes a client
+      // disconnect (an Esc) from an upstream failure, and attributing every
+      // dead socket to the user would be a guess the consumer then displays.
+      const interruption = error.includes('Client disconnected')
+        ? 'client-disconnected' as const
+        : 'transport-error' as const
+      this.reapStaleActiveFlow(state, interruption)
+    } else if (state.attribution === 'active' && !state.turnStarted) {
+      // A flow that published `requesting` on its first chunk and died before
+      // `message_start` owns the spinner with no turn behind it.
+      this.publishPhase(state, 'idle')
+    }
     this.flows.delete(flowId)
     this.releaseStreamingFlow(flowId)
   }

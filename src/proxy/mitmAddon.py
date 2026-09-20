@@ -611,18 +611,25 @@ def error(flow: http.HTTPFlow) -> None:
     showing `Thinking` until the next prompt, and a goal loop whose turn ended
     that way had no idle edge to resume from.
 
-    Emitted for every flow, allowed host or not, because the flow id is the
-    only thing the consumer needs to release state it is already holding; it
-    ignores ids it never saw.
+    ALLOWED HOSTS ONLY, and no URL (review of this change): this hook fires
+    for flows that never reached `request()`, so emitting their metadata would
+    capture requests the addon has never recorded before — a probe wrote
+    `http://localhost:12345/upload?token=…` into the JSONL from an incomplete
+    POST to a host we do not proxy for. Ignoring the line downstream cannot
+    unwrite it. The consumer needs the flow id and nothing else: it is
+    releasing state it already holds, and it ignores ids it never saw.
+
+    The error TEXT is carried because the consumer has to tell a client
+    disconnect (an Esc) from an upstream failure, and it is mitmproxy's own
+    message, not request content.
     """
+    request = flow.request
+    if not request or not _is_allowed_host(request):
+        return
     _write(
         {
             "kind": "response-error",
             "flow_id": id(flow),
-            "method": flow.request.method if flow.request else None,
-            "url": flow.request.pretty_url if flow.request else None,
-            "host": flow.request.host if flow.request else None,
-            "path": flow.request.path if flow.request else None,
             "error": str(flow.error) if flow.error else "flow error",
         }
     )
