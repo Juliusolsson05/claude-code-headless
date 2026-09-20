@@ -88,7 +88,7 @@ describe('a stream the client severed', () => {
     expect(phases(events).at(-1)).toBe('idle')
     const stopped = events.filter(ev => ev.type === 'turn_stopped')
     expect(stopped).toHaveLength(1)
-    expect(stopped[0]).toMatchObject({ interruption: 'client-disconnected', stopReason: null })
+    expect(stopped[0]).toMatchObject({ interruption: 'transport-error', stopReason: null })
     // The partial answer still reaches the consumer; what must NOT appear is a
     // synthesised message_completed claiming a truncated message is whole.
     expect(events.some(ev => ev.type === 'turn_completed')).toBe(true)
@@ -138,15 +138,19 @@ describe('a stream the client severed', () => {
     expect(events.filter(ev => ev.type === 'turn_stopped')).toHaveLength(1)
   })
 
-  it('does not blame the client for an upstream failure', () => {
-    // Teardown is right either way, but the attribution is displayed, so it
-    // has to be earned: only mitmproxy saying the CLIENT went away means the
-    // user pressed Esc.
-    const { events, request, chunk, severed } = mount()
-    request(1)
-    chunk(1, streaming('msg_upstream'))
-    severed(1, 'Client TLS handshake failed')
-    expect(events.filter(ev => ev.type === 'turn_stopped')[0]).toMatchObject({ interruption: 'transport-error' })
+  it('reports one neutral interruption, whatever mitmproxy called it', () => {
+    // The attribution is displayed, so it has to be earned — and it cannot
+    // be: mitmproxy hands the error hook `Client disconnected.` for its OWN
+    // inactivity timeout as well as for a real client close (reproduced
+    // against 12.2.2 with tcp_timeout=1). Every severed stream reports the
+    // one thing that is true.
+    for (const message of ['Client disconnected.', 'The remote server does not speak TLS.']) {
+      const { events, request, chunk, severed } = mount()
+      request(1)
+      chunk(1, streaming('msg_any'))
+      severed(1, message)
+      expect(events.filter(ev => ev.type === 'turn_stopped')[0]).toMatchObject({ interruption: 'transport-error' })
+    }
   })
 
   it('ignores an error for a flow it never tracked', () => {

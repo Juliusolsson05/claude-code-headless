@@ -859,7 +859,7 @@ export class ClaudeProxyAdapter {
         // pressed Esc and Claude Code closed the connection (#1040). There is
         // no future frame that can finish this turn, and nothing else will
         // say so: `response-end` fires only on a clean end of message.
-        this.onTransportError(flowId, typeof event.error === 'string' ? event.error : '')
+        this.onTransportError(flowId)
         return
       case 'response':
         // Buffered body is not consumed — chunks are the single
@@ -872,7 +872,7 @@ export class ClaudeProxyAdapter {
     }
   }
 
-  private onTransportError(flowId: string, error: string): void {
+  private onTransportError(flowId: string): void {
     const state = this.flows.get(flowId)
     // An id we never tracked: nothing to release.
     if (!state) return
@@ -885,13 +885,24 @@ export class ClaudeProxyAdapter {
     // an upstream connection failure does not establish. `onEnd` observes
     // the same rule; only the transport bookkeeping is released here.
     if (state.attribution === 'active' && state.turnStarted && !state.turnStopped) {
-      // mitmproxy's own message is the only thing that distinguishes a client
-      // disconnect (an Esc) from an upstream failure, and attributing every
-      // dead socket to the user would be a guess the consumer then displays.
-      const interruption = error.includes('Client disconnected')
-        ? 'client-disconnected' as const
-        : 'transport-error' as const
-      this.reapStaleActiveFlow(state, interruption)
+      // ONE neutral value, deliberately (review of this change, round 2).
+      //
+      // The first version read mitmproxy's message and called
+      // `Client disconnected.` an Esc. The reviewer then reproduced a proxy
+      // INACTIVITY timeout against 12.2.2 with `tcp_timeout=1`: the client's
+      // socket is still open, mitmproxy logs "Closing connection due to
+      // inactivity" — and hands the error hook the string
+      // `Client disconnected.` all the same. The message cannot establish who
+      // went away, and the observed vocabulary has no other discriminator:
+      //
+      //   client close during streaming   -> "Client disconnected."
+      //   proxy inactivity timeout        -> "Client disconnected."
+      //   upstream refusal                -> "[Errno 61] Connect call failed…"
+      //   TLS against a plaintext upstream-> "The remote server does not speak TLS."
+      //
+      // A consumer displays this as fact, so it says only what is true: the
+      // transport died before the stream ended.
+      this.reapStaleActiveFlow(state, 'transport-error')
     } else if (state.attribution === 'active' && !state.turnStarted) {
       // A flow that published `requesting` on its first chunk and died before
       // `message_start` owns the spinner with no turn behind it.
