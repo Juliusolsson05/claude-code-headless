@@ -102,6 +102,57 @@ def _write(payload):
 _REQUEST_BODY_CAP = 2 * 1024 * 1024
 
 
+# Per-FILE budget for request bodies (agent-code #1273).
+#
+# _REQUEST_BODY_CAP bounds one body; nothing bounded their sum. Every Claude
+# request re-sends the whole conversation, so a long session writes a
+# near-identical, ever-larger body on every turn and the file grows roughly
+# quadratically. Measured 2026-09-25: one live session's proxy-events.jsonl
+# reached 2.37 GB (four sessions over 0.8 GB that day, proxy/ at 7.6 GB), and
+# body_b64 was 92.9 % of the bytes in its last 300 MB. Retention cannot help
+# a live session: it skips files written in the last ten minutes.
+#
+# WHY omitting bodies (and not rotating the file or capping everything): the
+# body is forensic only. The adapter's sidecar predicate reads request_shape,
+# which is still written for every request, and the responses, errors and
+# stream chunks the transcript view is built from are untouched, so live
+# behaviour does not change. The omission is marked (`body_omitted`) so a
+# fixture extractor or debug reader knows the body was dropped, not absent.
+#
+# WHY gate on the file's SIZE, not a counter of bytes written: the size
+# survives an addon restart that appends to the same run file, and one
+# stat() per /v1/messages request is negligible next to the request itself.
+#
+# The kept bodies are the EARLIEST ones. Each carries the full history up to
+# its turn, so the last kept body still decodes everything before the budget
+# was reached; turns after it are recoverable only from request_shape and the
+# responses. 256 MiB holds roughly a hundred 2 MiB turns, more than a typical
+# session, and the override exists for a deliberate forensic capture.
+def _read_body_budget():
+    raw = os.environ.get("PROXY_REQUEST_BODY_BUDGET_BYTES")
+    if raw:
+        try:
+            value = int(raw)
+            if value >= 0:
+                return value
+        except ValueError:
+            pass
+    return 256 * 1024 * 1024
+
+
+_REQUEST_BODY_FILE_BUDGET = _read_body_budget()
+
+
+def _events_file_over_budget() -> bool:
+    if not OUT_PATH:
+        return False
+    try:
+        return os.path.getsize(OUT_PATH) >= _REQUEST_BODY_FILE_BUDGET
+    except OSError:
+        # No file yet (first event) or unreadable: nothing written counts.
+        return False
+
+
 # How many leading characters of each system-prompt text block we ship
 # to the adapter. The longest known sidecar fingerprint prefix is ~50
 # chars (see SIDECAR_SYSTEM_PROMPT_PREFIXES in ClaudeProxyAdapter.ts);
@@ -549,7 +600,10 @@ def request(flow: http.HTTPFlow) -> None:
                 # request_shape yet. Past the cap we drop silently —
                 # request_shape already covers the predicate's needs.
                 if len(content) <= _REQUEST_BODY_CAP:
-                    payload["body_b64"] = base64.b64encode(content).decode("ascii")
+                    if _events_file_over_budget():
+                        payload["body_omitted"] = "file-budget"
+                    else:
+                        payload["body_b64"] = base64.b64encode(content).decode("ascii")
         except Exception as exc:
             payload["body_error"] = str(exc)
 
