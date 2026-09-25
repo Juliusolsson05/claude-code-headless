@@ -10,6 +10,7 @@ import {
   detectActivity,
   extractAssistantInProgress,
   parseClaudeComposerState,
+  type ComposerAttributes,
   type ClaudeComposerState,
 } from './parsers/ScreenParser.js'
 import { detectCompaction, type CompactionState } from './parsers/CompactionParser.js'
@@ -1478,6 +1479,22 @@ export class ClaudeCodeHeadless extends EventEmitter {
   /** Latest provider-owned composer classification, computed once per frame. */
   getComposerState(): ClaudeComposerState {
     return this.composerState
+  }
+
+  /**
+   * Cell-attribute summary of the active composer, read from the LIVE buffer
+   * now — not the per-frame cache behind getComposerState().
+   *
+   * WHY a fresh read exists (agent-code #1309 review): the cached state only
+   * moves on a `screen` event, which is throttled (snapshotIntervalMs) and can
+   * stall behind pendingWrites while the buffer keeps changing. A caller that
+   * must verify its OWN keystroke took effect (agent-code's delivery rollback,
+   * 25 ms after a kill) needs the buffer as it is, read together with
+   * getScreen() so text and attributes describe the same instant. Null when no
+   * composer is painted.
+   */
+  getComposerAttributes(): ComposerAttributes | null {
+    return this.terminal.snapshotComposerAttributes()
   }
 
   /** Current markdown-reconstructed screen snapshot. */

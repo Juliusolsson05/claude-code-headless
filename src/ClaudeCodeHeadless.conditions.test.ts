@@ -53,6 +53,17 @@ describe('ClaudeCodeHeadless composer classification', () => {
     expect(headless.getComposerState()).toBe('empty')
   })
 
+  // agent-code #1309: the delivery rollback checks its own kill 25 ms later,
+  // faster than the throttled screen event that updates getComposerState().
+  it('reads composer attributes from the live buffer, ahead of the cached state', async () => {
+    const headless = await paintComposer(`❯ ${dim('suggested follow-up')}`)
+    expect(headless.getComposerState()).toBe('empty')
+    const internal = headless as unknown as { terminal: { writeForTest(data: string): Promise<void> } }
+    // Typed text lands in the buffer; no screen event is awaited.
+    await internal.terminal.writeForTest('\x1b[2J\x1b[H' + [RULE, '❯ typed by a human', RULE].join('\r\n'))
+    expect(headless.getComposerAttributes()?.plain).toBeGreaterThan(0)
+  })
+
   it('still reports a drafted composer for typed text', async () => {
     const headless = await paintComposer('❯ this is a real human draft')
     expect(headless.getComposerState()).toBe('drafted')
