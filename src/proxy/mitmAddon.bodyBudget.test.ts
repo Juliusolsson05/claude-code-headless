@@ -106,6 +106,8 @@ describe('mitmAddon request body budget (#1273)', () => {
     const event = runRequest('absent', 0)
     expect(event.body_b64).toBeUndefined()
     expect(event.body_omitted).toBe('file-budget')
+    // Nor in the recent-body sidecar (steering q26): zero means nowhere.
+    expect(event.latest).toBeNull()
   })
 
   // Review of #62 (A, minor): pin the default and the exact boundary.

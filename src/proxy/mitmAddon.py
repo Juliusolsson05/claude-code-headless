@@ -174,6 +174,16 @@ def _write_latest_body(flow_id, content: bytes) -> None:
     if not OUT_PATH:
         return
     target = os.path.join(os.path.dirname(OUT_PATH), LATEST_BODY_FILE_NAME)
+    if _REQUEST_BODY_FILE_BUDGET == 0:
+        # Zero means "keep no request body anywhere" (steering q26): the
+        # sidecar must not become a second place the first prompt lands.
+        # A sidecar left by an earlier run of this addon with a positive
+        # budget is removed too, so switching to zero actually stops capture.
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+        return
     temp = target + ".tmp"
     try:
         with open(temp, "w", encoding="utf-8") as fh:
