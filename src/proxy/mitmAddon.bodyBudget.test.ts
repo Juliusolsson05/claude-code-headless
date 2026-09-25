@@ -127,4 +127,80 @@ describe('mitmAddon request body budget (#1273)', () => {
     // Under budget nothing is written there: the body is in the log itself.
     expect(runRequest(0).latest).toBeNull()
   })
+
+  // Round 2 of the #62 review: several requests in ONE run, with a sidecar
+  // that may already exist, and bodies over the 2 MiB per-body cap (627 of
+  // 2,810 requests past the budget in one real log).
+  function runSequence(opts: { existingBytes: number; budget?: number; prompts: Array<{ text: string; padTo?: number }>; preSidecar?: boolean }) {
+    const root = mkdtempSync(join(tmpdir(), 'mitm-seq-'))
+    stubMitmproxy(root)
+    const out = join(root, 'events.jsonl')
+    writeFileSync(out, '')
+    truncateSync(out, opts.existingBytes)
+    const sidecar = join(root, 'latest-request-body.json')
+    if (opts.preSidecar) writeFileSync(sidecar, JSON.stringify({ kind: 'request-body-latest', flow_id: 1, body_b64: Buffer.from('OLD PROMPT').toString('base64') }) + '\n')
+    const bodies = opts.prompts.map(({ text, padTo }) => {
+      const base = { model: 'claude-test', system: 'synthetic', messages: [{ role: 'user', content: text }], tools: [], pad: '' }
+      const size = JSON.stringify(base).length
+      return JSON.stringify({ ...base, pad: padTo && padTo > size ? 'x'.repeat(padTo - size) : '' })
+    })
+    const script = `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("addon", ${JSON.stringify(ADDON)})
+addon = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(addon)
+class Headers(dict):
+    pass
+class Request:
+    method = "POST"
+    host = "api.anthropic.com"
+    port = 443
+    path = "/v1/messages"
+    pretty_url = "https://api.anthropic.com/v1/messages"
+    def __init__(self, content):
+        self.headers = Headers()
+        self.content = content
+class Flow:
+    def __init__(self, content):
+        self.request = Request(content)
+for body in json.loads(sys.stdin.read()):
+    addon.request(Flow(body.encode("utf-8")))
+`
+    const env: NodeJS.ProcessEnv = { ...process.env, PYTHONPATH: root, PROXY_EVENTS_FILE: out }
+    if (opts.budget !== undefined) env.PROXY_REQUEST_BODY_BUDGET_BYTES = String(opts.budget)
+    execFileSync('python3', ['-c', script], { env, input: JSON.stringify(bodies), maxBuffer: 64 * 1024 * 1024 })
+    const fd = openSync(out, 'r')
+    let events: Array<Record<string, unknown>>
+    try {
+      const appended = Buffer.alloc(fstatSync(fd).size - opts.existingBytes)
+      readSync(fd, appended, 0, appended.length, opts.existingBytes)
+      events = appended.toString('utf8').trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    } finally {
+      closeSync(fd)
+    }
+    const latest = existsSync(sidecar) ? JSON.parse(readFileSync(sidecar, 'utf8')) as Record<string, unknown> : null
+    const latestText = latest ? Buffer.from(String(latest.body_b64), 'base64').toString('utf8') : null
+    return { events, latest, latestText }
+  }
+
+  it('zero budget removes an existing sidecar even when the first request is over the per-body cap', () => {
+    const run = runSequence({ existingBytes: 0, budget: 0, preSidecar: true, prompts: [{ text: 'huge', padTo: 2 * 1024 * 1024 + 64 }] })
+    expect(run.latest).toBeNull()
+    expect(run.events[0]?.body_b64).toBeUndefined()
+  })
+
+  it('past the budget, an over-cap newest request replaces the sidecar instead of leaving an older prompt as "latest"', () => {
+    const run = runSequence({ existingBytes: 4096, budget: 1024, prompts: [{ text: 'first prompt' }, { text: 'newest prompt', padTo: 2 * 1024 * 1024 + 64 }] })
+    expect(run.latestText).toContain('newest prompt')
+    expect(run.latest?.flow_id).toBe(run.events[1]?.flow_id)
+  })
+
+  it('before the budget, an over-cap body is kept in the sidecar and marked, and a newer inline body clears it', () => {
+    const over = runSequence({ existingBytes: 0, prompts: [{ text: 'big one', padTo: 2 * 1024 * 1024 + 64 }] })
+    expect(over.events[0]?.body_omitted).toBe('body-cap')
+    expect(over.latestText).toContain('big one')
+    const then = runSequence({ existingBytes: 0, prompts: [{ text: 'big one', padTo: 2 * 1024 * 1024 + 64 }, { text: 'small newer' }] })
+    expect(typeof then.events[1]?.body_b64).toBe('string')
+    expect(then.latest).toBeNull()
+  })
 })

@@ -156,35 +156,67 @@ def _events_file_over_budget() -> bool:
     return size >= _REQUEST_BODY_FILE_BUDGET
 
 
-# Past the budget, the NEWEST body is still kept, alone, in a sidecar next to
-# the events file, overwritten on every request (review of #62).
+# The newest request body that is NOT in the events file, kept alone in a
+# sidecar next to it (review of #62, rounds 1-2).
 #
 # WHY: omitting bodies lost exactly the prompts a bug report is about — the
 # recent ones. Agent Code's debug bundle carries only the last 5 MiB of the
-# events file, and on the two largest real logs every /v1/messages request in
-# that tail had a body today. Because every Claude request re-sends the whole
-# conversation, the latest body alone reconstructs every prompt so far, and
-# the sidecar is bounded by one body (_REQUEST_BODY_CAP). Written temp +
-# rename so a reader never sees half a body. The line has its own kind so
-# nothing that replays proxy-events.jsonl mistakes it for a second request.
+# events file. Because every Claude request re-sends the whole conversation,
+# one body reconstructs every prompt so far.
+#
+# INVARIANT: if the sidecar exists, it holds the newest request whose body is
+# not in the log. So:
+#   - a body written inline removes the sidecar (the log now has the newest);
+#   - a body over _REQUEST_BODY_CAP (2 MiB) is NOT in the log either — long
+#     sessions past the budget are mostly such bodies (627 of 2,810 requests
+#     in one real log) — so it goes to the sidecar too, up to
+#     _LATEST_BODY_CAP; a body beyond even that removes the sidecar rather
+#     than leave an older prompt labelled "latest";
+#   - a budget of 0 keeps no body anywhere: the sidecar and any temp file are
+#     removed at load and on every request, whatever the body's size.
+# Written to a per-write temp name + rename, so a reader never sees half a
+# body and two writers cannot truncate each other's temp file; a failed
+# rename removes its temp file. The line has its own kind so nothing that
+# replays proxy-events.jsonl mistakes it for a second request.
 LATEST_BODY_FILE_NAME = "latest-request-body.json"
+_LATEST_BODY_CAP = 16 * 1024 * 1024
+
+
+def _latest_body_path():
+    if not OUT_PATH:
+        return None
+    return os.path.join(os.path.dirname(OUT_PATH), LATEST_BODY_FILE_NAME)
+
+
+def _remove_latest_body() -> None:
+    target = _latest_body_path()
+    if target is None:
+        return
+    directory = os.path.dirname(target)
+    try:
+        os.remove(target)
+    except OSError:
+        pass
+    # Temp files of this sidecar (a crash between write and rename leaves one).
+    try:
+        for name in os.listdir(directory):
+            if name.startswith(LATEST_BODY_FILE_NAME + ".") and name.endswith(".tmp"):
+                try:
+                    os.remove(os.path.join(directory, name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def _write_latest_body(flow_id, content: bytes) -> None:
-    if not OUT_PATH:
+    target = _latest_body_path()
+    if target is None:
         return
-    target = os.path.join(os.path.dirname(OUT_PATH), LATEST_BODY_FILE_NAME)
-    if _REQUEST_BODY_FILE_BUDGET == 0:
-        # Zero means "keep no request body anywhere" (steering q26): the
-        # sidecar must not become a second place the first prompt lands.
-        # A sidecar left by an earlier run of this addon with a positive
-        # budget is removed too, so switching to zero actually stops capture.
-        try:
-            os.remove(target)
-        except OSError:
-            pass
+    if _REQUEST_BODY_FILE_BUDGET == 0 or len(content) > _LATEST_BODY_CAP:
+        _remove_latest_body()
         return
-    temp = target + ".tmp"
+    temp = "%s.%d.%s.tmp" % (target, os.getpid(), flow_id)
     try:
         with open(temp, "w", encoding="utf-8") as fh:
             fh.write(json.dumps({
@@ -195,7 +227,22 @@ def _write_latest_body(flow_id, content: bytes) -> None:
         os.replace(temp, target)
     except OSError:
         # Forensics only: a failed side write must never disturb the proxy.
-        pass
+        # Drop the temp file and any now-stale sidecar, so "latest" is never
+        # an older prompt.
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+
+
+# Switching an existing run to zero must stop capture at once, even if no
+# further request arrives (review of #62, round 2).
+if _REQUEST_BODY_FILE_BUDGET == 0:
+    _remove_latest_body()
 
 
 # How many leading characters of each system-prompt text block we ship
@@ -644,12 +691,16 @@ def request(flow: http.HTTPFlow) -> None:
                 # adapters that haven't been updated to read
                 # request_shape yet. Past the cap we drop silently —
                 # request_shape already covers the predicate's needs.
-                if len(content) <= _REQUEST_BODY_CAP:
-                    if _events_file_over_budget():
-                        payload["body_omitted"] = "file-budget"
-                        _write_latest_body(payload["flow_id"], content)
-                    else:
-                        payload["body_b64"] = base64.b64encode(content).decode("ascii")
+                # See LATEST_BODY_FILE_NAME for the sidecar's invariant.
+                if _events_file_over_budget():
+                    payload["body_omitted"] = "file-budget"
+                    _write_latest_body(payload["flow_id"], content)
+                elif len(content) > _REQUEST_BODY_CAP:
+                    payload["body_omitted"] = "body-cap"
+                    _write_latest_body(payload["flow_id"], content)
+                else:
+                    payload["body_b64"] = base64.b64encode(content).decode("ascii")
+                    _remove_latest_body()
         except Exception as exc:
             payload["body_error"] = str(exc)
 
