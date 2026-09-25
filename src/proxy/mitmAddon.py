@@ -102,6 +102,149 @@ def _write(payload):
 _REQUEST_BODY_CAP = 2 * 1024 * 1024
 
 
+# Per-FILE budget for request bodies (agent-code #1273).
+#
+# _REQUEST_BODY_CAP bounds one body; nothing bounded their sum. Every Claude
+# request re-sends the whole conversation, so a long session writes a
+# near-identical, ever-larger body on every turn and the file grows roughly
+# quadratically. Measured 2026-09-25: one live session's proxy-events.jsonl
+# reached 2.37 GB (four sessions over 0.8 GB that day, proxy/ at 7.6 GB), and
+# body_b64 was 92.9 % of the bytes in its last 300 MB. Retention cannot help
+# a live session: it skips files written in the last ten minutes.
+#
+# WHY omitting bodies (and not rotating the file or capping everything): the
+# body is forensic only. The adapter's sidecar predicate reads request_shape,
+# which is still written for every request, and the responses, errors and
+# stream chunks the transcript view is built from are untouched, so live
+# behaviour does not change. The omission is marked (`body_omitted`) so a
+# fixture extractor or debug reader knows the body was dropped, not absent.
+#
+# WHY gate on the file's SIZE, not a counter of bytes written: the size
+# survives an addon restart that appends to the same run file, and one
+# stat() per /v1/messages request is negligible next to the request itself.
+#
+# The kept bodies are the EARLIEST ones. Each carries the full history up to
+# its turn, so the last kept body still decodes everything before the budget
+# was reached; turns after it are recoverable only from request_shape and the
+# responses. 256 MiB holds roughly a hundred 2 MiB turns, more than a typical
+# session, and the override exists for a deliberate forensic capture.
+def _read_body_budget():
+    raw = os.environ.get("PROXY_REQUEST_BODY_BUDGET_BYTES")
+    if raw:
+        try:
+            value = int(raw)
+            if value >= 0:
+                return value
+        except ValueError:
+            pass
+    return 256 * 1024 * 1024
+
+
+_REQUEST_BODY_FILE_BUDGET = _read_body_budget()
+
+
+def _events_file_over_budget() -> bool:
+    if not OUT_PATH:
+        return False
+    try:
+        size = os.path.getsize(OUT_PATH)
+    except OSError:
+        # No file yet: nothing has been written, so its size is 0. Returning
+        # False here instead let a budget of 0 ("never keep bodies") still
+        # write the FIRST request's body (review of #62).
+        size = 0
+    return size >= _REQUEST_BODY_FILE_BUDGET
+
+
+# The newest request body that is NOT in the events file, kept alone in a
+# sidecar next to it (review of #62, rounds 1-2).
+#
+# WHY: omitting bodies lost exactly the prompts a bug report is about — the
+# recent ones. Agent Code's debug bundle carries only the last 5 MiB of the
+# events file. Because every Claude request re-sends the whole conversation,
+# one body reconstructs every prompt so far.
+#
+# INVARIANT: if the sidecar exists, it holds the newest request whose body is
+# not in the log. So:
+#   - a body written inline removes the sidecar (the log now has the newest);
+#   - a body over _REQUEST_BODY_CAP (2 MiB) is NOT in the log either — long
+#     sessions past the budget are mostly such bodies (627 of 2,810 requests
+#     in one real log) — so it goes to the sidecar too, up to
+#     _LATEST_BODY_CAP; a body beyond even that removes the sidecar rather
+#     than leave an older prompt labelled "latest";
+#   - a budget of 0 keeps no body anywhere: the sidecar and any temp file are
+#     removed at load and on every request, whatever the body's size.
+# Written to a per-write temp name + rename, so a reader never sees half a
+# body and two writers cannot truncate each other's temp file; a failed
+# rename removes its temp file. The line has its own kind so nothing that
+# replays proxy-events.jsonl mistakes it for a second request.
+LATEST_BODY_FILE_NAME = "latest-request-body.json"
+_LATEST_BODY_CAP = 16 * 1024 * 1024
+
+
+def _latest_body_path():
+    if not OUT_PATH:
+        return None
+    return os.path.join(os.path.dirname(OUT_PATH), LATEST_BODY_FILE_NAME)
+
+
+def _remove_latest_body() -> None:
+    target = _latest_body_path()
+    if target is None:
+        return
+    directory = os.path.dirname(target)
+    try:
+        os.remove(target)
+    except OSError:
+        pass
+    # Temp files of this sidecar (a crash between write and rename leaves one).
+    try:
+        for name in os.listdir(directory):
+            if name.startswith(LATEST_BODY_FILE_NAME + ".") and name.endswith(".tmp"):
+                try:
+                    os.remove(os.path.join(directory, name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def _write_latest_body(flow_id, content: bytes) -> None:
+    target = _latest_body_path()
+    if target is None:
+        return
+    if _REQUEST_BODY_FILE_BUDGET == 0 or len(content) > _LATEST_BODY_CAP:
+        _remove_latest_body()
+        return
+    temp = "%s.%d.%s.tmp" % (target, os.getpid(), flow_id)
+    try:
+        with open(temp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "kind": "request-body-latest",
+                "flow_id": flow_id,
+                "body_b64": base64.b64encode(content).decode("ascii"),
+            }) + "\n")
+        os.replace(temp, target)
+    except OSError:
+        # Forensics only: a failed side write must never disturb the proxy.
+        # Drop the temp file and any now-stale sidecar, so "latest" is never
+        # an older prompt.
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+
+
+# Switching an existing run to zero must stop capture at once, even if no
+# further request arrives (review of #62, round 2).
+if _REQUEST_BODY_FILE_BUDGET == 0:
+    _remove_latest_body()
+
+
 # How many leading characters of each system-prompt text block we ship
 # to the adapter. The longest known sidecar fingerprint prefix is ~50
 # chars (see SIDECAR_SYSTEM_PROMPT_PREFIXES in ClaudeProxyAdapter.ts);
@@ -548,8 +691,16 @@ def request(flow: http.HTTPFlow) -> None:
                 # adapters that haven't been updated to read
                 # request_shape yet. Past the cap we drop silently —
                 # request_shape already covers the predicate's needs.
-                if len(content) <= _REQUEST_BODY_CAP:
+                # See LATEST_BODY_FILE_NAME for the sidecar's invariant.
+                if _events_file_over_budget():
+                    payload["body_omitted"] = "file-budget"
+                    _write_latest_body(payload["flow_id"], content)
+                elif len(content) > _REQUEST_BODY_CAP:
+                    payload["body_omitted"] = "body-cap"
+                    _write_latest_body(payload["flow_id"], content)
+                else:
                     payload["body_b64"] = base64.b64encode(content).decode("ascii")
+                    _remove_latest_body()
         except Exception as exc:
             payload["body_error"] = str(exc)
 
