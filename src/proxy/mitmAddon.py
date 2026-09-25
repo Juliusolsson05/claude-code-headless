@@ -147,10 +147,45 @@ def _events_file_over_budget() -> bool:
     if not OUT_PATH:
         return False
     try:
-        return os.path.getsize(OUT_PATH) >= _REQUEST_BODY_FILE_BUDGET
+        size = os.path.getsize(OUT_PATH)
     except OSError:
-        # No file yet (first event) or unreadable: nothing written counts.
-        return False
+        # No file yet: nothing has been written, so its size is 0. Returning
+        # False here instead let a budget of 0 ("never keep bodies") still
+        # write the FIRST request's body (review of #62).
+        size = 0
+    return size >= _REQUEST_BODY_FILE_BUDGET
+
+
+# Past the budget, the NEWEST body is still kept, alone, in a sidecar next to
+# the events file, overwritten on every request (review of #62).
+#
+# WHY: omitting bodies lost exactly the prompts a bug report is about — the
+# recent ones. Agent Code's debug bundle carries only the last 5 MiB of the
+# events file, and on the two largest real logs every /v1/messages request in
+# that tail had a body today. Because every Claude request re-sends the whole
+# conversation, the latest body alone reconstructs every prompt so far, and
+# the sidecar is bounded by one body (_REQUEST_BODY_CAP). Written temp +
+# rename so a reader never sees half a body. The line has its own kind so
+# nothing that replays proxy-events.jsonl mistakes it for a second request.
+LATEST_BODY_FILE_NAME = "latest-request-body.json"
+
+
+def _write_latest_body(flow_id, content: bytes) -> None:
+    if not OUT_PATH:
+        return
+    target = os.path.join(os.path.dirname(OUT_PATH), LATEST_BODY_FILE_NAME)
+    temp = target + ".tmp"
+    try:
+        with open(temp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "kind": "request-body-latest",
+                "flow_id": flow_id,
+                "body_b64": base64.b64encode(content).decode("ascii"),
+            }) + "\n")
+        os.replace(temp, target)
+    except OSError:
+        # Forensics only: a failed side write must never disturb the proxy.
+        pass
 
 
 # How many leading characters of each system-prompt text block we ship
@@ -602,6 +637,7 @@ def request(flow: http.HTTPFlow) -> None:
                 if len(content) <= _REQUEST_BODY_CAP:
                     if _events_file_over_budget():
                         payload["body_omitted"] = "file-budget"
+                        _write_latest_body(payload["flow_id"], content)
                     else:
                         payload["body_b64"] = base64.b64encode(content).decode("ascii")
         except Exception as exc:
