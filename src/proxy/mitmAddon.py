@@ -187,6 +187,36 @@ _write_failure_reported = False
 _pending_generation = None
 
 
+def _resume_interrupted_rotation():
+    """Finish a rotation a previous addon process began but did not complete.
+
+    WHY (final review of #64, a): the rename and the header publication are
+    two steps. An addon that exits between them (mitmdump killed, the
+    session's proxy restarted) leaves `.1` and NO live file, and the pending
+    generation lived only in that process's memory. The restarted addon then
+    appended to a fresh, headerless file, so numbering restarted at 0; after
+    the next rotation the tail — still holding the old generation 0 — took
+    the new file's `.1` for one it had already settled, and a whole
+    generation of events vanished with lostGenerations 0.
+
+    A missing live file next to an existing `.1` can only mean that half
+    finished rotation (or someone deleting the live file, where continuing
+    the chain is equally right), so the next generation is published before
+    the first write, exactly as the in-process retry would have done.
+    """
+    global _pending_generation
+    if not OUT_PATH or os.path.exists(OUT_PATH) or not os.path.exists(_rotated_path()):
+        return
+    previous = _generation_of(_rotated_path())
+    try:
+        _start_next_generation(previous)
+    except OSError:
+        _pending_generation = previous
+
+
+_resume_interrupted_rotation()
+
+
 def _write(payload):
     """Append one event; NEVER raise.
 

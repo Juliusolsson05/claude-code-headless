@@ -402,6 +402,54 @@ addon._start_next_generation = _flaky_start
     expect(generationOf(rotatedEventsPath(ws.events))).toBe(4)
   })
 
+  // Final review of #64 (a): the addon exited between renaming the live file to `.1` and publishing
+  // the next header. The restarted addon wrote a headerless file (generation 0 again); after its
+  // next rotation the tail, still holding the ORIGINAL generation 0, took that file's `.1` for one
+  // it had settled, and a whole generation vanished with lostGenerations 0.
+  it('a restarted addon finishes a rotation its predecessor was killed in the middle of', async () => {
+    const ws = workspace()
+    streamTurn(ws, [0, 1], null)
+    const tail = new EventsFileTail(ws.events)
+    const first = await drain(tail)
+    expect(chunkSeqs(first.lines)).toEqual([0, 1])
+    // The kill: the rename happened, the next generation's header never did.
+    renameSync(ws.events, rotatedEventsPath(ws.events))
+    // The restarted addon: one turn that rotates exactly once part-way (~1.44 KB per turn).
+    streamTurn(ws, [2, 3], 1000)
+    const second = await drain(tail)
+    expect(chunkSeqs(second.lines)).toEqual([2, 3])
+    expect(second.lost).toBe(0)
+    expect(generationOf(ws.events)).toBe(2)
+    await tail.close()
+  })
+
+  // Final review of #64 (a), a surviving mutation: writing the header straight to the live path
+  // passed every test. A reader must never see a live file without its generation, so the header
+  // is written to a temp file and published with one atomic replace.
+  it('publishes each new generation with an atomic replace, never by writing the live path', () => {
+    const ws = workspace()
+    streamTurn(ws, [0], 100, `
+import os as _os
+_real_replace = _os.replace
+_published = []
+def _watch_replace(src, dst):
+    if dst == addon.OUT_PATH and str(src).endswith(".gen.tmp"):
+        with open(src, "r", encoding="utf-8") as fh:
+            _published.append(fh.readline())
+    return _real_replace(src, dst)
+addon.os.replace = _watch_replace
+import atexit
+def _report():
+    with open(addon.OUT_PATH + ".published", "w") as fh:
+        fh.write("".join(_published))
+atexit.register(_report)
+`)
+    const published = readFileSync(`${ws.events}.published`, 'utf8').trim().split('\n')
+    // Every rotation of the turn published its header through the temp file, in order.
+    expect(published.length).toBeGreaterThanOrEqual(3)
+    expect(published.map(line => (JSON.parse(line) as { generation: number }).generation)).toEqual(published.map((_, index) => index + 1))
+  })
+
   it('never raises out of a hook when the events file cannot be written at all', () => {
     const ws = workspace()
     // The parent directory does not exist, so every append fails.
