@@ -77,6 +77,17 @@ export type HeadlessTerminalOptions = {
    *  and streaming-card extraction are all human-timescale, and
    *  paste-confirmation waits have multi-second timeouts. */
   snapshotIntervalMs?: number
+  /**
+   * An extra, owner-supplied term for the text-only change gate
+   * (agent-code#1253). Called on every flush that the text gate would
+   * otherwise drop; a different value from the last emitted frame's lets the
+   * frame through. The owner keeps it CHEAP and returns a constant ('') in the
+   * common case. ClaudeCodeHeadless returns the slash picker's selected row,
+   * and only while a picker is visible, because selection there is
+   * colour-only. See the gate's KNOWN TRADEOFF comment for why the gate itself
+   * stays attribute-blind.
+   */
+  gateSignature?: () => string
 }
 
 export type ScreenSnapshot = {
@@ -249,6 +260,8 @@ export class HeadlessTerminal extends EventEmitter {
   // negligible next to the churn it prevents.
   private lastEmittedPlain: string | null = null
   private lastEmittedRecent: string | null = null
+  private lastEmittedSignature = ''
+  private readonly gateSignature: (() => string) | undefined
   // Chrome-blind keys of the last emitted frame plus the markdown strings
   // emitted with it (agent-code#765). WHY the markdown is retained: a frame
   // whose normalized keys equal the last emit's differs only in spinner
@@ -264,6 +277,7 @@ export class HeadlessTerminal extends EventEmitter {
     super()
     this.pty = options.pty
     this.snapshotIntervalMs = options.snapshotIntervalMs ?? 100
+    this.gateSignature = options.gateSignature
 
     const cols = options.cols ?? 120
     const rows = options.rows ?? 40
@@ -629,9 +643,17 @@ export class HeadlessTerminal extends EventEmitter {
       // stays the right default.
       const plain = this.snapshotPlain()
       const recent = this.snapshotRecent()
-      if (plain === this.lastEmittedPlain && recent === this.lastEmittedRecent) {
+      // WHY the signature is read only when the text is unchanged, and
+      // compared as a third term (agent-code#1253): a colour-only change
+      // (the slash picker's selected row) is exactly the attribute-only
+      // repaint the text gate drops. The owner's signature names the one
+      // attribute-driven fact it needs, cheaply, instead of making every
+      // frame attribute-aware (see KNOWN TRADEOFF above).
+      const signature = this.gateSignature?.() ?? ''
+      if (plain === this.lastEmittedPlain && recent === this.lastEmittedRecent && signature === this.lastEmittedSignature) {
         return
       }
+      this.lastEmittedSignature = signature
       // Second gate, one level softer (agent-code#765): the text DID change,
       // but did anything other than spinner chrome change? Normalize both
       // strings (glyph at line start → fixed token, timers → `Ns`, token

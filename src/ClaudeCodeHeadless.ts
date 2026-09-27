@@ -481,6 +481,17 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // of silent shadowing that would undo the 60Hz→10Hz fix
       // (agent-code#390) the next time someone edits only one of them.
       snapshotIntervalMs: options.snapshotIntervalMs,
+      // agent-code#1253: arrowing through the slash picker can change only the
+      // highlight colour, with byte-identical text, and the text gate then
+      // dropped the frame, so the picker was never reparsed. While a picker is
+      // visible (the last parsed state), the selected row joins the gate. With
+      // no picker this is a constant '' and costs one property read: the
+      // common frame stays attribute-blind (agent-code#390).
+      gateSignature: () => {
+        if (!this.pickerState.visible) return ''
+        const selected = detectSlashPicker(this.terminal.getTerminal()).items.find(item => item.selected)
+        return `picker:${selected?.id ?? ''}`
+      },
     })
 
     // Proxy adapter is created lazily — only when the consumer opted
