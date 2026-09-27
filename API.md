@@ -1434,7 +1434,7 @@ adding it here alone: `spawnClaudeWithProxy` sets a loopback-only
 | Event | Args | Description |
 | --- | --- | --- |
 | `event` | `[ProxyCapturedEvent]` | A captured proxy event (`Record<string, unknown>` — feed straight into `handleProxyTransportEvent` / the adapter). |
-| `transport-gap` | `[TransportGap]` | `{ lostGenerations, since, until }`: whole rotated generations of the events file were deleted before the poller read them (it stalled through >= two rotations). Emitted **in order**, between the `event`s written before and after the loss, so a consumer can react at the gap's place — call the adapter's `sealFlowsForTransportGap()` here. `since` (when the tail was last caught up; `null` before the first poll) to `until` (when the gap was seen) is the app-clock window the lost events were written in; the events carry no timestamps of their own. |
+| `transport-gap` | `[TransportGap]` | `{ lostGenerations, since, until }`: whole rotated generations of the events file were deleted before the poller read them (it stalled through >= two rotations). Emitted **in order**, between the `event`s written before and after the loss, so a consumer can react at the gap's place — call the adapter's `sealFlowsForTransportGap()` here. `since` (when the previous poll started reading, a lower bound even for a loss that landed mid-poll; `null` before the first poll) to `until` (when the gap was seen) is the app-clock window the lost events were written in; the events carry no timestamps of their own. |
 | `stdout` | `[string]` | mitmdump stdout. |
 | `stderr` | `[string]` | mitmdump stderr. |
 
