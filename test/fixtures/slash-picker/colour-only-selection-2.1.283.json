@@ -1,0 +1,51 @@
+{
+ "recordedAt": "2026-09-27",
+ "claudeCodeVersion": "2.1.283",
+ "cols": 100,
+ "rows": 32,
+ "note": "Real Claude Code PTY output for agent-code#1253. See README.md for how it was recorded, sliced and redacted.",
+ "steps": [
+  {
+   "step": "open-filtered",
+   "chunks": [
+    "\u001b7\u001b[r\u001b8\u001b[?25h",
+    "\u001b[?25l",
+    "\u001b[?2004h\u001b[?2031h\u001b[?1004h",
+    "\u001b[>4m\u001b[<u\u001b[?1004l\u001b[?2031l\u001b[?2004l",
+    "\u001b[>0q\u001b[?u\u001b[c\u001b[?2004h\u001b[?2031h\u001b[?1004h",
+    "\u001b]0;\u2733 Claude Code\u0007",
+    "\u001b[?1049h\u001b[2J\u001b[H\u001b[?1000h\u001b[?1002h\u001b[?1003h\u001b[?1006h\u001b[?25l\u001b[H\r\u001b[1B\u001b[38;2;215;119;87m \u2590\u001b[48;2;0;0;0m\u259b\u2588\u2588\u2588\u259b\u2588\u001b[12G\u001b[39m\u001b[49m\u001b[1mClaude Code\u001b[24G\u001b[22m\u001b[38;2;153;153;153mv2.1.283\r\u001b[1B\u001b[38;2;215;119;87m\u259d\u259c\u001b[48;2;0;0;0m\u2588\u2588\u2588\u2588\u2588\u001b[49m\u2588\u2580\u001b[12G\u001b[38;2;153;153;153mOpus 5.5 \u00b7 Claude XXX\r\u001b[1B\u001b[38;2;215;119;87m \u259d\u259d   \u259d\u259d \u001b[12G\u001b[38;2;153;153;153m/private/tmp/picker-xxxxxx\r\u001b[80C\u001b[23B\u25d0 medium \u00b7 /effort\r\u001b[1B\u001b[38;2;136;136;136m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\u001b[1B\u001b[39m\u276f\u00a0\u001b[7m \r\u001b[1B\u001b[27m\u001b[38;2;136;136;136m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+    "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\u001b[2C\u001b[1B\u001b[38;2;255;193;7m\u26a0 Transcript saving is off \u2014 inherited CLAUDE_CODE_CHILD_SESSION marker\u001b[38;2;153;153;153m \u00b7 restart with CLAUDE_C\u2026\r\u001b[2C\u001b[1B\u001b[38;2;255;107;128m\u23f5\u23f5 bypass permissions on\u001b[38;2;153;153;153m (shift+tab to cycle)\u001b[39m\u001b[32;1H\u001b[29;3H",
+    "\u001b[>0q\u001b[?u\u001b[c",
+    "\u001b(B\u000f\u001b[?2004h\u001b[?1000h\u001b[?1002h\u001b[?1003h\u001b[?1006h",
+    "\u001b[H\r\u001b[2C\u001b[22B\u001b[38;2;177;185;249m/\u001b[1mco\u001b[22mpy                                \u001b[1mCo\u001b[22mpy Claude's last response to clipboard (or /copy N for\r\u001b[39C\u001b[1Bthe Nth-latest)\r\u001b[2C\u001b[1B\u001b[38;2;153;153;153m/\u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mlor                               Set the prompt bar \u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mlor for this session\r\u001b[2C\u001b[1B/\u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mnfig                              Open settings\r\u001b[2C\u001b[1B/\u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mmpact                             Free up \u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mntext by summarizing the conversation so far\u001b[39m\u001b[K\r\u001b[2C\u001b[2B/co\u001b[7m \u001b[27m\u001b[32;1H\u001b[29;6H"
+   ]
+  },
+  {
+   "step": "arrow-down-1",
+   "chunks": [
+    "\u001b[H\r\u001b[2C\u001b[22B\u001b[38;2;153;153;153m/\u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mpy                                \u001b[39m\u001b[1mCo\u001b[22m\u001b[38;2;153;153;153mpy Claude's last response to clipboard (or /copy N for\r\u001b[39C\u001b[1Bthe Nth-latest)\r\u001b[2C\u001b[1B\u001b[38;2;177;185;249m/\u001b[1mco\u001b[22mlor                               Set the prompt bar \u001b[1mco\u001b[22mlor for this session\u001b[39m\u001b[32;1H\u001b[29;6H"
+   ]
+  },
+  {
+   "step": "arrow-down-2",
+   "chunks": [
+    "\u001b[H\r\u001b[2C\u001b[22B\u001b[K\r\u001b[2C\u001b[1B\u001b[38;2;153;153;153m/\u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mlor                               Set\u001b[44Gthe promp\u001b[54G bar \u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mlor for this session\r\u001b[5C\u001b[1B\u001b[38;2;177;185;249mnfig\u001b[40GOpen s\u001b[47Gttings\u001b[39m\u001b[K\r\u001b[5C\u001b[1B\u001b[38;2;153;153;153mmpact\u001b[40GFr\u001b[43Ge\u001b[45Gup \u001b[39m\u001b[1mco\u001b[51G\u001b[22m\u001b[38;2;153;153;153mtext by summarizing the conversation so far\r\u001b[5C\u001b[1Bntex\u001b[40GVisualize current \u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mntext usa\u001b[70Ge as\u001b[75Ga colored grid\u001b[39m\u001b[K\u001b[32;1H\u001b[29;6H"
+   ]
+  },
+  {
+   "step": "arrow-up-1",
+   "chunks": [
+    "\u001b[H\r\u001b[2C\u001b[22B\u001b[38;2;153;153;153m/\u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mpy                                \u001b[39m\u001b[1mCo\u001b[22m\u001b[38;2;153;153;153mpy Claude's last response to clipboard (or /copy N for\r\u001b[2C\u001b[1B\u001b[39m                                     \u001b[38;2;153;153;153mthe\u001b[44GNth-lates\u001b[54G)\u001b[39m\u001b[K\r\u001b[5C\u001b[1B\u001b[38;2;177;185;249mlor \u001b[40GSet th\u001b[47G prompt bar \u001b[1mco\u001b[22mlor for this session\r\u001b[5C\u001b[1B\u001b[38;2;153;153;153mnfig \u001b[40GOp\u001b[43Gn\u001b[45Gsetti\u001b[51Ggs\u001b[39m\u001b[K\r\u001b[5C\u001b[1B\u001b[38;2;153;153;153mmpac\u001b[40GFree up \u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mntext by summarizin\u001b[70G the\u001b[75Gconversation so far\u001b[39m\u001b[32;1H\u001b[29;6H"
+   ]
+  },
+  {
+   "step": "escape",
+   "chunks": [
+    "\u001b[H\r\u001b[39C\u001b[22B\u001b[38;2;153;153;153m \u001b[39m\u001b[1mCo\u001b[22m\u001b[38;2;153;153;153mpy Claude's last response to clipboard (or /copy N for\r\u001b[39C\u001b[1B\u001b[39m \u001b[38;2;153;153;153mthe Nth-latest)\r\u001b[39C\u001b[1B\u001b[38;2;177;185;249m Set the prompt bar \u001b[1mco\u001b[22mlor for this se\u001b[78Gsion\r\u001b[39C\u001b[1B\u001b[38;2;153;153;153m Open se\u001b[49Gtings\r\u001b[39C\u001b[1B Fr\u001b[44Ge up \u001b[39m\u001b[1mco\u001b[22m\u001b[38;2;153;153;153mntext by su\u001b[63Gmarizing the conversation so far\u001b[39m\u001b[32;1H\u001b[29;6H",
+    "\u001b[H\r\u001b[2C\u001b[22B\u001b[K\r\u001b[40C\u001b[1B\u001b[K\r\u001b[2C\u001b[1B\u001b[K\r\u001b[2C\u001b[1B\u001b[K\r\u001b[2C\u001b[1B                                                                              \u001b[38;2;153;153;153m\u25d0 medium \u00b7\u001b[92G/effort\u001b[39m\u001b[32;1H\u001b[29;6H",
+    "\u001b[H\r\u001b[80C\u001b[26B\u001b[K\u001b[32;1H\u001b[29;6H"
+   ]
+  }
+ ]
+}

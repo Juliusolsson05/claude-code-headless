@@ -127,7 +127,13 @@ export function detectSlashPicker(term: TerminalInstance): SlashPickerState {
     // Split the row into (name, description). CC renders commands
     // with a run of 2+ spaces between the name column and the
     // description column.
-    const raw = line.translateToString(true).replace(/\s+$/, '')
+    // WHY trim BOTH ends (agent-code#1253): Claude Code 2.1.283 indents every
+    // picker row by two spaces ("  /copy   Copy Claude's…"). Splitting the
+    // untrimmed row on 2+ spaces made parts[0] the empty indent, the id check
+    // below rejected every row, and the picker was never detected at all on
+    // current Claude (recorded: test/fixtures/slash-picker). The first-cell
+    // scan above already skips leading spaces; the text split must too.
+    const raw = line.translateToString(true).trim()
     const parts = raw.split(/\s{2,}/)
     const id = (parts[0] ?? '').trim()
     const description = parts.slice(1).join(' ').trim()

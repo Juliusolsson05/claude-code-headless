@@ -427,7 +427,8 @@ Consequences for consumers:
 | `pty` | `IPty` | — (required) | PTY to mirror. Consumer owns its lifecycle. |
 | `cols` | `number` | `120` | Terminal columns. |
 | `rows` | `number` | `40` | Terminal rows. |
-| `snapshotIntervalMs` | `number` | `16` | Throttle interval (ms) for `screen` events. |
+| `snapshotIntervalMs` | `number` | `100` | Throttle interval (ms) for `screen` events. |
+| `gateSignature` | `(source: 'live' \| 'emitted') => string` | — | Optional extra term for the `screen` change gate, which otherwise compares text only. `'live'` is read from the grid ONLY on a flush whose text is unchanged, and a value that differs from the last emitted frame's lets the frame through. `'emitted'` is recorded right after a frame is emitted, once your `screen` handlers have run. Keep both cheap and return a constant (`''`) in the common case: the gate is text-only because per-frame attribute work is expensive. `ClaudeCodeHeadless` uses it for the slash picker's colour-only selection, and only while a picker is visible. |
 
 ### 4.2 Lifecycle
 
