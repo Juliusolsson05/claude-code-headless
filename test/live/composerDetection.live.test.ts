@@ -1,11 +1,13 @@
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { spawn } from 'node-pty'
 import { describe, expect, it } from 'vitest'
 
 import { HeadlessTerminal } from '../../src/terminal/HeadlessTerminal.js'
 import { parseClaudeComposerState } from '../../src/parsers/ScreenParser.js'
+import { createLiveClaudeCwd } from '../support/claudeLiveResidue.js'
+
+const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 // WHY this test exists, and why it is NOT in the default suite:
 //
@@ -30,7 +32,12 @@ import { parseClaudeComposerState } from '../../src/parsers/ScreenParser.js'
 // characters must classify as `drafted`.
 describe('live composer detection', () => {
   it('classifies real placeholders as empty and real typing as drafted', async () => {
-    const cwd = mkdtempSync(join(tmpdir(), 'composer-live-'))
+    // Not a bare mkdtemp (#1329): that left a trust entry, a transcript and
+    // the cwd in the developer's real Claude home on every run. See
+    // test/support/claudeLiveResidue.ts for why this placement avoids the
+    // trust entry and how the transcript is removed.
+    const live = createLiveClaudeCwd({ packageRoot })
+    const cwd = live.cwd
     const term = new HeadlessTerminal({
       // A PTY we own directly, so this bypasses attach() and drives the
       // terminal the same way writeForTest does in the unit tests.
@@ -52,11 +59,30 @@ describe('live composer detection', () => {
       parseClaudeComposerState(term.snapshotPlain(), term.snapshotComposerAttributes())
 
     try {
-      // A fresh temp cwd always shows the folder-trust dialog first.
-      await sleep(6000)
-      if (/trust (the )?(files|this folder)/i.test(term.snapshotPlain())) {
-        pty.write('1\r')
-        await sleep(7000)
+      // The folder-trust dialog, when Claude shows it. Waited for rather than
+      // sampled after a fixed sleep (a slow start missed it), and answered by
+      // moving the selection onto "Yes" rather than typing `1`: as of
+      // 2026-09-27 the dialog lists "No, exit" FIRST and preselects it, so the
+      // old blind `1\r` could never accept it (#1329, found on the first run
+      // after moving the cwd). Trust is saved once for the package's shared
+      // git directory; see test/support/claudeLiveResidue.ts.
+      // The dialog check comes FIRST in each pass: the dialog draws its own
+      // `─` rule, so testing for the composer's divider first exits the loop
+      // with the dialog still up.
+      for (let i = 0; i < 20; i++) {
+        if (/Yes, I trust this folder|trust (the )?(files|this folder)/i.test(term.snapshotPlain())) {
+          for (let step = 0; step < 3; step++) {
+            const selected = term.snapshotPlain().split('\n').find(line => line.trimStart().startsWith('❯'))
+            if (selected && /yes/i.test(selected)) break
+            pty.write('\x1b[B')
+            await sleep(300)
+          }
+          pty.write('\r')
+          await sleep(3000)
+          break
+        }
+        if (/─{10}/.test(term.snapshotPlain())) break
+        await sleep(1000)
       }
       // Wait for the composer box (a divider rule) to paint.
       for (let i = 0; i < 25 && !/─{10}/.test(term.snapshotPlain()); i++) await sleep(1000)
@@ -101,17 +127,25 @@ describe('live composer detection', () => {
       }
       if (!sawDimPlaceholder) {
         // Deliberately NOT a failure. A placeholder needs Claude to actually
-        // offer a suggestion, and an empty composer does not always carry one —
-        // a fresh temp cwd has no git history, so there is no example command
-        // to fall back on. Asserting it would make the canary flaky for a
-        // reason unrelated to drift. Say so loudly instead, so a run never
+        // offer a suggestion, and an empty composer does not always carry one
+        // (the scratch cwd sits inside the package's git repo, so example
+        // commands are possible but not guaranteed). Asserting it would make
+        // the canary flaky for a reason unrelated to drift. Say so loudly instead, so a run never
         // implies coverage it did not provide.
         console.warn(
           '[live] no dim placeholder appeared this run; the placeholder assertion did not execute',
         )
       }
     } finally {
-      pty.kill()
+      // Wait for Claude to exit before removing its transcript directory, or
+      // a late write recreates it after cleanup.
+      await new Promise<void>(resolveExit => {
+        pty.onExit(() => resolveExit())
+        pty.kill()
+        setTimeout(resolveExit, 10_000)
+      })
+      const residue = live.cleanup()
+      if (residue.length > 0) console.warn(`[live] could not remove: ${residue.join(', ')}`)
     }
   }, 150_000)
 })
