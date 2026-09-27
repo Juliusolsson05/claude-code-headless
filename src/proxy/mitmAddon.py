@@ -72,11 +72,69 @@ def _is_allowed_host(request) -> bool:
     return False
 
 
+# Live-file rotation (agent-code #1273, residual after #62).
+#
+# The per-file body budget below removed ~93 % of the growth, but responses,
+# stream chunks and body-less request records still append for as long as the
+# session lives, and a live run is never pruned (debugRetention skips anything
+# written in the last ten minutes). A Claude session left open for days grew
+# its file without bound.
+#
+# WHY rotate, and not stop writing past a budget: this file is not only a log,
+# it is the TRANSPORT to the app. ProxyServer tails it and the adapter builds
+# the live transcript from the `response-chunk` lines, so dropping chunks would
+# blank the live view. Rotation keeps every event flowing and bounds the disk:
+# at most this generation plus ONE previous one (`proxy-events.1.jsonl`), each
+# up to the threshold plus one line.
+#
+# WHY the writer rotates (not the app): this addon is the only writer, runs
+# single-threaded, and opens-appends-closes per line. So once os.replace()
+# returns, no later write can land in the old inode, and the tailer can drain
+# the renamed generation to its end without racing a writer. The tailer side
+# of this contract lives in eventsFileTail.ts (ROTATED_SUFFIX must match).
+#
+# 512 MiB: each generation still keeps the first 256 MiB of request bodies
+# (the per-file budget restarts with the fresh file) plus a long stretch of
+# body-less traffic; debug bundles ship only the last 5 MiB anyway. 0 or an
+# invalid value disables rotation (the old unbounded behaviour), for a
+# deliberate forensic capture.
+def _read_rotate_bytes():
+    raw = os.environ.get("PROXY_EVENTS_ROTATE_BYTES")
+    if raw:
+        try:
+            value = int(raw)
+            if value >= 0:
+                return value
+        except ValueError:
+            pass
+    return 512 * 1024 * 1024
+
+
+_ROTATE_BYTES = _read_rotate_bytes()
+
+
+def _rotated_path():
+    base, ext = os.path.splitext(OUT_PATH)
+    return base + ".1" + ext
+
+
 def _write(payload):
     if not OUT_PATH:
         return
     with open(OUT_PATH, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload) + "\n")
+        # tell() after an append is the file size: no extra stat per chunk.
+        size = fh.tell()
+    if _ROTATE_BYTES and size >= _ROTATE_BYTES:
+        try:
+            # Atomically replaces the previous generation; the next _write
+            # creates a fresh file. The rotated file always ends in "\n"
+            # because the line above was written whole before the rename.
+            os.replace(OUT_PATH, _rotated_path())
+        except OSError:
+            # Forensics must never disturb the proxy: keep appending to the
+            # current file and try again after the next line.
+            pass
 
 
 # Cap on the raw `body_b64` payload emitted to the adapter.
@@ -123,10 +181,11 @@ _REQUEST_BODY_CAP = 2 * 1024 * 1024
 # survives an addon restart that appends to the same run file, and one
 # stat() per /v1/messages request is negligible next to the request itself.
 #
-# The kept bodies are the EARLIEST ones. Each carries the full history up to
-# its turn, so the last kept body still decodes everything before the budget
-# was reached; turns after it are recoverable only from request_shape and the
-# responses. 256 MiB holds roughly a hundred 2 MiB turns, more than a typical
+# The kept bodies are the EARLIEST ones of each events-file generation (the
+# file rotates, see _write, and the budget restarts with the fresh file). Each
+# carries the full history up to its turn, so the last kept body still decodes
+# everything before the budget was reached; turns after it are recoverable only
+# from request_shape and the responses. 256 MiB holds roughly a hundred 2 MiB turns, more than a typical
 # session, and the override exists for a deliberate forensic capture.
 def _read_body_budget():
     raw = os.environ.get("PROXY_REQUEST_BODY_BUDGET_BYTES")
