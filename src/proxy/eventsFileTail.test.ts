@@ -478,6 +478,69 @@ atexit.register(_report)
     await tail.close()
   })
 
+  // agent-code#1381: a consumer has to know WHERE the lost span sits, not just
+  // how big it is. The held generation's unread tail was written BEFORE the
+  // lost generations and `.1`/live AFTER them, so a gap reported ahead of the
+  // whole batch would let the consumer apply pre-gap events after it acted on
+  // the gap (sealing a flow, then re-opening one from a pre-gap request).
+  it('says where in the batch the lost generations sat (#1381)', async () => {
+    const ws = workspace()
+    writeFileSync(ws.events, '{"kind":"a"}\n')
+    const tail = new EventsFileTail(ws.events)
+    expect((await tail.poll()).lines).toEqual(['{"kind":"a"}'])
+    appendFileSync(ws.events, '{"kind":"a2"}\n') // still generation 0, unread
+    rotateLikeAddon(ws.events, '{"kind":"b"}\n')
+    rotateLikeAddon(ws.events, '{"kind":"c"}\n')
+    rotateLikeAddon(ws.events, '{"kind":"d"}\n')
+    const poll = await tail.poll()
+    expect(poll.lines).toEqual(['{"kind":"a2"}', '{"kind":"c"}', '{"kind":"d"}'])
+    // b is gone, and it sat between a2 (index 0) and c (index 1).
+    expect(poll.gaps).toEqual([{ index: 1, lostGenerations: 1 }])
+    expect(poll.lostGenerations).toBe(1)
+    await tail.close()
+  })
+
+  // cch#69 review a: ONE poll can settle twice, its first adoption and then a
+  // rotation it notices mid-poll, and each lost span must be reported at its
+  // own place. Written order: a b c d(2 lines) e f g. The tail's first poll
+  // adopts d, settles below it (a and b lost, c read from .1), and while it
+  // checks the live path three more rotations land (e lost, f at .1, g live).
+  it('reports two lost spans in one poll as two gaps, each where it sat (#1381)', async () => {
+    const ws = workspace()
+    writeFileSync(ws.events, '{"kind":"a"}\n')
+    rotateLikeAddon(ws.events, '{"kind":"b"}\n')
+    rotateLikeAddon(ws.events, '{"kind":"c"}\n')
+    rotateLikeAddon(ws.events, '{"kind":"d"}\n{"kind":"d2"}\n')
+    const tail = new EventsFileTail(ws.events)
+    let rotatedMidPoll = false
+    fsHook.before = (call, path) => {
+      // The poll's rotation check is its only path stat() of the live file.
+      if (rotatedMidPoll || call !== 'stat' || path !== ws.events) return
+      rotatedMidPoll = true
+      rotateLikeAddon(ws.events, '{"kind":"e"}\n')
+      rotateLikeAddon(ws.events, '{"kind":"f"}\n')
+      rotateLikeAddon(ws.events, '{"kind":"g"}\n')
+    }
+    const poll = await tail.poll()
+    expect(rotatedMidPoll).toBe(true)
+    expect(poll.lines).toEqual(['{"kind":"c"}', '{"kind":"d"}', '{"kind":"d2"}', '{"kind":"f"}', '{"kind":"g"}'])
+    expect(poll.gaps).toEqual([{ index: 0, lostGenerations: 2 }, { index: 3, lostGenerations: 1 }])
+    expect(poll.lostGenerations).toBe(3)
+    await tail.close()
+  })
+
+  it('reports no gap positions in a run that lost nothing (#1381)', async () => {
+    const ws = workspace()
+    writeFileSync(ws.events, '{"kind":"a"}\n')
+    const tail = new EventsFileTail(ws.events)
+    await tail.poll()
+    rotateLikeAddon(ws.events, '{"kind":"b"}\n')
+    const poll = await tail.poll()
+    expect(poll.lines).toEqual(['{"kind":"b"}'])
+    expect(poll.gaps).toEqual([])
+    await tail.close()
+  })
+
   // Round 2 of the #64 review: a rotation before the tail's FIRST poll left the
   // old events at `.1`, never read and never reported.
   it('reads the previous generation when the first poll already finds a rotated file', async () => {
@@ -612,8 +675,111 @@ describe('ProxyServer events wiring (#1273)', () => {
       for (const n of [2, 3, 4]) rotateLikeAddon(ws.events, `{"kind":"response-end","flow_id":${n}}\n`)
       await poll()
       expect(events).toEqual([{ kind: 'response-end', flow_id: 1 }, { kind: 'response-end', flow_id: 3 }, { kind: 'response-end', flow_id: 4 }])
-      expect(gaps).toEqual([{ lostGenerations: 1 }])
+      expect(gaps).toEqual([{ lostGenerations: 1, since: expect.any(Number), until: expect.any(Number) }])
       expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+      await server.stop()
+    }
+  })
+
+  // agent-code#1381: the gap is emitted AT its place in the event order. The
+  // adapter seals the flows it is tracking when it hears the gap; an event
+  // written before the loss but delivered after the gap would otherwise be
+  // applied to a state the gap already closed.
+  // cch#69 review a: `since` must be a LOWER bound on when the lost events were
+  // written. Taken when the previous poll FINISHED, it could postdate a loss
+  // that landed while that poll was still running. And every gap of a poll is
+  // emitted, each at its own place.
+  it('never dates a gap window after the loss it covers, and emits every gap of a poll in place (#1381)', async () => {
+    const server = new ProxyServer({ eventsFile: '/nonexistent/events.jsonl' } as ProxyServerInfo)
+    const order: string[] = []
+    const gaps: Array<{ since: number | null; until: number }> = []
+    server.on('event', event => order.push(String((event as { kind: unknown }).kind)))
+    server.on('transport-gap', gap => { order.push('gap'); gaps.push(gap) })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    let clock = 100
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock)
+    let lostWrittenAt = 0
+    const line = (kind: string) => JSON.stringify({ kind })
+    const polls = [
+      async () => {
+        // The first poll reads a, and while it is still running the writer
+        // rotates through a generation that the next poll finds lost.
+        clock = 150
+        lostWrittenAt = clock
+        clock = 200
+        return { lines: [line('a')], gaps: [], lostGenerations: 0 }
+      },
+      async () => ({
+        lines: ['c', 'd', 'f', 'g'].map(line),
+        gaps: [{ index: 0, lostGenerations: 2 }, { index: 2, lostGenerations: 1 }],
+        lostGenerations: 3,
+      }),
+    ]
+    ;(server as unknown as { eventsTail: { poll(): Promise<unknown> } }).eventsTail = { poll: () => polls.shift()!(), close: async () => {} } as never
+    const poll = () => (server as unknown as { pollEventsOnce(): Promise<void> }).pollEventsOnce()
+    try {
+      await poll()
+      clock = 300
+      await poll()
+      expect(order).toEqual(['a', 'gap', 'c', 'd', 'gap', 'f', 'g'])
+      expect(gaps).toHaveLength(2)
+      for (const gap of gaps) {
+        expect(gap.since).not.toBeNull()
+        expect(gap.since!).toBeLessThanOrEqual(lostWrittenAt)
+        expect(gap.until).toBeGreaterThanOrEqual(lostWrittenAt)
+      }
+    } finally {
+      now.mockRestore()
+      warn.mockRestore()
+      await server.stop()
+    }
+  })
+
+  // cch#69 review c: a gap on the very first poll has no lower bound yet.
+  it('reports a gap on the first poll with since: null (#1381)', async () => {
+    const server = new ProxyServer({ eventsFile: '/nonexistent/events.jsonl' } as ProxyServerInfo)
+    const gaps: Array<{ since: number | null }> = []
+    server.on('transport-gap', gap => gaps.push(gap))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    ;(server as unknown as { eventsTail: unknown }).eventsTail = {
+      poll: async () => ({ lines: [], gaps: [{ index: 0, lostGenerations: 1 }], lostGenerations: 1 }),
+      close: async () => {},
+    }
+    try {
+      await (server as unknown as { pollEventsOnce(): Promise<void> }).pollEventsOnce()
+      expect(gaps).toEqual([expect.objectContaining({ since: null })])
+    } finally {
+      warn.mockRestore()
+      await server.stop()
+    }
+  })
+
+  it('emits the transport gap between the events written before and after the loss (#1381)', async () => {
+    const ws = workspace()
+    const server = new ProxyServer({ eventsFile: ws.events } as ProxyServerInfo)
+    const order: string[] = []
+    const gaps: Array<{ lostGenerations: number; since: number | null; until: number }> = []
+    server.on('event', event => order.push(`event:${String((event as { flow_id: unknown }).flow_id)}`))
+    server.on('transport-gap', gap => { order.push('gap'); gaps.push(gap) })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const poll = () => (server as unknown as { pollEventsOnce(): Promise<void> }).pollEventsOnce()
+    try {
+      appendFileSync(ws.events, '{"kind":"response-end","flow_id":1}\n')
+      await poll()
+      const caughtUpAt = Date.now()
+      appendFileSync(ws.events, '{"kind":"response-end","flow_id":2}\n') // before the loss, unread
+      for (const n of [3, 4, 5]) rotateLikeAddon(ws.events, `{"kind":"response-end","flow_id":${n}}\n`)
+      await poll()
+      expect(order).toEqual(['event:1', 'event:2', 'gap', 'event:4', 'event:5'])
+      // The window the lost events were written in: from when the tail was
+      // last caught up (the previous poll finished) to when the gap was seen.
+      const [gap] = gaps
+      expect(gap!.lostGenerations).toBe(1)
+      expect(gap!.since).not.toBeNull()
+      expect(gap!.since!).toBeLessThanOrEqual(caughtUpAt)
+      expect(gap!.until).toBeGreaterThanOrEqual(gap!.since!)
     } finally {
       warn.mockRestore()
       await server.stop()

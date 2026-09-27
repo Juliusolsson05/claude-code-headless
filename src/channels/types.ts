@@ -611,8 +611,13 @@ export type SemanticTurnStoppedEvent = {
    *  an Esc interrupt is the common cause (agent-code #1040), but so is a
    *  proxy inactivity timeout or an upstream failure, and mitmproxy's error
    *  text cannot tell them apart (it says "Client disconnected." for its own
-   *  timeout too). It says what is known and nothing more. */
-  interruption?: 'system-suspended' | 'transport-error'
+   *  timeout too). It says what is known and nothing more.
+   *  `transport-gap`: the events transport between mitmdump and this adapter
+   *  LOST a span of events (rotated generations deleted unread, agent-code
+   *  #1381), so this turn is missing frames. Unlike the two above it says
+   *  nothing about why the stream ended — only that this adapter did not see
+   *  all of it (`ClaudeProxyAdapter.sealFlowsForTransportGap`). */
+  interruption?: 'system-suspended' | 'transport-error' | 'transport-gap'
   /** Upstream value exactly as delivered. Null means "stream ended
    *  without a message_delta", which is a soft error. */
   stopReason:
