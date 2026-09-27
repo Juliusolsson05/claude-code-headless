@@ -467,7 +467,10 @@ export class ProxyServer extends EventEmitter {
  * user's shell (or set by any parent process) would silently re-enable the
  * unbounded secret-bearing file this option exists to keep off. The only way
  * to get a key log is the explicit option, and it always lands in this
- * run's directory, where debug retention can find and remove it.
+ * run's directory. That keeps it next to the run it belongs to; it does NOT
+ * guarantee cleanup. Agent Code's debug retention collects a run directory
+ * only once it holds `proxy-events.jsonl`, and #1380 review c found 23 older
+ * key-log-only run dirs it never collects (an app follow-up).
  */
 export function buildMitmdumpEnv(
   inherited: NodeJS.ProcessEnv,
