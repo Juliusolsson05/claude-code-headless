@@ -559,6 +559,14 @@ type FlowState = {
    *  pins activeStreamingFlowId forever and turns every later flow
    *  into a `flow_ignored` event. */
   lastChunkAt: number
+  /** Set when a transport gap was sealed while this flow had seen only its
+   *  request (agent-code#1381, cch#69 review b). Its response may have
+   *  begun inside the lost span, or after it. The first post-gap chunk
+   *  decides: one that opens with `message_start` (or is a prefix of it,
+   *  since the transport cuts chunks anywhere) is the whole response and
+   *  streams normally; anything else begins mid-SSE and the flow is
+   *  forgotten. Holds the text seen so far while that prefix is undecided. */
+  awaitingStartAfterGap: string | null
 }
 
 /** System-prompt prefixes that identify Claude Code's auxiliary
@@ -987,6 +995,7 @@ export class ClaudeProxyAdapter {
       // to send its first SSE chunk (e.g. slow upstream) doesn't look
       // "stale" to the watchdog the very first time onChunk runs.
       lastChunkAt: Date.now(),
+      awaitingStartAfterGap: null,
     }
     // Prefer the addon's pre-extracted request_shape over parsing
     // body_b64 inline. The addon path works for any body size (it
@@ -1057,8 +1066,13 @@ export class ClaudeProxyAdapter {
   private onChunk(flowId: string, event: ProxyTransportEvent): void {
     const state = this.flows.get(flowId)
     if (!state) return
-    const b64 = event.chunk_b64
+    let b64 = event.chunk_b64
     if (typeof b64 !== 'string' || !b64) return
+    if (state.awaitingStartAfterGap !== null) {
+      const decided = this.startsAfterGap(state, b64)
+      if (decided === null) return
+      b64 = decided
+    }
 
     // Bump lastChunkAt for the watchdog. We do this for every chunk on
     // every flow (active, candidate, secondary) so the timestamp
@@ -1324,17 +1338,37 @@ export class ClaudeProxyAdapter {
    *   - a turn that already STOPPED (a tool message that ended cleanly, now
    *     awaiting its tool) keeps its phase — the gap says nothing about the
    *     tool running locally, the same rule onTransportError follows;
-   *   - every flow is then forgotten, including one that saw only its request:
-   *     its first chunks may be in the lost span, and a decoder started on a
-   *     post-gap chunk would begin mid-SSE. Their later chunks are ignored
-   *     (onChunk drops unknown flows); a NEW request streams normally.
+   *   - every flow that streamed is then forgotten: its later chunks are
+   *     ignored (onChunk drops unknown flows), and a NEW request streams
+   *     normally;
+   *   - a flow that saw only its request is KEPT, pending proof (cch#69
+   *     review b): its response may have begun inside the lost span or after
+   *     it. The first post-gap chunk decides (startsAfterGap). If it opens
+   *     with `message_start`, the response is whole and streams. If it begins
+   *     mid-SSE, the flow is forgotten. Forgetting it unconditionally lost an
+   *     intact live turn.
    *
    * Synchronous and timer-free like sealFlowsSilentSince, so the host can call
    * it at the gap's place in the event stream and tests can drive it against
    * recorded sequences.
    */
   sealFlowsForTransportGap(): void {
-    for (const state of [...this.flows.values()]) {
+    // The phase owner goes LAST (cch#69 review b). Releasing a flow hands
+    // phase ownership to the next streaming flow, so sealing an awaiting-tool
+    // owner first made the next sealed flow the owner, and its reap published
+    // idle while the tool was still running locally. Sealed last, every
+    // earlier seal is a non-owner whose publishPhase is a no-op, and the owner
+    // applies its own rule: idle if it was streaming, kept if it stopped.
+    const ordered = [...this.flows.values()].sort(
+      (a, b) => Number(a.flowId === this.phaseOwnerFlowId) - Number(b.flowId === this.phaseOwnerFlowId),
+    )
+    for (const state of ordered) {
+      if (state.attribution === 'candidate') {
+        // Only its request was seen: kept, pending the proof its response
+        // starts after the gap (see awaitingStartAfterGap).
+        state.awaitingStartAfterGap = ''
+        continue
+      }
       if (state.attribution === 'active' && state.turnStarted && !state.turnStopped) {
         // Deletes and releases the flow itself.
         this.reapStaleActiveFlow(state, 'transport-gap')
@@ -1344,6 +1378,33 @@ export class ClaudeProxyAdapter {
       this.flows.delete(state.flowId)
       this.releaseStreamingFlow(state.flowId)
     }
+  }
+
+  /** Decide a gap-sealed candidate from its first post-gap chunk(s).
+   *  Returns the base64 to decode (the held prefix plus this chunk) once the
+   *  response provably opens with `message_start`, or null to drop the chunk:
+   *  still undecided (a prefix of the opening frame), or the flow began
+   *  inside the lost span and is forgotten. */
+  private startsAfterGap(state: FlowState, b64: string): string | null {
+    const OPENING = 'event: message_start'
+    const held = state.awaitingStartAfterGap ?? ''
+    const bytes = Buffer.from(b64, 'base64')
+    // Decoded only to COMPARE; what is returned is the raw bytes, because a
+    // chunk can end inside a multi-byte character and a string round trip
+    // would corrupt it. The held prefix is always ASCII (a prefix of OPENING).
+    const seen = held + bytes.toString('utf8')
+    if (seen.startsWith(OPENING)) {
+      state.awaitingStartAfterGap = null
+      return held ? Buffer.concat([Buffer.from(held, 'ascii'), bytes]).toString('base64') : b64
+    }
+    if (OPENING.startsWith(seen)) {
+      state.awaitingStartAfterGap = seen
+      return null
+    }
+    this.onDiagnostic(`flow ${state.flowId} forgotten after a transport gap (its response began inside the lost span)`)
+    this.flows.delete(state.flowId)
+    this.releaseStreamingFlow(state.flowId)
+    return null
   }
 
   private closeTurnAfterTerminalApiError(

@@ -105,18 +105,47 @@ describe('a transport gap across a live stream (agent-code#1381)', () => {
     expect(events.slice(before)).toEqual([])
   })
 
-  it('forgets a flow whose first chunks may be in the lost span', () => {
-    // A request seen, no chunk yet: its response may have begun inside the
-    // gap, so a decoder starting on a post-gap chunk would begin mid-SSE.
+  it('keeps a request-only flow whose response provably starts after the gap', () => {
+    // cch#69 review b: a request seen, no chunk yet. If its first post-gap
+    // chunk opens with message_start, the response began after the loss and
+    // is whole; dropping it lost an intact live turn.
     const { adapter, events, request, chunk } = mount()
     request(1)
     adapter.sealFlowsForTransportGap()
     chunk(1, streaming('msg_after'))
+    expect(events.filter(ev => ev.type === 'turn_started')).toHaveLength(1)
+  })
+
+  it('forgets a request-only flow whose first post-gap chunk begins mid-SSE', () => {
+    // Its opening frames were in the lost span: a decoder started here
+    // would assemble a message without its start.
+    const { adapter, events, request, chunk } = mount()
+    request(1)
+    adapter.sealFlowsForTransportGap()
+    chunk(1, streaming('msg_cut').slice(1))
+    adapter.handleTransportEvent({ kind: 'response-end', flow_id: 1 })
     expect(events.filter(ev => ev.type === 'turn_started')).toHaveLength(0)
     // A NEW request after the gap streams normally.
     request(2)
     chunk(2, streaming('msg_next'))
     expect(events.filter(ev => ev.type === 'turn_started')).toHaveLength(1)
+  })
+
+  it('accepts a message_start split across the first post-gap chunks', () => {
+    // The transport cuts chunks anywhere; a first chunk that is a prefix of
+    // the opening frame is still the response's start.
+    const { adapter, events, request } = mount()
+    request(1)
+    adapter.sealFlowsForTransportGap()
+    // Cut mid-frame, and the second cut inside a multi-byte character, so a
+    // string round trip of the held prefix would corrupt the text.
+    const bytes = Buffer.from(sse([...streaming('msg_split').slice(0, 2), { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'café' } }]))
+    const cut = bytes.indexOf(Buffer.from('é')) + 1
+    for (const part of [bytes.subarray(0, 9), bytes.subarray(9, cut), bytes.subarray(cut)]) {
+      adapter.handleTransportEvent({ kind: 'response-chunk', flow_id: 1, path: '/v1/messages', chunk_b64: part.toString('base64') })
+    }
+    expect(events.filter(ev => ev.type === 'turn_started')).toHaveLength(1)
+    expect(events.filter(ev => ev.type === 'turn_delta').at(-1)?.fullText).toBe('café')
   })
 
   it('leaves a completed turn waiting for its tool instead of calling it idle', () => {
@@ -135,6 +164,50 @@ describe('a transport gap across a live stream (agent-code#1381)', () => {
     adapter.sealFlowsForTransportGap()
     expect(phases(events).at(-1)).toBe('awaiting-tool')
     expect(events.filter(ev => ev.type === 'turn_stopped')).toHaveLength(1)
+  })
+
+  it('keeps a stopped turn\'s awaiting-tool phase when a concurrent flow is sealed with it', () => {
+    // cch#69 review b: sealing the awaiting-tool flow first handed phase
+    // ownership to the still-streaming flow, whose seal then published idle
+    // while the tool was still running locally.
+    const { adapter, events, request, chunk } = mount()
+    request(1)
+    chunk(1, [
+      { type: 'message_start', message: { id: 'msg_tool', model: MODEL, usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+      { type: 'message_stop' },
+    ])
+    request(2)
+    chunk(2, streaming('msg_parallel'))
+    expect(phases(events).at(-1)).toBe('awaiting-tool')
+
+    adapter.sealFlowsForTransportGap()
+
+    expect(phases(events).at(-1)).toBe('awaiting-tool')
+    const stopped = events.filter(ev => ev.type === 'turn_stopped')
+    expect(stopped.at(-1)).toMatchObject({ interruption: 'transport-gap' })
+  })
+
+  it('seals every concurrent streaming turn, not only the first', () => {
+    const { adapter, events, request, chunk } = mount()
+    request(1)
+    chunk(1, streaming('msg_one'))
+    request(2)
+    chunk(2, streaming('msg_two'))
+    adapter.sealFlowsForTransportGap()
+    expect(events.filter(ev => ev.type === 'turn_stopped' && ev.interruption === 'transport-gap')).toHaveLength(2)
+  })
+
+  it('gives back the spinner of a flow that streamed its first chunk but has no turn yet', () => {
+    const { adapter, events, request, chunk } = mount()
+    request(1)
+    // A first chunk with no complete frame: requesting, no message_start yet.
+    adapter.handleTransportEvent({ kind: 'response-chunk', flow_id: 1, path: '/v1/messages', chunk_b64: Buffer.from('event: message_st').toString('base64') })
+    expect(phases(events).at(-1)).toBe('requesting')
+    adapter.sealFlowsForTransportGap()
+    expect(phases(events).at(-1)).toBe('idle')
   })
 
   it('is a no-op when nothing is being tracked', () => {
