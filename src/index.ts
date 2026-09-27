@@ -297,6 +297,7 @@ export {
   buildMitmdumpArgs,
   type ProxyServerInfo,
   type ProxyServerEvents,
+  type TransportGap,
   type ProxyCapturedEvent,
 } from './proxy/proxyServer.js'
 export {

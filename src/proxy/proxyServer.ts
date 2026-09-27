@@ -31,13 +31,26 @@ export type ProxyServerInfo = {
   allowedHosts?: string[]
 }
 
+/** See ProxyServerEvents['transport-gap']. */
+export type TransportGap = { lostGenerations: number; since: number | null; until: number }
+
 export type ProxyServerEvents = {
   event: [ProxyCapturedEvent]
   /** Whole events-file generations were rotated away and deleted before the
    *  tail read them, so their events never reached `event` (#1273; see
    *  EventsFileTail's delivery contract). Only after the poller stalled for
-   *  >= two rotations' worth of traffic. */
-  'transport-gap': [{ lostGenerations: number }]
+   *  >= two rotations' worth of traffic.
+   *
+   *  Emitted IN ORDER (agent-code#1381): after every `event` written before the
+   *  lost span and before every one written after it, so a consumer that
+   *  closes open state on a gap never applies a pre-gap event to state it
+   *  already closed. `since`..`until` is the app-clock window the lost events
+   *  were written in: `since` is when this tail was last caught up (the
+   *  previous poll finished; null before the first), `until` is when the gap
+   *  was seen. The events themselves carry no timestamp, so this window is
+   *  the tightest honest bound — possibly wider than the loss, never
+   *  narrower. */
+  'transport-gap': [TransportGap]
   stderr: [string]
   stdout: [string]
 }
@@ -134,6 +147,8 @@ export class ProxyServer extends EventEmitter {
   // alive). Skipping a tick is always safe — the next tick reads from the
   // same offset.
   private pollInFlight = false
+  /** When the last poll finished, i.e. the tail was caught up (see TransportGap). */
+  private caughtUpAt: number | null = null
   private readonly stderrTail: string[] = []
   private childExitCode: number | null = null
   private childExitSignal: NodeJS.Signals | null = null
@@ -381,21 +396,30 @@ export class ProxyServer extends EventEmitter {
     if (this.pollInFlight) return
     this.pollInFlight = true
     try {
-      const { lines, lostGenerations } = await this.eventsTail.poll()
-      if (lostGenerations > 0) {
-        // Loud, bounded, and without any event content: a lost generation
-        // means the live view may be missing a stretch of this session.
-        console.warn(`[proxy] events transport lost ${lostGenerations} rotated generation(s) of ${this.info.eventsFile} before they were read`)
-        this.emit('transport-gap', { lostGenerations })
-      }
-      for (const line of lines) {
-        try {
-          this.emit('event', JSON.parse(line) as ProxyCapturedEvent)
-        } catch {
-          // A terminated line that fails to parse is garbage from mitmdump,
-          // not a partial write (partials are never returned). Drop it.
+      const { lines, gaps } = await this.eventsTail.poll()
+      const until = Date.now()
+      // Lines and gaps in the order they were written (agent-code#1381): a gap
+      // at `index` sits after the first `index` lines of this batch.
+      let next = 0
+      const emitThrough = (end: number): void => {
+        for (; next < end; next += 1) {
+          try {
+            this.emit('event', JSON.parse(lines[next]!) as ProxyCapturedEvent)
+          } catch {
+            // A terminated line that fails to parse is garbage from mitmdump,
+            // not a partial write (partials are never returned). Drop it.
+          }
         }
       }
+      for (const gap of gaps) {
+        emitThrough(gap.index)
+        // Loud, bounded, and without any event content: a lost generation
+        // means the live view may be missing a stretch of this session.
+        console.warn(`[proxy] events transport lost ${gap.lostGenerations} rotated generation(s) of ${this.info.eventsFile} before they were read`)
+        this.emit('transport-gap', { lostGenerations: gap.lostGenerations, since: this.caughtUpAt, until })
+      }
+      emitThrough(lines.length)
+      this.caughtUpAt = until
     } catch {
       // best-effort
     } finally {

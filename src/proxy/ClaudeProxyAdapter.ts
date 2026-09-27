@@ -1308,6 +1308,44 @@ export class ClaudeProxyAdapter {
     }
   }
 
+  /**
+   * The events transport lost a span at this point in the event order
+   * (agent-code#1381; ProxyServer emits `transport-gap` exactly between the
+   * events written before and after the loss). Every flow this adapter is
+   * tracking may be missing frames, so none of them can be trusted to
+   * continue:
+   *
+   *   - a turn that is still streaming is sealed as `transport-gap` (turn
+   *     stopped, partial text finished, phase idle) — the lost frames may be a
+   *     text delta, a block stop or the message stop, so stitching the rest on
+   *     would present a spliced answer as whole;
+   *   - a flow that streamed its first chunk but no turn yet gives its
+   *     spinner back (the same rule reapStaleActiveFlow applies);
+   *   - a turn that already STOPPED (a tool message that ended cleanly, now
+   *     awaiting its tool) keeps its phase — the gap says nothing about the
+   *     tool running locally, the same rule onTransportError follows;
+   *   - every flow is then forgotten, including one that saw only its request:
+   *     its first chunks may be in the lost span, and a decoder started on a
+   *     post-gap chunk would begin mid-SSE. Their later chunks are ignored
+   *     (onChunk drops unknown flows); a NEW request streams normally.
+   *
+   * Synchronous and timer-free like sealFlowsSilentSince, so the host can call
+   * it at the gap's place in the event stream and tests can drive it against
+   * recorded sequences.
+   */
+  sealFlowsForTransportGap(): void {
+    for (const state of [...this.flows.values()]) {
+      if (state.attribution === 'active' && state.turnStarted && !state.turnStopped) {
+        // Deletes and releases the flow itself.
+        this.reapStaleActiveFlow(state, 'transport-gap')
+        continue
+      }
+      if (state.attribution === 'active' && !state.turnStarted) this.publishPhase(state, 'idle')
+      this.flows.delete(state.flowId)
+      this.releaseStreamingFlow(state.flowId)
+    }
+  }
+
   private closeTurnAfterTerminalApiError(
     state: FlowState,
     source: SemanticSource,
