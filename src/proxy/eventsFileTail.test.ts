@@ -12,6 +12,10 @@ const fsHook = vi.hoisted(() => ({
   before: null as null | ((call: string, path: string) => void),
   /** When set, every FileHandle.read returns at most this many bytes (legal per the API). */
   maxReadBytes: null as null | number,
+  /** Runs before every FileHandle.stat, with the path the handle was opened on. */
+  beforeHandleStat: null as null | ((path: string) => void),
+  /** When set, opening a path it names throws (an I/O error on that file). */
+  failOpen: null as null | ((path: string) => boolean),
 }))
 vi.mock('fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('fs/promises')>()
@@ -22,12 +26,17 @@ vi.mock('fs/promises', async importOriginal => {
     }) as F
   const open = (async (...args: Parameters<typeof actual.open>) => {
     fsHook.before?.('open', String(args[0]))
+    if (fsHook.failOpen?.(String(args[0]))) throw Object.assign(new Error('EIO: injected'), { code: 'EIO' })
     const handle = await actual.open(...args)
+    const openedPath = String(args[0])
     const read = handle.read.bind(handle) as (buffer: Buffer, offset: number, length: number, position: number) => ReturnType<typeof handle.read>
     return Object.assign(Object.create(handle) as typeof handle, {
       read: (buffer: Buffer, offset: number, length: number, position: number) =>
         read(buffer, offset, fsHook.maxReadBytes === null ? length : Math.min(length, fsHook.maxReadBytes), position),
-      stat: handle.stat.bind(handle),
+      stat: (...statArgs: Parameters<typeof handle.stat>) => {
+        fsHook.beforeHandleStat?.(openedPath)
+        return handle.stat(...statArgs)
+      },
       close: handle.close.bind(handle),
     })
   }) as typeof actual.open
@@ -156,7 +165,7 @@ async function drain(tail: EventsFileTail): Promise<{ lines: string[]; lost: num
 }
 
 describe('rotating events file (#1273)', () => {
-  afterEach(() => { fsHook.before = null; fsHook.maxReadBytes = null })
+  afterEach(() => { fsHook.before = null; fsHook.maxReadBytes = null; fsHook.beforeHandleStat = null; fsHook.failOpen = null })
 
   it('bounds the live file and keeps exactly one previous generation', () => {
     const ws = workspace()
@@ -451,6 +460,65 @@ addon._start_next_generation = _flaky_start
     } finally {
       fsHook.maxReadBytes = null
     }
+    await tail.close()
+  })
+
+  // Round 2 of the #64 review (a): two rotations while the NEW live handle's
+  // own fh.stat() is in flight made the first design read the newest rotated
+  // file before the held one: c,b,c,d. Handle-level hooks, not just path ones.
+  it('keeps order when two rotations land while the new live handle is being stat()ed', async () => {
+    const ws = workspace()
+    writeFileSync(ws.events, '{"kind":"a"}\n')
+    const tail = new EventsFileTail(ws.events)
+    expect((await tail.poll()).lines).toEqual(['{"kind":"a"}'])
+    rotateLikeAddon(ws.events, '{"kind":"b"}\n')
+    let handleStats = 0
+    fsHook.beforeHandleStat = path => {
+      if (path !== ws.events) return
+      handleStats += 1
+      // 1-2: the held A's reads; 3: the new live (B) handle's identity stat.
+      if (handleStats === 3) {
+        rotateLikeAddon(ws.events, '{"kind":"c"}\n')
+        rotateLikeAddon(ws.events, '{"kind":"d"}\n')
+      }
+    }
+    const { lines, lost } = await drain(tail)
+    expect(handleStats).toBeGreaterThanOrEqual(3)
+    expect(lines).toEqual(['{"kind":"b"}', '{"kind":"c"}', '{"kind":"d"}'])
+    expect(lost).toBe(0)
+    await tail.close()
+  })
+
+  // Round 2 of the #64 review (a, suspicion): an I/O error reading `.1` after the
+  // live file was already read must not drop anything silently. The unreadable
+  // generation is reported as lost; the live lines are still delivered.
+  it('reports the previous generation as lost when it cannot be read, and still delivers the live one', async () => {
+    const ws = workspace()
+    writeFileSync(ws.events, '{"kind":"a"}\n')
+    const tail = new EventsFileTail(ws.events)
+    expect((await tail.poll()).lines).toEqual(['{"kind":"a"}'])
+    rotateLikeAddon(ws.events, '{"kind":"b"}\n')
+    rotateLikeAddon(ws.events, '{"kind":"c"}\n')
+    fsHook.failOpen = path => path === rotatedEventsPath(ws.events)
+    const { lines, lost } = await drain(tail)
+    expect(lines).toEqual(['{"kind":"c"}'])
+    expect(lost).toBe(1)
+    await tail.close()
+  })
+
+  it('treats an error reading an opened previous generation the same way', async () => {
+    const ws = workspace()
+    writeFileSync(ws.events, '{"kind":"a"}\n')
+    const tail = new EventsFileTail(ws.events)
+    expect((await tail.poll()).lines).toEqual(['{"kind":"a"}'])
+    rotateLikeAddon(ws.events, '{"kind":"b"}\n')
+    rotateLikeAddon(ws.events, '{"kind":"c"}\n')
+    fsHook.beforeHandleStat = path => {
+      if (path === rotatedEventsPath(ws.events)) throw Object.assign(new Error('EIO: injected'), { code: 'EIO' })
+    }
+    const { lines, lost } = await drain(tail)
+    expect(lines).toEqual(['{"kind":"c"}'])
+    expect(lost).toBe(1)
     await tail.close()
   })
 

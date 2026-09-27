@@ -149,23 +149,30 @@ export class EventsFileTail {
       // addon renames live -> `.1` and then creates the next live file.
       const rotated = await open(rotatedEventsPath(this.eventsFile), 'r').catch(() => null)
       if (rotated) {
-        const { ino } = await rotated.stat()
-        // Never the live file itself (a rename racing this open). The
-        // generation we just finished never gets here: its generation is known
-        // once its last read resolves, so `generation - 1` is already settled.
-        if (ino !== liveIno) {
-          const liveOffset = this.offset
-          this.offset = 0
-          const lines = (await this.readFrom({ fh: rotated, ino, generation: null })) ?? []
-          this.offset = liveOffset
-          const header = generationOf(lines[0])
-          if (header !== null) lines.shift()
-          if ((header ?? 0) === generation - 1) {
-            out.lines.push(...lines)
-            readRotated = 1
+        const liveOffset = this.offset
+        try {
+          const { ino } = await rotated.stat()
+          // Never the live file itself (a rename racing this open). The
+          // generation we just finished never gets here: its generation is known
+          // once its last read resolves, so `generation - 1` is already settled.
+          if (ino !== liveIno) {
+            this.offset = 0
+            const lines = (await this.readFrom({ fh: rotated, ino, generation: null })) ?? []
+            const header = generationOf(lines[0])
+            if (header !== null) lines.shift()
+            if ((header ?? 0) === generation - 1) {
+              out.lines.push(...lines)
+              readRotated = 1
+            }
           }
+        } catch {
+          // An I/O error on `.1` fails closed: the generation is counted as
+          // lost below instead of throwing away the live lines already read
+          // (round 2 of the #64 review).
+        } finally {
+          this.offset = liveOffset
+          await rotated.close().catch(() => {})
         }
-        await rotated.close().catch(() => {})
       }
     }
     // Everything between what we had settled and the live generation that was
