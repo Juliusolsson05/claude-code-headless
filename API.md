@@ -1375,9 +1375,18 @@ createProxyServer(
 
 A bare string is treated as `{ baseDir }`. `CreateProxyServerOptions`:
 `baseDir?`, `storageRoot?`, `runDir?`, `confDir?`, `eventsFile?`,
-`mitmDumpPath?`, `addonPath?`, `cwd?`, `sessionKey?`, `allowedHosts?`.
+`mitmDumpPath?`, `addonPath?`, `cwd?`, `sessionKey?`, `allowedHosts?`,
+`sslKeyLog?`.
 With no options it
 writes runtime state under `os.tmpdir()/claude-code-headless/proxy/`.
+
+**`sslKeyLog`** (default `false`): write mitmproxy's TLS key log to
+`<run dir>/sslkeylog.log`. It is off by default, and an inherited
+`MITMPROXY_SSLKEYLOGFILE` is removed from mitmdump's environment. The file
+holds every TLS handshake's session secrets in plaintext and was never
+rotated, so it grew for the life of every session (agent-code#1380). Turn it
+on only to decrypt a packet capture. `buildMitmdumpEnv` is the exported pure
+builder.
 `mitmdump` discovery order: explicit `mitmDumpPath` →
 `$CLAUDE_HEADLESS_MITMDUMP` / `$CC_PROXY_TEST_MITMDUMP` →
 `.proxy-testing/venv/bin/mitmdump` candidates → homebrew/`/usr/local`.
