@@ -737,6 +737,25 @@ describe('ProxyServer events wiring (#1273)', () => {
     }
   })
 
+  // cch#69 review c: a gap on the very first poll has no lower bound yet.
+  it('reports a gap on the first poll with since: null (#1381)', async () => {
+    const server = new ProxyServer({ eventsFile: '/nonexistent/events.jsonl' } as ProxyServerInfo)
+    const gaps: Array<{ since: number | null }> = []
+    server.on('transport-gap', gap => gaps.push(gap))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    ;(server as unknown as { eventsTail: unknown }).eventsTail = {
+      poll: async () => ({ lines: [], gaps: [{ index: 0, lostGenerations: 1 }], lostGenerations: 1 }),
+      close: async () => {},
+    }
+    try {
+      await (server as unknown as { pollEventsOnce(): Promise<void> }).pollEventsOnce()
+      expect(gaps).toEqual([expect.objectContaining({ since: null })])
+    } finally {
+      warn.mockRestore()
+      await server.stop()
+    }
+  })
+
   it('emits the transport gap between the events written before and after the loss (#1381)', async () => {
     const ws = workspace()
     const server = new ProxyServer({ eventsFile: ws.events } as ProxyServerInfo)
