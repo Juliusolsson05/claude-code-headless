@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 // so it grew for the life of every session, as plaintext secrets on disk.
 // Nothing reads it. It is now written only on an explicit opt-in.
 
-const spawned = vi.hoisted(() => ({ env: [] as Array<NodeJS.ProcessEnv | undefined> }))
+const spawned = vi.hoisted(() => ({ env: [] as Array<NodeJS.ProcessEnv | undefined>, writeCaOnSpawn: null as string | null }))
 vi.mock('child_process', async importOriginal => {
   const original = await importOriginal<typeof import('child_process')>()
   return {
@@ -21,6 +21,11 @@ vi.mock('child_process', async importOriginal => {
     // exits when stop() kills it.
     spawn: (_cmd: string, _args: string[], options?: { env?: NodeJS.ProcessEnv }) => {
       spawned.env.push(options?.env)
+      // A fresh confdir: like the real mitmdump, generate the CA on start.
+      if (spawned.writeCaOnSpawn) {
+        const caPath = spawned.writeCaOnSpawn
+        queueMicrotask(() => { void import('node:fs').then(fs => fs.writeFileSync(caPath, 'generated CA')) })
+      }
       const child = new EventEmitter()
       Object.assign(child, {
         stdout: new EventEmitter(), stderr: new EventEmitter(), pid: 1, exitCode: null, signalCode: null,
@@ -35,6 +40,7 @@ const { buildMitmdumpEnv, createProxyServer } = await import('./proxyServer.js')
 
 afterEach(() => {
   spawned.env.length = 0
+  spawned.writeCaOnSpawn = null
   delete process.env.MITMPROXY_SSLKEYLOGFILE
 })
 
@@ -68,5 +74,21 @@ describe('mitmdump TLS key log (agent-code#1380)', () => {
     const keyLog = spawned.env[0]?.MITMPROXY_SSLKEYLOGFILE
     if (expected) expect(keyLog).toBe(join(server.info.workDir, expected))
     else expect(keyLog).toBeUndefined()
+  })
+
+  // #1380 review a: a FRESH confdir has no CA yet, so start() spawns mitmdump
+  // inside withCaBootstrapLock to generate one, a separate path from the one
+  // above (which pre-creates the CA). The first-ever start must be covered too.
+  it('hands mitmdump no key log on a fresh-CA first start', async () => {
+    process.env.MITMPROXY_SSLKEYLOGFILE = '/home/user/keys.log'
+    const runDir = mkdtempSync(join(tmpdir(), 'proxy-keylog-fresh-'))
+    const confDir = join(runDir, 'conf')
+    mkdirSync(confDir, { recursive: true })
+    spawned.writeCaOnSpawn = join(confDir, 'mitmproxy-ca-cert.pem')
+    const server = await createProxyServer({ runDir, confDir, mitmDumpPath: '/bin/false', addonPath: '/tmp/addon.py' })
+    await server.start()
+    await server.stop()
+    expect(spawned.env.length).toBeGreaterThan(0)
+    for (const env of spawned.env) expect(env?.MITMPROXY_SSLKEYLOGFILE).toBeUndefined()
   })
 })
