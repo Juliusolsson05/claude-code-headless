@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { closeSync, existsSync, fstatSync, mkdtempSync, openSync, readFileSync, readSync, truncateSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, mkdtempSync, openSync, readFileSync, readSync, truncateSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -14,6 +14,18 @@ import { describe, expect, it } from 'vitest'
 // and the omission is marked.
 
 const ADDON = resolve(__dirname, 'mitmAddon.py')
+
+/** A sparse events file of exactly `bytes` bytes that ends like a real one,
+ *  in a newline. The addon now repairs a file that ends mid-line (a crashed
+ *  write) by appending one, which would move a bare sparse file's size across
+ *  the exact boundaries these tests pin (#1273, review of #64). */
+function sparseEventsFile(path: string, bytes: number): void {
+  writeFileSync(path, '')
+  truncateSync(path, bytes)
+  if (bytes === 0) return
+  const fd = openSync(path, 'r+')
+  try { writeSync(fd, '\n', bytes - 1) } finally { closeSync(fd) }
+}
 
 function stubMitmproxy(root: string): void {
   const pkg = join(root, 'mitmproxy')
@@ -32,8 +44,7 @@ function runRequest(existingBytes: number | 'absent', budget?: number, content =
   // costs no disk and no time.
   const prefix = existingBytes === 'absent' ? 0 : existingBytes
   if (existingBytes !== 'absent') {
-    writeFileSync(out, '')
-    truncateSync(out, existingBytes)
+    sparseEventsFile(out, existingBytes)
   }
   // A minimal, synthetic /v1/messages body: no private content.
   const body = JSON.stringify({ model: 'claude-test', system: 'synthetic', messages: [{ role: 'user', content }], tools: [] })
@@ -135,8 +146,7 @@ describe('mitmAddon request body budget (#1273)', () => {
     const root = mkdtempSync(join(tmpdir(), 'mitm-seq-'))
     stubMitmproxy(root)
     const out = join(root, 'events.jsonl')
-    writeFileSync(out, '')
-    truncateSync(out, opts.existingBytes)
+    sparseEventsFile(out, opts.existingBytes)
     const sidecar = join(root, 'latest-request-body.json')
     if (opts.preSidecar) writeFileSync(sidecar, JSON.stringify({ kind: 'request-body-latest', flow_id: 1, body_b64: Buffer.from('OLD PROMPT').toString('base64') }) + '\n')
     const bodies = opts.prompts.map(({ text, padTo }) => {

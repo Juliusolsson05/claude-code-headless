@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events'
-import { access, mkdir, open, stat, writeFile } from 'fs/promises'
+import { access, mkdir, writeFile } from 'fs/promises'
 import { constants as fsConstants } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join, resolve } from 'path'
@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url'
 
 import { canonicalizePath, sanitizePath } from '../transcript/ProjectDir.js'
 import { DEFAULT_ALLOWED_HOSTS, type ProxyTransportEvent } from './ClaudeProxyAdapter.js'
+import { EventsFileTail } from './eventsFileTail.js'
 
 export type ProxyCapturedEvent = ProxyTransportEvent
 
@@ -32,6 +33,11 @@ export type ProxyServerInfo = {
 
 export type ProxyServerEvents = {
   event: [ProxyCapturedEvent]
+  /** Whole events-file generations were rotated away and deleted before the
+   *  tail read them, so their events never reached `event` (#1273; see
+   *  EventsFileTail's delivery contract). Only after the poller stalled for
+   *  >= two rotations' worth of traffic. */
+  'transport-gap': [{ lostGenerations: number }]
   stderr: [string]
   stdout: [string]
 }
@@ -120,9 +126,8 @@ async function withCaBootstrapLock(confDir: string, action: () => Promise<void>)
 export class ProxyServer extends EventEmitter {
   private child: ChildProcess | null = null
   private watcherTimer: ReturnType<typeof setInterval> | null = null
-  // BYTE offset of consumed events-file content (see pollEventsOnce for
-  // why bytes, not chars). Reset to 0 only if the file shrinks.
-  private lastEventOffset = 0
+  // Owns the byte offset and follows the addon's rotations (#1273).
+  private readonly eventsTail: EventsFileTail
   // In-flight guard for pollEventsOnce: setInterval re-fires regardless of
   // whether the previous async body finished, and overlapping polls were
   // half of the 2026-07-07 OOM (each overlap held a whole-file string
@@ -135,6 +140,7 @@ export class ProxyServer extends EventEmitter {
 
   constructor(readonly info: ProxyServerInfo) {
     super()
+    this.eventsTail = new EventsFileTail(info.eventsFile)
   }
 
   async start(): Promise<void> {
@@ -272,6 +278,9 @@ export class ProxyServer extends EventEmitter {
       clearInterval(this.watcherTimer)
       this.watcherTimer = null
     }
+    // The tail holds an open handle on the current generation; release it so
+    // a stopped proxy does not pin a deleted file's disk space.
+    await this.eventsTail.close()
     if (!this.child) return
     const child = this.child
     this.child = null
@@ -364,90 +373,27 @@ export class ProxyServer extends EventEmitter {
     }, 200)
   }
 
-  // Incremental read of the mitm addon's events file.
-  //
-  // WHY incremental (open + read from lastEventOffset), never
-  // readFile(whole file): this poller originally did
-  // `readFile(eventsFile, 'utf8')` every 200ms and sliced off
-  // `lastEventOffset` afterwards. The events file grows without bound over
-  // a session (Claude API request/response bodies land here; a single
-  // long-lived resume session reached 308 MB on 2026-07-07), so each poll
-  // allocated a file-sized JS string. Strings that big go straight to V8's
-  // large_object_space, which is only reclaimed by MAJOR GCs — so dead
-  // copies piled up between major GCs (observed as a 300 MB → 2.4 GB → 300
-  // MB heap sawtooth whose amplitude tracked the file size). And because
-  // the old setInterval callback was async with no in-flight guard, once
-  // the read latency exceeded the 200ms period several whole-file strings
-  // were REACHABLE at once. The 2026-07-07 main-process OOM crashed with
-  // heapUsed 2726 MB of which 2702 MB was large_object_space, and the
-  // final last-resort mark-compacts freed nothing — that was N concurrent
-  // 308 MB read results in flight. Reading only [lastEventOffset, size)
-  // keeps each poll proportional to NEW bytes, exactly like the
-  // FileTailer/SubAgentWatcher incremental-read fixes before it.
-  //
-  // OFFSET SEMANTICS: lastEventOffset is a BYTE offset now (it was a
-  // JS-string char offset when we decoded the whole file). Byte slicing is
-  // safe here because we only ever cut at `\n` boundaries — 0x0A never
-  // appears inside a UTF-8 multibyte sequence — and in practice
-  // mitmAddon.py writes `json.dumps(payload)` with the default
-  // ensure_ascii=True, so the file is pure ASCII anyway.
+  // One poll of the events file. The reading, offset and rotation rules live
+  // in EventsFileTail (see its header for the 2026-07-07 OOM history and the
+  // #1273 rotation contract); this method only owns the in-flight guard and
+  // turns lines into events.
   private async pollEventsOnce(): Promise<void> {
     if (this.pollInFlight) return
     this.pollInFlight = true
     try {
-      const st = await stat(this.info.eventsFile).catch(() => null)
-      if (!st) return
-      if (st.size < this.lastEventOffset) {
-        // File shrank (recreated/truncated). mitmdump only appends, so
-        // this means a new file replaced the old one — restart from 0
-        // rather than silently never reading again.
-        this.lastEventOffset = 0
+      const { lines, lostGenerations } = await this.eventsTail.poll()
+      if (lostGenerations > 0) {
+        // Loud, bounded, and without any event content: a lost generation
+        // means the live view may be missing a stretch of this session.
+        console.warn(`[proxy] events transport lost ${lostGenerations} rotated generation(s) of ${this.info.eventsFile} before they were read`)
+        this.emit('transport-gap', { lostGenerations })
       }
-      if (st.size === this.lastEventOffset) return
-
-      const fh = await open(this.info.eventsFile, 'r')
-      let buf: Buffer
-      try {
-        const toRead = st.size - this.lastEventOffset
-        buf = Buffer.alloc(toRead)
-        const { bytesRead } = await fh.read(buf, 0, toRead, this.lastEventOffset)
-        buf = buf.subarray(0, bytesRead)
-      } finally {
-        await fh.close().catch(() => {})
-      }
-
-      // Only advance the offset past the LAST complete line we see.
-      // Earlier versions advanced to end-of-read up-front, which
-      // silently dropped any in-flight partial line when mitmdump's
-      // write was mid-flush during the poll: the partial failed
-      // JSON.parse, got swallowed by the catch, and the completed
-      // line on the next poll was already past `lastEventOffset`.
-      //
-      // The newline-terminator invariant: mitmAddon.py writes
-      // `json.dumps(payload) + "\n"` per event, so a correctly
-      // flushed record always ends in `\n`. Anything after the
-      // final `\n` in the buffer is a partial write-in-progress and
-      // must be retried on the next tick.
-      const lastNl = buf.lastIndexOf(0x0a)
-      if (lastNl === -1) {
-        // No complete line yet; leave offset untouched so we re-
-        // read the partial next tick.
-        return
-      }
-      const completeBlock = buf.subarray(0, lastNl).toString('utf8')
-      this.lastEventOffset += lastNl + 1 // skip past the consumed \n
-
-      for (const line of completeBlock.split('\n')) {
-        const trimmed = line.trim()
-        if (!trimmed) continue
+      for (const line of lines) {
         try {
-          this.emit('event', JSON.parse(trimmed) as ProxyCapturedEvent)
+          this.emit('event', JSON.parse(line) as ProxyCapturedEvent)
         } catch {
-          // A parse error on a line we've committed to (offset
-          // already advanced past `\n`) means mitmdump wrote
-          // garbage, not that the line was partial. Drop silently;
-          // the line was terminated and we can't do anything with
-          // it.
+          // A terminated line that fails to parse is garbage from mitmdump,
+          // not a partial write (partials are never returned). Drop it.
         }
       }
     } catch {

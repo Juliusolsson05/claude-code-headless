@@ -2,6 +2,7 @@ import json
 import os
 import re
 import base64
+import sys
 from mitmproxy import http
 
 
@@ -72,11 +73,196 @@ def _is_allowed_host(request) -> bool:
     return False
 
 
-def _write(payload):
+# Live-file rotation (agent-code #1273, residual after #62).
+#
+# The per-file body budget below removed ~93 % of the growth, but responses,
+# stream chunks and body-less request records still append for as long as the
+# session lives, and a live run is never pruned (debugRetention skips anything
+# written in the last ten minutes). A Claude session left open for days grew
+# its file without bound.
+#
+# WHY rotate, and not stop writing past a budget: this file is not only a log,
+# it is the TRANSPORT to the app. ProxyServer tails it and the adapter builds
+# the live transcript from the `response-chunk` lines, so dropping chunks would
+# blank the live view. Rotation keeps every event flowing and bounds the disk:
+# at most this generation plus ONE previous one (`proxy-events.1.jsonl`), each
+# up to the threshold plus one line.
+#
+# WHY the writer rotates (not the app): this addon is the only writer, runs
+# single-threaded, and opens-appends-closes per line. So once os.replace()
+# returns, no later write can land in the old inode, and the tailer can drain
+# the renamed generation to its end without racing a writer. The tailer side
+# of this contract lives in eventsFileTail.ts (ROTATED_SUFFIX must match).
+#
+# 512 MiB: each generation still keeps the first 256 MiB of request bodies
+# (the per-file budget restarts with the fresh file) plus a long stretch of
+# body-less traffic; debug bundles ship only the last 5 MiB anyway. 0 or an
+# invalid value disables rotation (the old unbounded behaviour), for a
+# deliberate forensic capture.
+def _read_rotate_bytes():
+    raw = os.environ.get("PROXY_EVENTS_ROTATE_BYTES")
+    if raw:
+        try:
+            value = int(raw)
+            if value >= 0:
+                return value
+        except ValueError:
+            pass
+    return 512 * 1024 * 1024
+
+
+_ROTATE_BYTES = _read_rotate_bytes()
+
+
+def _rotated_path():
+    base, ext = os.path.splitext(OUT_PATH)
+    return base + ".1" + ext
+
+
+# Generation header (agent-code #1273, round 2 of the #64 review).
+#
+# Every live file created by a rotation starts with one line naming its
+# generation: {"kind": "generation", "generation": n}. The first file, which
+# the first event creates, has no header and is generation 0. The tail reads
+# it to know exactly which generation it holds, fills an unseen generation
+# from `.1`, and reports any generation deleted before it could be read
+# (eventsFileTail.ts `lostGenerations`). The tail strips this line; it never
+# reaches the adapter.
+#
+# WHY a header and not a counter file beside the log (the first design): the
+# counter had to be bumped either before or after the rename, and either way a
+# reader could pair a count with the wrong file — reviewers reproduced a lost
+# generation reported as 0. A number stored IN the generation cannot disagree
+# with it.
+_GENERATION_KIND = "generation"
+
+
+def _generation_of(path):
+    """The generation named by a file's header line; 0 for a headerless
+    (first) file or an unreadable one."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            first = json.loads(fh.readline() or "{}")
+        if first.get("kind") == _GENERATION_KIND and isinstance(first.get("generation"), int):
+            return first["generation"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return 0
+
+
+def _start_next_generation(previous):
+    """Create the next live file WITH its header in one atomic step, so a
+    reader never sees a live file without its generation."""
+    temp = "%s.%d.gen.tmp" % (OUT_PATH, os.getpid())
+    with open(temp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"kind": _GENERATION_KIND, "generation": previous + 1}) + "\n")
+    os.replace(temp, OUT_PATH)
+
+
+def _terminate_partial_line():
+    """A crashed addon can leave the events file ending mid-line. The next
+    append would glue a fresh event onto that fragment and both would fail to
+    parse, losing the new event too (review of #64). Ending the fragment with
+    a newline turns it into one garbage line the tail drops on its own."""
     if not OUT_PATH:
         return
-    with open(OUT_PATH, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload) + "\n")
+    try:
+        with open(OUT_PATH, "rb+") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) != b"\n":
+                fh.write(b"\n")
+    except OSError:
+        pass
+
+
+_terminate_partial_line()
+
+
+_write_failure_reported = False
+# A rotation whose new live file could not be created; the next _write
+# creates it (with its header) before appending.
+_pending_generation = None
+
+
+def _resume_interrupted_rotation():
+    """Finish a rotation a previous addon process began but did not complete.
+
+    WHY (final review of #64, a): the rename and the header publication are
+    two steps. An addon that exits between them (mitmdump killed, the
+    session's proxy restarted) leaves `.1` and NO live file, and the pending
+    generation lived only in that process's memory. The restarted addon then
+    appended to a fresh, headerless file, so numbering restarted at 0; after
+    the next rotation the tail — still holding the old generation 0 — took
+    the new file's `.1` for one it had already settled, and a whole
+    generation of events vanished with lostGenerations 0.
+
+    A missing live file next to an existing `.1` can only mean that half
+    finished rotation (or someone deleting the live file, where continuing
+    the chain is equally right), so the next generation is published before
+    the first write, exactly as the in-process retry would have done.
+    """
+    global _pending_generation
+    if not OUT_PATH or os.path.exists(OUT_PATH) or not os.path.exists(_rotated_path()):
+        return
+    previous = _generation_of(_rotated_path())
+    try:
+        _start_next_generation(previous)
+    except OSError:
+        _pending_generation = previous
+
+
+_resume_interrupted_rotation()
+
+
+def _write(payload):
+    """Append one event; NEVER raise.
+
+    WHY never raise: this runs inside mitmproxy's hooks, including the stream
+    tap that forwards Claude's live response to the CLI. An exception there
+    breaks the user's actual request, not just our log. A write we cannot make
+    is reported once on stderr (mitmdump's stderr lands in the proxy's startup
+    diagnostics) and dropped.
+    """
+    global _write_failure_reported, _pending_generation
+    if not OUT_PATH:
+        return
+    try:
+        if _pending_generation is not None:
+            _start_next_generation(_pending_generation)
+            _pending_generation = None
+        with open(OUT_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload) + "\n")
+            # tell() after an append is the file size: no extra stat per chunk.
+            size = fh.tell()
+    except OSError as exc:
+        if not _write_failure_reported:
+            _write_failure_reported = True
+            sys.stderr.write("[mitmAddon] cannot append to the events file: %s\n" % exc.__class__.__name__)
+        return
+    if _ROTATE_BYTES and size >= _ROTATE_BYTES:
+        generation = _generation_of(OUT_PATH)
+        try:
+            # Atomically replaces the previous generation. The rotated file
+            # always ends in "\n" because the line above was written whole
+            # before the rename.
+            os.replace(OUT_PATH, _rotated_path())
+        except OSError:
+            # Keep appending to the current file and try again after the next
+            # line.
+            return
+        try:
+            # Recreate the live file NOW rather than on the next write: an
+            # idle session may not write again for hours, and until then a
+            # missing proxy-events.jsonl hides the run from the debug-bundle
+            # reader (it picks runs by that file) and from debug retention's
+            # run detection. If this fails, the next _write retries it first,
+            # so the generation's header is never lost.
+            _start_next_generation(generation)
+        except OSError:
+            _pending_generation = generation
 
 
 # Cap on the raw `body_b64` payload emitted to the adapter.
@@ -123,10 +309,11 @@ _REQUEST_BODY_CAP = 2 * 1024 * 1024
 # survives an addon restart that appends to the same run file, and one
 # stat() per /v1/messages request is negligible next to the request itself.
 #
-# The kept bodies are the EARLIEST ones. Each carries the full history up to
-# its turn, so the last kept body still decodes everything before the budget
-# was reached; turns after it are recoverable only from request_shape and the
-# responses. 256 MiB holds roughly a hundred 2 MiB turns, more than a typical
+# The kept bodies are the EARLIEST ones of each events-file generation (the
+# file rotates, see _write, and the budget restarts with the fresh file). Each
+# carries the full history up to its turn, so the last kept body still decodes
+# everything before the budget was reached; turns after it are recoverable only
+# from request_shape and the responses. 256 MiB holds roughly a hundred 2 MiB turns, more than a typical
 # session, and the override exists for a deliberate forensic capture.
 def _read_body_budget():
     raw = os.environ.get("PROXY_REQUEST_BODY_BUDGET_BYTES")
