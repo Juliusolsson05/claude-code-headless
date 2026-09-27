@@ -8,7 +8,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 // A hook into the tail's path-level fs calls, so a test can rotate the file at
 // EXACTLY one await point of a poll (review of #64, steering q53). Handle-level
 // calls (fh.stat / fh.read) are untouched: they are what must not care.
-const fsHook = vi.hoisted(() => ({ before: null as null | ((call: string, path: string) => void) }))
+const fsHook = vi.hoisted(() => ({
+  before: null as null | ((call: string, path: string) => void),
+  /** When set, every FileHandle.read returns at most this many bytes (legal per the API). */
+  maxReadBytes: null as null | number,
+}))
 vi.mock('fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('fs/promises')>()
   const wrap = <F extends (...args: never[]) => unknown>(name: string, fn: F) =>
@@ -16,10 +20,21 @@ vi.mock('fs/promises', async importOriginal => {
       fsHook.before?.(name, String(args[0]))
       return fn(...args)
     }) as F
-  return { ...actual, open: wrap('open', actual.open), stat: wrap('stat', actual.stat), readFile: wrap('readFile', actual.readFile) }
+  const open = (async (...args: Parameters<typeof actual.open>) => {
+    fsHook.before?.('open', String(args[0]))
+    const handle = await actual.open(...args)
+    const read = handle.read.bind(handle) as (buffer: Buffer, offset: number, length: number, position: number) => ReturnType<typeof handle.read>
+    return Object.assign(Object.create(handle) as typeof handle, {
+      read: (buffer: Buffer, offset: number, length: number, position: number) =>
+        read(buffer, offset, fsHook.maxReadBytes === null ? length : Math.min(length, fsHook.maxReadBytes), position),
+      stat: handle.stat.bind(handle),
+      close: handle.close.bind(handle),
+    })
+  }) as typeof actual.open
+  return { ...actual, open, stat: wrap('stat', actual.stat), readFile: wrap('readFile', actual.readFile) }
 })
 
-import { EventsFileTail, rotatedEventsPath, rotationsCounterPath } from './eventsFileTail.js'
+import { EventsFileTail, rotatedEventsPath } from './eventsFileTail.js'
 import { ProxyServer, type ProxyServerInfo } from './proxyServer.js'
 
 // agent-code #1273 (residual after #62): a live Claude session's
@@ -92,6 +107,7 @@ addon.responseheaders(flow)
 for seq in ${JSON.stringify(seqs)}:
     flow.response.stream(('data: {"seq": %d}\\n\\n' % seq).encode("utf-8"))
 flow.response.stream(b"")
+addon.response(flow)
 `
   const env: NodeJS.ProcessEnv = { ...process.env, PYTHONPATH: ws.root, PROXY_EVENTS_FILE: ws.events }
   delete env.PROXY_EVENTS_ROTATE_BYTES
@@ -110,13 +126,22 @@ function chunkSeqs(lines: string[]): number[] {
 // end 167 B). 4 KB therefore rotates about every third turn.
 const ROTATE = 4096
 
-/** Rotate the way the addon does: bump the counter, rename, recreate. */
+/** The generation a file's header line names (0 for a headerless first file). */
+function generationOf(path: string): number {
+  const first = readFileSync(path, 'utf8').split('\n')[0] ?? ''
+  try {
+    const parsed = JSON.parse(first) as { kind?: string; generation?: number }
+    return parsed.kind === 'generation' && typeof parsed.generation === 'number' ? parsed.generation : 0
+  } catch {
+    return 0
+  }
+}
+
+/** Rotate the way the addon does: rename, then create the next generation WITH its header. */
 function rotateLikeAddon(events: string, newContent = ''): void {
-  const counter = rotationsCounterPath(events)
-  const count = existsSync(counter) ? Number(readFileSync(counter, 'utf8')) : 0
-  writeFileSync(counter, String(count + 1))
+  const next = generationOf(events) + 1
   renameSync(events, rotatedEventsPath(events))
-  writeFileSync(events, newContent)
+  writeFileSync(events, `{"kind":"generation","generation":${next}}\n${newContent}`)
 }
 
 async function drain(tail: EventsFileTail): Promise<{ lines: string[]; lost: number }> {
@@ -131,7 +156,7 @@ async function drain(tail: EventsFileTail): Promise<{ lines: string[]; lost: num
 }
 
 describe('rotating events file (#1273)', () => {
-  afterEach(() => { fsHook.before = null })
+  afterEach(() => { fsHook.before = null; fsHook.maxReadBytes = null })
 
   it('bounds the live file and keeps exactly one previous generation', () => {
     const ws = workspace()
@@ -146,7 +171,9 @@ describe('rotating events file (#1273)', () => {
     expect(existsSync(rotatedEventsPath(ws.events))).toBe(true)
     expect(statSync(rotatedEventsPath(ws.events)).size).toBeGreaterThanOrEqual(ROTATE)
     expect(existsSync(ws.events.replace('.jsonl', '.2.jsonl'))).toBe(false)
-    expect(Number(readFileSync(rotationsCounterPath(ws.events), 'utf8'))).toBeGreaterThan(1)
+    // The live file names its generation; several rotations happened.
+    expect(generationOf(ws.events)).toBeGreaterThan(1)
+    expect(generationOf(rotatedEventsPath(ws.events))).toBe(generationOf(ws.events) - 1)
   })
 
   it('rotates at 512 MiB when nothing overrides it', () => {
@@ -161,13 +188,15 @@ print(addon._ROTATE_BYTES)
     expect(Number(out)).toBe(512 * 1024 * 1024)
   })
 
-  it('leaves an empty live file right after a rotation, so an idle run stays discoverable', () => {
+  it('leaves a live file holding only its generation header right after a rotation, so an idle run stays discoverable', () => {
     const ws = workspace()
     // A threshold below every line's size: each write rotates, including the
     // turn's last one (response-end), and nothing follows it.
     streamTurn(ws, [0], 100)
     expect(existsSync(rotatedEventsPath(ws.events))).toBe(true)
-    expect(statSync(ws.events).size).toBe(0)
+    const content = readFileSync(ws.events, 'utf8')
+    expect(content.trim().split('\n')).toHaveLength(1)
+    expect(generationOf(ws.events)).toBeGreaterThan(0)
   })
 
   it('delivers every event exactly once, in order, across rotations', async () => {
@@ -185,6 +214,8 @@ print(addon._ROTATE_BYTES)
     const kinds = seen.map(line => (JSON.parse(line) as { kind: string }).kind)
     expect(kinds.filter(kind => kind === 'request')).toHaveLength(12)
     expect(kinds.filter(kind => kind === 'response-end')).toHaveLength(12)
+    // The completion hook's record (status + headers) arrives too.
+    expect(kinds.filter(kind => kind === 'response')).toHaveLength(12)
     await tail.close()
   })
 
@@ -213,7 +244,8 @@ print(addon._ROTATE_BYTES)
     const all = ['b', 'c', 'd', 'e'].map(kind => `{"kind":"${kind}"}`)
     expect(lines).toEqual(calls >= k ? all : all.slice(0, 3))
     expect(lost).toBe(0)
-    expect(calls).toBeGreaterThanOrEqual(Math.min(k, 6))
+    // Coverage guard: this path makes 5 path-level calls, so positions 2..5 each rotate mid-poll.
+    expect(calls).toBeGreaterThanOrEqual(Math.min(k, 5))
     await tail.close()
   })
 
@@ -277,10 +309,14 @@ print(addon._ROTATE_BYTES)
     const tail = new EventsFileTail(ws.events)
     streamTurn(ws, [0], null)
     expect(chunkSeqs((await tail.poll()).lines)).toEqual([0])
-    // Every line rotates: request, chunk, end -> 3 rotations while unpolled.
+    // Every write now rotates after it lands: the request goes into the held
+    // generation 0 (then rotates), the chunk into 1, the end into 2, the
+    // response into 3; 4 is live (header only). 0 is finished from the held
+    // handle and 3 is read from `.1`; 1 and 2 were deleted unread.
     streamTurn(ws, [1], 100)
-    const { lost } = await drain(tail)
-    expect(lost).toBe(1)
+    const { lines, lost } = await drain(tail)
+    expect(lost).toBe(2)
+    expect(lines.map(line => (JSON.parse(line) as { kind: string }).kind)).toEqual(['request', 'response'])
     await tail.close()
   })
 
@@ -334,15 +370,108 @@ print(addon._ROTATE_BYTES)
     await tail.close()
   })
 
+  // If creating the next generation's live file fails right after the rename,
+  // the next write must create it WITH its header, or the tail would read a
+  // headerless file as generation 0 and miscount the chain.
+  it('retries the next generation header when creating it failed after the rename', () => {
+    const ws = workspace()
+    streamTurn(ws, [0, 1], 100, `
+_real_start = addon._start_next_generation
+_fail_once = [True]
+def _flaky_start(previous):
+    if _fail_once[0]:
+        _fail_once[0] = False
+        raise OSError("injected")
+    return _real_start(previous)
+addon._start_next_generation = _flaky_start
+`)
+    // Every one of the turn's 5 writes (request, 2 chunks, end, response)
+    // rotates, so the numbering must reach 5 unbroken. Without the retry the
+    // next write creates a headerless file, numbering restarts at 0, and the
+    // live file ends one generation short.
+    expect(generationOf(ws.events)).toBe(5)
+    expect(generationOf(rotatedEventsPath(ws.events))).toBe(4)
+  })
+
   it('never raises out of a hook when the events file cannot be written at all', () => {
     const ws = workspace()
     // The parent directory does not exist, so every append fails.
     expect(() => streamTurn({ root: ws.root, events: join(ws.root, 'missing', 'proxy-events.jsonl') }, [0], ROTATE)).not.toThrow()
   })
 
-  it('names the previous generation and the counter the way the addon does', () => {
+  it('names the previous generation the way the addon does', () => {
     expect(rotatedEventsPath('/run/proxy-events.jsonl')).toBe('/run/proxy-events.1.jsonl')
-    expect(rotationsCounterPath('/run/proxy-events.jsonl')).toBe('/run/proxy-events.rotations')
+  })
+
+  // Round 2 of the #64 review: the counter file could be read between its bump
+  // and the rename, pairing a count with the wrong file. Headers make the
+  // reviewer's exact sequence — A read, then A->B->C->D before the next poll —
+  // report exactly one lost generation (B).
+  it('counts exactly one lost generation when A is read and then three rotations pass', async () => {
+    const ws = workspace()
+    writeFileSync(ws.events, '{"kind":"a"}\n')
+    const tail = new EventsFileTail(ws.events)
+    expect((await tail.poll()).lines).toEqual(['{"kind":"a"}'])
+    rotateLikeAddon(ws.events, '{"kind":"b"}\n')
+    rotateLikeAddon(ws.events, '{"kind":"c"}\n')
+    rotateLikeAddon(ws.events, '{"kind":"d"}\n')
+    const { lines, lost } = await drain(tail)
+    expect(lines).toEqual(['{"kind":"c"}', '{"kind":"d"}'])
+    expect(lost).toBe(1)
+    await tail.close()
+  })
+
+  // Round 2 of the #64 review: a rotation before the tail's FIRST poll left the
+  // old events at `.1`, never read and never reported.
+  it('reads the previous generation when the first poll already finds a rotated file', async () => {
+    const ws = workspace()
+    writeFileSync(ws.events, '{"kind":"old"}\n')
+    rotateLikeAddon(ws.events)
+    const tail = new EventsFileTail(ws.events)
+    const { lines, lost } = await drain(tail)
+    expect(lines).toEqual(['{"kind":"old"}'])
+    expect(lost).toBe(0)
+    await tail.close()
+  })
+
+  // Round 2 of the #64 review: FileHandle.read may return fewer bytes than asked;
+  // a short read of a finished generation silently dropped its unread line.
+  it('reads a finished generation to its end even when every read is short', async () => {
+    const ws = workspace()
+    writeFileSync(ws.events, '{"kind":"a"}\n')
+    const tail = new EventsFileTail(ws.events)
+    expect((await tail.poll()).lines).toEqual(['{"kind":"a"}'])
+    appendFileSync(ws.events, '{"kind":"unread"}\n')
+    rotateLikeAddon(ws.events, '{"kind":"next"}\n')
+    fsHook.maxReadBytes = 5
+    try {
+      const { lines, lost } = await drain(tail)
+      expect(lines).toEqual(['{"kind":"unread"}', '{"kind":"next"}'])
+      expect(lost).toBe(0)
+    } finally {
+      fsHook.maxReadBytes = null
+    }
+    await tail.close()
+  })
+
+  // Round 2 of the #64 review: nothing pinned the second read of the held
+  // generation after a rotation is detected — a line written between the first
+  // read and the path stat.
+  it('finishes a line written to the held generation just before the rotation was noticed', async () => {
+    const ws = workspace()
+    writeFileSync(ws.events, '{"kind":"a"}\n')
+    const tail = new EventsFileTail(ws.events)
+    expect((await tail.poll()).lines).toEqual(['{"kind":"a"}'])
+    fsHook.before = (call, path) => {
+      if (call !== 'stat' || path !== ws.events) return
+      fsHook.before = null
+      appendFileSync(ws.events, '{"kind":"late"}\n')
+      rotateLikeAddon(ws.events, '{"kind":"next"}\n')
+    }
+    const { lines, lost } = await drain(tail)
+    expect(lines).toEqual(['{"kind":"late"}', '{"kind":"next"}'])
+    expect(lost).toBe(0)
+    await tail.close()
   })
 })
 
@@ -359,7 +488,9 @@ describe('ProxyServer events wiring (#1273)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const poll = () => (server as unknown as { pollEventsOnce(): Promise<void> }).pollEventsOnce()
     try {
-      appendFileSync(ws.events, '{"kind":"response-end","flow_id":1}\nnot json\n')
+      // A malformed line BEFORE a valid one: one bad line must not drop the rest
+      // of its batch (round 2 of the #64 review).
+      appendFileSync(ws.events, 'not json\n{"kind":"response-end","flow_id":1}\n')
       await poll()
       expect(events).toEqual([{ kind: 'response-end', flow_id: 1 }])
       for (const n of [2, 3, 4]) rotateLikeAddon(ws.events, `{"kind":"response-end","flow_id":${n}}\n`)

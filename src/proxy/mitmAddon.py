@@ -119,28 +119,44 @@ def _rotated_path():
     return base + ".1" + ext
 
 
-# Rotation counter next to the events file (agent-code #1273, review of #64).
-# The tail can hold and drain the generation it is reading plus one unseen
-# generation at `.1`; if the app's poller stalls through more rotations than
-# that, the generations in between are deleted unread. The counter lets the
-# tail REPORT that gap (eventsFileTail.ts `lostGenerations`) instead of
-# silently claiming exactly-once. It is bumped BEFORE the rename, so a reader
-# that sees the rename also sees its count. Name must match
-# eventsFileTail.ts rotationsCounterPath().
-_ROTATIONS_FILE_NAME = "proxy-events.rotations"
+# Generation header (agent-code #1273, round 2 of the #64 review).
+#
+# Every live file created by a rotation starts with one line naming its
+# generation: {"kind": "generation", "generation": n}. The first file, which
+# the first event creates, has no header and is generation 0. The tail reads
+# it to know exactly which generation it holds, fills an unseen generation
+# from `.1`, and reports any generation deleted before it could be read
+# (eventsFileTail.ts `lostGenerations`). The tail strips this line; it never
+# reaches the adapter.
+#
+# WHY a header and not a counter file beside the log (the first design): the
+# counter had to be bumped either before or after the rename, and either way a
+# reader could pair a count with the wrong file — reviewers reproduced a lost
+# generation reported as 0. A number stored IN the generation cannot disagree
+# with it.
+_GENERATION_KIND = "generation"
 
 
-def _bump_rotations():
-    path = os.path.join(os.path.dirname(OUT_PATH), _ROTATIONS_FILE_NAME)
+def _generation_of(path):
+    """The generation named by a file's header line; 0 for a headerless
+    (first) file or an unreadable one."""
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            count = int(fh.read().strip() or "0")
-    except (OSError, ValueError):
-        count = 0
-    temp = "%s.%d.tmp" % (path, os.getpid())
+            first = json.loads(fh.readline() or "{}")
+        if first.get("kind") == _GENERATION_KIND and isinstance(first.get("generation"), int):
+            return first["generation"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return 0
+
+
+def _start_next_generation(previous):
+    """Create the next live file WITH its header in one atomic step, so a
+    reader never sees a live file without its generation."""
+    temp = "%s.%d.gen.tmp" % (OUT_PATH, os.getpid())
     with open(temp, "w", encoding="utf-8") as fh:
-        fh.write(str(count + 1))
-    os.replace(temp, path)
+        fh.write(json.dumps({"kind": _GENERATION_KIND, "generation": previous + 1}) + "\n")
+    os.replace(temp, OUT_PATH)
 
 
 def _terminate_partial_line():
@@ -166,6 +182,9 @@ _terminate_partial_line()
 
 
 _write_failure_reported = False
+# A rotation whose new live file could not be created; the next _write
+# creates it (with its header) before appending.
+_pending_generation = None
 
 
 def _write(payload):
@@ -177,10 +196,13 @@ def _write(payload):
     is reported once on stderr (mitmdump's stderr lands in the proxy's startup
     diagnostics) and dropped.
     """
-    global _write_failure_reported
+    global _write_failure_reported, _pending_generation
     if not OUT_PATH:
         return
     try:
+        if _pending_generation is not None:
+            _start_next_generation(_pending_generation)
+            _pending_generation = None
         with open(OUT_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload) + "\n")
             # tell() after an append is the file size: no extra stat per chunk.
@@ -191,26 +213,26 @@ def _write(payload):
             sys.stderr.write("[mitmAddon] cannot append to the events file: %s\n" % exc.__class__.__name__)
         return
     if _ROTATE_BYTES and size >= _ROTATE_BYTES:
+        generation = _generation_of(OUT_PATH)
         try:
-            _bump_rotations()
             # Atomically replaces the previous generation. The rotated file
             # always ends in "\n" because the line above was written whole
             # before the rename.
             os.replace(OUT_PATH, _rotated_path())
         except OSError:
             # Keep appending to the current file and try again after the next
-            # line. (A counter bumped for a rename that then failed only makes
-            # a later gap report err high, never hides a real gap.)
+            # line.
             return
         try:
             # Recreate the live file NOW rather than on the next write: an
             # idle session may not write again for hours, and until then a
             # missing proxy-events.jsonl hides the run from the debug-bundle
             # reader (it picks runs by that file) and from debug retention's
-            # run detection. If this fails, the next _write creates it.
-            open(OUT_PATH, "a", encoding="utf-8").close()
+            # run detection. If this fails, the next _write retries it first,
+            # so the generation's header is never lost.
+            _start_next_generation(generation)
         except OSError:
-            pass
+            _pending_generation = generation
 
 
 # Cap on the raw `body_b64` payload emitted to the adapter.

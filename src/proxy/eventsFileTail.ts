@@ -1,5 +1,5 @@
-import { open, readFile, stat, type FileHandle } from 'fs/promises'
-import { dirname, extname, join } from 'path'
+import { open, stat, type FileHandle } from 'fs/promises'
+import { extname } from 'path'
 
 /**
  * The previous generation's path, as mitmAddon.py `_rotated_path()` names it:
@@ -9,15 +9,6 @@ import { dirname, extname, join } from 'path'
 export function rotatedEventsPath(eventsFile: string): string {
   const ext = extname(eventsFile)
   return `${eventsFile.slice(0, eventsFile.length - ext.length)}.1${ext}`
-}
-
-/**
- * The addon's rotation counter, next to the events file (mitmAddon.py
- * `_ROTATIONS_FILE_NAME`). It only ever increases, and is bumped BEFORE each
- * rename, so a reader that sees a rename also sees its count.
- */
-export function rotationsCounterPath(eventsFile: string): string {
-  return join(dirname(eventsFile), 'proxy-events.rotations')
 }
 
 export type EventsFilePoll = {
@@ -52,20 +43,21 @@ export type EventsFilePoll = {
  * held generation is then read to its end (the addon never writes to an inode
  * after renaming it, so that end is final) before the next one starts at 0.
  *
+ * GENERATIONS: every live file the addon creates by rotating starts with a
+ * header line `{"kind":"generation","generation":n}` (the first file has none
+ * and is generation 0). The tail strips it and so always knows which generation
+ * it holds. (The first design kept a counter file beside the log; bumped
+ * before or after the rename, a reader could pair it with the wrong file and
+ * report a lost generation as 0 — round 2 of the #64 review.)
+ *
  * DELIVERY CONTRACT — exactly once and in order, OR an explicit gap:
- *   - one rotation between polls: the held generation is finished, then the
- *     new one. Nothing lost.
- *   - two rotations between polls, including one that lands while the poll
- *     itself is between awaits: the held generation is finished, the live one
- *     is opened, and the unseen generation between them — necessarily at `.1`
- *     — is read whole before it. Nothing lost. Pinned at every path-level
- *     await point by the rotation tests.
- *   - three or more (the poller stalled for >= 1 GiB of traffic at the
- *     512 MiB default): the generations between are deleted before anyone
- *     could read them. That is reported as `lostGenerations` from the addon's
- *     rotation counter instead of being passed off as exactly-once. The
- *     count is a lower bound: a rotation that races the counter read is
- *     reported on the next poll.
+ *   Whenever the tail adopts a live file of generation n, every generation
+ *   below n it has not finished is either read — the one directly below n can
+ *   only be at `.1` — or counted in `lostGenerations`. That covers one or two
+ *   rotations between polls, rotations while a poll is between awaits, and a
+ *   rotation before the very first poll. Only generations deleted before
+ *   anyone could read them (the poller stalled through >= 1 GiB of traffic at
+ *   the 512 MiB default) are lost, and they are counted exactly.
  *   We chose the bounded, reported gap over an acknowledgement protocol
  *   (the addon keeping generations until the app confirms them) because an
  *   ack channel would need a second writer in the app, and a stalled or dead
@@ -84,59 +76,39 @@ export type EventsFilePoll = {
  * slicing is safe because we only cut at `\n` (0x0A never appears inside a
  * UTF-8 multibyte sequence), and the addon writes ensure_ascii JSON anyway.
  */
+type Held = {
+  fh: FileHandle
+  ino: number
+  /** From the header line; null until the file's first line has been seen. */
+  generation: number | null
+}
+
 export class EventsFileTail {
-  private held: { fh: FileHandle; ino: number; rotationsAtOpen: number } | null = null
+  private held: Held | null = null
   private offset = 0
+  /** Highest generation fully read or already counted as lost. */
+  private settledGeneration = -1
 
   constructor(private readonly eventsFile: string) {}
 
   async poll(): Promise<EventsFilePoll> {
-    const lines: string[] = []
-    let lostGenerations = 0
-    if (!this.held) {
-      if (!(await this.openLive())) return { lines, lostGenerations }
-    }
-    const held = this.held!
-    lines.push(...(await this.readHeld()))
+    const out: EventsFilePoll = { lines: [], lostGenerations: 0 }
+    if (!this.held && !(await this.openLive())) return out
+    await this.readLive(out)
 
     // Rotated? Only the PATH can say; the handle keeps naming the old inode.
     const live = await stat(this.eventsFile).catch(() => null)
-    if (live && live.ino !== held.ino) {
+    if (live && live.ino !== this.held!.ino) {
       // The rename happened before this stat, so the held inode is final:
       // finish it. Its trailing partial line (only after a writer crash) is
       // dropped with the generation.
-      lines.push(...(await this.readHeld()))
+      await this.readLive(out)
+      const finished = this.held!
+      if (finished.generation !== null) this.settledGeneration = Math.max(this.settledGeneration, finished.generation)
       await this.closeHeld()
-      let generationsRead = 1
-      // Take the live handle BEFORE looking at `.1`. Then any generation
-      // between the one we finished and the one we now hold can only be at
-      // `.1` (a later rename would move the held live file itself there, which
-      // the inode check below recognises). Checking `.1` first and opening the
-      // live path second let a rename slip between the two and skip a whole
-      // generation (found by the per-await-point rotation test).
-      const liveOpened = await this.openLive()
-      const current = this.held
-      const middle = await this.openIfUnseen(rotatedEventsPath(this.eventsFile), held.ino, current?.ino)
-      if (middle) {
-        // A complete, renamed generation we never opened: read it whole,
-        // before the live one, to keep the order.
-        const liveOffset = this.offset
-        this.held = { ...middle, rotationsAtOpen: 0 }
-        lines.push(...(await this.readHeld()))
-        await this.closeHeld()
-        this.held = current
-        this.offset = liveOffset
-        generationsRead += 1
-      }
-      if (liveOpened) lines.push(...(await this.readHeld()))
-      // Every rename since we opened the finished file moved exactly one
-      // generation out of the live path; the ones we did not read are gone.
-      // A rename that races openLive's counter read is counted on the next
-      // rotation instead of this one.
-      const rotated = (current?.rotationsAtOpen ?? (await this.readRotations())) - held.rotationsAtOpen
-      lostGenerations = Math.max(0, rotated - generationsRead)
+      if (await this.openLive()) await this.readLive(out)
     }
-    return { lines, lostGenerations }
+    return out
   }
 
   async close(): Promise<void> {
@@ -144,25 +116,62 @@ export class EventsFileTail {
   }
 
   private async openLive(): Promise<boolean> {
-    const rotationsAtOpen = await this.readRotations()
     const fh = await open(this.eventsFile, 'r').catch(() => null)
     if (!fh) return false
     const { ino } = await fh.stat()
-    this.held = { fh, ino, rotationsAtOpen }
+    this.held = { fh, ino, generation: null }
     this.offset = 0
     return true
   }
 
-  private async openIfUnseen(path: string, ...seen: Array<number | undefined>): Promise<{ fh: FileHandle; ino: number } | null> {
-    const fh = await open(path, 'r').catch(() => null)
-    if (!fh) return null
-    const { ino } = await fh.stat()
-    if (seen.includes(ino)) {
-      await fh.close().catch(() => {})
-      return null
+  /**
+   * Read the held live generation. The first time its generation becomes
+   * known, settle every older generation first — read the one at `.1` if it is
+   * unread, count the rest as lost — so lines stay in order.
+   */
+  private async readLive(out: EventsFilePoll): Promise<void> {
+    const held = this.held!
+    const lines = await this.readFrom(held)
+    if (lines === null) return
+    if (held.generation === null) {
+      held.generation = generationOf(lines[0]) ?? 0
+      if (generationOf(lines[0]) !== null) lines.shift()
+      await this.settleBelow(held.generation, held.ino, out)
     }
-    this.offset = 0
-    return { fh, ino }
+    out.lines.push(...lines)
+  }
+
+  private async settleBelow(generation: number, liveIno: number, out: EventsFilePoll): Promise<void> {
+    const settledBefore = this.settledGeneration
+    let readRotated = 0
+    if (generation - 1 > settledBefore) {
+      // The generation directly below the live one can only be at `.1`: the
+      // addon renames live -> `.1` and then creates the next live file.
+      const rotated = await open(rotatedEventsPath(this.eventsFile), 'r').catch(() => null)
+      if (rotated) {
+        const { ino } = await rotated.stat()
+        // Never the live file itself (a rename racing this open). The
+        // generation we just finished never gets here: its generation is known
+        // once its last read resolves, so `generation - 1` is already settled.
+        if (ino !== liveIno) {
+          const liveOffset = this.offset
+          this.offset = 0
+          const lines = (await this.readFrom({ fh: rotated, ino, generation: null })) ?? []
+          this.offset = liveOffset
+          const header = generationOf(lines[0])
+          if (header !== null) lines.shift()
+          if ((header ?? 0) === generation - 1) {
+            out.lines.push(...lines)
+            readRotated = 1
+          }
+        }
+        await rotated.close().catch(() => {})
+      }
+    }
+    // Everything between what we had settled and the live generation that was
+    // neither read nor still readable is gone: count it, exactly.
+    out.lostGenerations += Math.max(0, generation - 1 - settledBefore - readRotated)
+    this.settledGeneration = Math.max(settledBefore, generation - 1)
   }
 
   private async closeHeld(): Promise<void> {
@@ -171,39 +180,51 @@ export class EventsFileTail {
     await held?.fh.close().catch(() => {})
   }
 
-  private async readRotations(): Promise<number> {
-    const raw = await readFile(rotationsCounterPath(this.eventsFile), 'utf8').catch(() => '0')
-    const value = Number.parseInt(raw.trim(), 10)
-    return Number.isFinite(value) && value >= 0 ? value : 0
-  }
-
   /**
-   * Read [offset, current size) of the HELD generation and return its complete
-   * lines, advancing `offset` only past the last `\n`. Anything after it is a
-   * write in progress and is re-read next time. (An earlier version advanced
-   * to end-of-read up-front and silently dropped a line mid-flush.)
+   * Read [offset, current size) of `file` and return its complete lines (null
+   * when there is no complete line yet), advancing `offset` only past the last
+   * `\n`. Loops until the size fstat reported, because a FileHandle read may
+   * return fewer bytes than asked (review of #64: a short read before closing
+   * a finished generation silently dropped its tail).
    */
-  private async readHeld(): Promise<string[]> {
-    const fh = this.held!.fh
-    const { size } = await fh.stat()
+  private async readFrom(file: Held): Promise<string[] | null> {
+    const { size } = await file.fh.stat()
     if (size < this.offset) {
       // Same inode, shorter: truncated in place. mitmdump never does this; a
       // manual `: > proxy-events.jsonl` would. Restart rather than wait
       // forever for the file to grow past a stale offset.
       this.offset = 0
     }
-    if (size === this.offset) return []
-    let buf = Buffer.alloc(size - this.offset)
-    const { bytesRead } = await fh.read(buf, 0, buf.length, this.offset)
-    buf = buf.subarray(0, bytesRead)
-    const lastNl = buf.lastIndexOf(0x0a)
-    if (lastNl === -1) return []
+    if (size === this.offset) return null
+    const buf = Buffer.alloc(size - this.offset)
+    let filled = 0
+    while (filled < buf.length) {
+      const { bytesRead } = await file.fh.read(buf, filled, buf.length - filled, this.offset + filled)
+      if (bytesRead === 0) break
+      filled += bytesRead
+    }
+    const data = buf.subarray(0, filled)
+    const lastNl = data.lastIndexOf(0x0a)
+    if (lastNl === -1) return null
     this.offset += lastNl + 1
-    return buf
+    return data
       .subarray(0, lastNl)
       .toString('utf8')
       .split('\n')
       .map(line => line.trim())
       .filter(line => line.length > 0)
+  }
+}
+
+/** The generation a header line names, or null when the line is not a header. */
+function generationOf(line: string | undefined): number | null {
+  if (line === undefined || !line.includes('"generation"')) return null
+  try {
+    const value = JSON.parse(line) as { kind?: unknown; generation?: unknown }
+    return value.kind === 'generation' && typeof value.generation === 'number' && Number.isInteger(value.generation)
+      ? value.generation
+      : null
+  } catch {
+    return null
   }
 }
