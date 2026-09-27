@@ -5,3 +5,5 @@ coverage/
 recordings/
 .proxy-testing/
 __pycache__/
+# Live-tier working directories (test/support/claudeLiveResidue.ts); removed after each run.
+.live-cwd/
