@@ -111,6 +111,16 @@ describe('rotating events file (#1273)', () => {
     expect(existsSync(ws.events.replace('.jsonl', '.2.jsonl'))).toBe(false)
   })
 
+  it('leaves an empty live file right after a rotation, so an idle run stays discoverable', () => {
+    const ws = workspace()
+    // A threshold below every line's size: each write rotates, including the
+    // turn's last one (response-end), and nothing follows it.
+    streamTurn(ws, [0], 100)
+    expect(existsSync(rotatedEventsPath(ws.events))).toBe(true)
+    expect(existsSync(ws.events)).toBe(true)
+    expect(statSync(ws.events).size).toBe(0)
+  })
+
   it('delivers every event exactly once, in order, across rotations', async () => {
     const ws = workspace()
     const tail = new EventsFileTail(ws.events)

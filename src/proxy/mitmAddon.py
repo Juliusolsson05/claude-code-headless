@@ -127,10 +127,16 @@ def _write(payload):
         size = fh.tell()
     if _ROTATE_BYTES and size >= _ROTATE_BYTES:
         try:
-            # Atomically replaces the previous generation; the next _write
-            # creates a fresh file. The rotated file always ends in "\n"
-            # because the line above was written whole before the rename.
+            # Atomically replaces the previous generation. The rotated file
+            # always ends in "\n" because the line above was written whole
+            # before the rename.
             os.replace(OUT_PATH, _rotated_path())
+            # Recreate the live file NOW rather than on the next write: an
+            # idle session may not write again for hours, and until then a
+            # missing proxy-events.jsonl hides the run from the debug-bundle
+            # reader (it picks runs by that file) and from debug retention's
+            # run detection.
+            open(OUT_PATH, "a", encoding="utf-8").close()
         except OSError:
             # Forensics must never disturb the proxy: keep appending to the
             # current file and try again after the next line.
