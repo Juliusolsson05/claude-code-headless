@@ -13,14 +13,20 @@ import { join, resolve } from 'node:path'
  * (vendor/claude-code-src/full/utils/config.ts, getProjectPathForConfig). A
  * fresh `/T/composer-live-*` cwd has no git root, so every run wrote a new
  * `projects` entry for a throwaway path into the REAL `~/.claude.json`, where
- * it stayed forever. Inside the checkout Claude keys the entry by the
- * repository's shared git directory. Measured 2026-09-27 with two consecutive
- * live runs from a worktree of this package: the first added exactly one entry,
- * `<agent-code>/.git/modules/claude-code-headless`, which every checkout and
- * worktree of the package shares, and the second added none. The installed
- * Claude still showed the dialog under an already-trusted PARENT, so trust is
- * not inherited in practice, whatever the vendored source's parent walk
- * suggests; the gain is one shared entry, not zero. THIS code never writes
+ * it stayed forever. Inside the checkout the entry is keyed by the canonical
+ * git root (vendor/claude-code-src/full/utils/git.ts, findCanonicalGitRoot),
+ * so it is written once per checkout FAMILY and reused by every later run:
+ *   - a worktree of this package (a `.git` file with a `commondir`): the shared
+ *     `<agent-code>/.git/modules/claude-code-headless`. Measured 2026-09-27
+ *     with two consecutive runs from such a worktree: +1 entry, then +0.
+ *   - the package's own submodule checkout (no `commondir`): that checkout's
+ *     directory, a different key.
+ *   - a plain standalone clone: its directory.
+ * So "one entry" means one per checkout family, not one for every checkout
+ * (review of #68, b). The installed Claude still showed the dialog under an
+ * already-trusted PARENT, so trust is not inherited in practice, whatever the
+ * vendored source's parent walk suggests; the gain is one entry per checkout
+ * family, not zero. THIS code never writes
  * `~/.claude.json` (rewriting it races every running Claude session); the
  * Claude process the live test launches writes that one trust entry itself
  * when the test accepts the dialog (review of claude-code-headless#68, a).

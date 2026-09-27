@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest'
 
 import { HeadlessTerminal } from '../../src/terminal/HeadlessTerminal.js'
 import { parseClaudeComposerState } from '../../src/parsers/ScreenParser.js'
+import { driveTrustDialogAccept } from '../../src/conditions/trustDialogDriver.js'
+import { detectTrustDialog } from '../../src/parsers/TrustDialogParser.js'
 import { createLiveClaudeCwd } from '../support/claudeLiveResidue.js'
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -63,26 +65,23 @@ describe('live composer detection', () => {
       })
       pty.onData(d => void term.writeForTest(d))
       pty.onExit(() => { exited = true })
-      // The folder-trust dialog, when Claude shows it. Waited for rather than
-      // sampled after a fixed sleep (a slow start missed it), and answered by
-      // moving the selection onto "Yes" rather than typing `1`: as of
-      // 2026-09-27 the dialog lists "No, exit" FIRST and preselects it, so the
-      // old blind `1\r` could never accept it (#1329, found on the first run
-      // after moving the cwd). Trust is saved once for the package's shared
-      // git directory; see test/support/claudeLiveResidue.ts.
-      // The dialog check comes FIRST in each pass: the dialog draws its own
-      // `─` rule, so testing for the composer's divider first exits the loop
-      // with the dialog still up.
+      // The folder-trust dialog, when Claude shows it, is answered by the
+      // PRODUCT's own fail-closed driver (src/conditions/trustDialogDriver.ts):
+      // it proves which row is highlighted, walks onto "Yes, I trust this
+      // folder" verifying every press, and only then presses Enter. The first
+      // version here pressed Enter after three blind Down presses, which could
+      // confirm "No, exit" (review of #68, b), and as of 2026-09-27 the dialog
+      // lists and preselects "No, exit" first. Using the driver also makes this
+      // canary a live check of it. Trust is saved once per git root; see
+      // test/support/claudeLiveResidue.ts.
       for (let i = 0; i < 20; i++) {
-        if (/Yes, I trust this folder|trust (the )?(files|this folder)/i.test(term.snapshotPlain())) {
-          for (let step = 0; step < 3; step++) {
-            const selected = term.snapshotPlain().split('\n').find(line => line.trimStart().startsWith('❯'))
-            if (selected && /yes/i.test(selected)) break
-            pty.write('\x1b[B')
-            await sleep(300)
-          }
-          pty.write('\r')
-          await sleep(3000)
+        if (detectTrustDialog(term.snapshotPlain()).visible) {
+          const accepted = await driveTrustDialogAccept({
+            write: data => pty!.write(data),
+            snapshotPlain: () => term.snapshotPlain(),
+            signal: AbortSignal.timeout(30_000),
+          })
+          expect(accepted).toMatchObject({ ok: true })
           break
         }
         if (/─{10}/.test(term.snapshotPlain())) break
