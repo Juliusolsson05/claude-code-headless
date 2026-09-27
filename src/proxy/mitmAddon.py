@@ -2,6 +2,7 @@ import json
 import os
 import re
 import base64
+import sys
 from mitmproxy import http
 
 
@@ -118,28 +119,97 @@ def _rotated_path():
     return base + ".1" + ext
 
 
-def _write(payload):
+# Rotation counter next to the events file (agent-code #1273, review of #64).
+# The tail can hold and drain the generation it is reading plus one unseen
+# generation at `.1`; if the app's poller stalls through more rotations than
+# that, the generations in between are deleted unread. The counter lets the
+# tail REPORT that gap (eventsFileTail.ts `lostGenerations`) instead of
+# silently claiming exactly-once. It is bumped BEFORE the rename, so a reader
+# that sees the rename also sees its count. Name must match
+# eventsFileTail.ts rotationsCounterPath().
+_ROTATIONS_FILE_NAME = "proxy-events.rotations"
+
+
+def _bump_rotations():
+    path = os.path.join(os.path.dirname(OUT_PATH), _ROTATIONS_FILE_NAME)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            count = int(fh.read().strip() or "0")
+    except (OSError, ValueError):
+        count = 0
+    temp = "%s.%d.tmp" % (path, os.getpid())
+    with open(temp, "w", encoding="utf-8") as fh:
+        fh.write(str(count + 1))
+    os.replace(temp, path)
+
+
+def _terminate_partial_line():
+    """A crashed addon can leave the events file ending mid-line. The next
+    append would glue a fresh event onto that fragment and both would fail to
+    parse, losing the new event too (review of #64). Ending the fragment with
+    a newline turns it into one garbage line the tail drops on its own."""
     if not OUT_PATH:
         return
-    with open(OUT_PATH, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload) + "\n")
-        # tell() after an append is the file size: no extra stat per chunk.
-        size = fh.tell()
+    try:
+        with open(OUT_PATH, "rb+") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) != b"\n":
+                fh.write(b"\n")
+    except OSError:
+        pass
+
+
+_terminate_partial_line()
+
+
+_write_failure_reported = False
+
+
+def _write(payload):
+    """Append one event; NEVER raise.
+
+    WHY never raise: this runs inside mitmproxy's hooks, including the stream
+    tap that forwards Claude's live response to the CLI. An exception there
+    breaks the user's actual request, not just our log. A write we cannot make
+    is reported once on stderr (mitmdump's stderr lands in the proxy's startup
+    diagnostics) and dropped.
+    """
+    global _write_failure_reported
+    if not OUT_PATH:
+        return
+    try:
+        with open(OUT_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload) + "\n")
+            # tell() after an append is the file size: no extra stat per chunk.
+            size = fh.tell()
+    except OSError as exc:
+        if not _write_failure_reported:
+            _write_failure_reported = True
+            sys.stderr.write("[mitmAddon] cannot append to the events file: %s\n" % exc.__class__.__name__)
+        return
     if _ROTATE_BYTES and size >= _ROTATE_BYTES:
         try:
+            _bump_rotations()
             # Atomically replaces the previous generation. The rotated file
             # always ends in "\n" because the line above was written whole
             # before the rename.
             os.replace(OUT_PATH, _rotated_path())
+        except OSError:
+            # Keep appending to the current file and try again after the next
+            # line. (A counter bumped for a rename that then failed only makes
+            # a later gap report err high, never hides a real gap.)
+            return
+        try:
             # Recreate the live file NOW rather than on the next write: an
             # idle session may not write again for hours, and until then a
             # missing proxy-events.jsonl hides the run from the debug-bundle
             # reader (it picks runs by that file) and from debug retention's
-            # run detection.
+            # run detection. If this fails, the next _write creates it.
             open(OUT_PATH, "a", encoding="utf-8").close()
         except OSError:
-            # Forensics must never disturb the proxy: keep appending to the
-            # current file and try again after the next line.
             pass
 
 

@@ -33,6 +33,11 @@ export type ProxyServerInfo = {
 
 export type ProxyServerEvents = {
   event: [ProxyCapturedEvent]
+  /** Whole events-file generations were rotated away and deleted before the
+   *  tail read them, so their events never reached `event` (#1273; see
+   *  EventsFileTail's delivery contract). Only after the poller stalled for
+   *  >= two rotations' worth of traffic. */
+  'transport-gap': [{ lostGenerations: number }]
   stderr: [string]
   stdout: [string]
 }
@@ -273,6 +278,9 @@ export class ProxyServer extends EventEmitter {
       clearInterval(this.watcherTimer)
       this.watcherTimer = null
     }
+    // The tail holds an open handle on the current generation; release it so
+    // a stopped proxy does not pin a deleted file's disk space.
+    await this.eventsTail.close()
     if (!this.child) return
     const child = this.child
     this.child = null
@@ -373,7 +381,14 @@ export class ProxyServer extends EventEmitter {
     if (this.pollInFlight) return
     this.pollInFlight = true
     try {
-      for (const line of await this.eventsTail.poll()) {
+      const { lines, lostGenerations } = await this.eventsTail.poll()
+      if (lostGenerations > 0) {
+        // Loud, bounded, and without any event content: a lost generation
+        // means the live view may be missing a stretch of this session.
+        console.warn(`[proxy] events transport lost ${lostGenerations} rotated generation(s) of ${this.info.eventsFile} before they were read`)
+        this.emit('transport-gap', { lostGenerations })
+      }
+      for (const line of lines) {
         try {
           this.emit('event', JSON.parse(line) as ProxyCapturedEvent)
         } catch {
