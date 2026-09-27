@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -20,9 +20,10 @@ import { join, resolve } from 'node:path'
  * worktree of the package shares, and the second added none. The installed
  * Claude still showed the dialog under an already-trusted PARENT, so trust is
  * not inherited in practice, whatever the vendored source's parent walk
- * suggests; the gain is one shared entry, not zero. The real
- * `~/.claude.json` is never edited here: rewriting it races every running
- * Claude session.
+ * suggests; the gain is one shared entry, not zero. THIS code never writes
+ * `~/.claude.json` (rewriting it races every running Claude session); the
+ * Claude process the live test launches writes that one trust entry itself
+ * when the test accepts the dialog (review of claude-code-headless#68, a).
  *
  * WHY the transcript directory is removed by exact name: Claude keys a
  * session's transcript directory by the sanitized ORIGINAL cwd
@@ -44,6 +45,14 @@ export type LiveClaudeCwd = {
   cleanup(): string[]
 }
 
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
 export function createLiveClaudeCwd(options: { packageRoot: string; configHome?: string }): LiveClaudeCwd {
   const parent = join(options.packageRoot, '.live-cwd')
   mkdirSync(parent, { recursive: true })
@@ -51,22 +60,28 @@ export function createLiveClaudeCwd(options: { packageRoot: string; configHome?:
   // resolved (macOS /var → /private/var), so the name must be derived from it.
   const cwd = join(realpathSync(parent), `composer-${randomUUID()}`)
   mkdirSync(cwd)
+  // Resolved against the CHILD's cwd, because that is where Claude resolves a
+  // relative CLAUDE_CONFIG_DIR (review of #68, a: resolving it against the
+  // test runner's cwd aimed the delete at a directory Claude never used). An
+  // empty value is the same relative case; Claude's `??` keeps it.
   const configHome = options.configHome ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
+  const projects = resolve(cwd, configHome, 'projects')
   return {
     cwd,
     cleanup() {
       const residue: string[] = []
       const sanitized = sanitizeClaudeProjectPath(cwd)
+      const transcripts = join(projects, sanitized)
       if (sanitized.length > CLAUDE_SANITIZED_PATH_LIMIT) {
-        residue.push(`${join(configHome, 'projects')}/${sanitized.slice(0, 40)}… (name is hashed past ${CLAUDE_SANITIZED_PATH_LIMIT} characters; not removed)`)
+        residue.push(`${projects}/${sanitized.slice(0, 40)}… (name is hashed past ${CLAUDE_SANITIZED_PATH_LIMIT} characters; not removed)`)
+      } else if (isSymlink(projects) || isSymlink(transcripts)) {
+        // Never follow a symlink into a recursive delete (review of #68, a):
+        // a lexical containment check cannot see where a linked `projects`
+        // points, so a linked parent or target is left alone and reported.
+        residue.push(`${transcripts} (a symlink is on the path; not removed)`)
       } else {
-        const transcripts = join(configHome, 'projects', sanitized)
-        // The resolved path must stay inside <configHome>/projects: a crafted
-        // cwd can never make this remove anything else.
-        if (resolve(transcripts).startsWith(resolve(configHome, 'projects') + '/')) {
-          rmSync(transcripts, { recursive: true, force: true })
-          if (existsSync(transcripts)) residue.push(transcripts)
-        }
+        rmSync(transcripts, { recursive: true, force: true })
+        if (existsSync(transcripts)) residue.push(transcripts)
       }
       rmSync(cwd, { recursive: true, force: true })
       if (existsSync(cwd)) residue.push(cwd)

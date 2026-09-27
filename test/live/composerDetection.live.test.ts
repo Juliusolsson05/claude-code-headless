@@ -45,20 +45,24 @@ describe('live composer detection', () => {
       cols: 120,
       rows: 40,
     })
-    const pty = spawn(process.env.SHELL ?? '/bin/zsh', ['-lc', 'claude'], {
-      name: 'xterm-256color',
-      cols: 120,
-      rows: 40,
-      cwd,
-      env: { ...process.env, TERM: 'xterm-256color' },
-    })
-    pty.onData(d => void term.writeForTest(d))
-
     const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms))
     const classify = (): string =>
       parseClaudeComposerState(term.snapshotPlain(), term.snapshotComposerAttributes())
 
+    // Spawned inside the try (review of #68, a): a spawn failure used to
+    // throw before it and leave the cwd behind.
+    let pty: ReturnType<typeof spawn> | null = null
+    let exited = false
     try {
+      pty = spawn(process.env.SHELL ?? '/bin/zsh', ['-lc', 'claude'], {
+        name: 'xterm-256color',
+        cols: 120,
+        rows: 40,
+        cwd,
+        env: { ...process.env, TERM: 'xterm-256color' },
+      })
+      pty.onData(d => void term.writeForTest(d))
+      pty.onExit(() => { exited = true })
       // The folder-trust dialog, when Claude shows it. Waited for rather than
       // sampled after a fixed sleep (a slow start missed it), and answered by
       // moving the selection onto "Yes" rather than typing `1`: as of
@@ -138,13 +142,19 @@ describe('live composer detection', () => {
       }
     } finally {
       // Wait for Claude to exit before removing its transcript directory, or
-      // a late write recreates it after cleanup.
-      await new Promise<void>(resolveExit => {
-        pty.onExit(() => resolveExit())
+      // a late write recreates it after cleanup. SIGTERM, then SIGKILL; if it
+      // still has not exited the cleanup runs anyway and SAYS so, because a
+      // late write can then leave residue (review of #68, a).
+      if (pty) {
         pty.kill()
-        setTimeout(resolveExit, 10_000)
-      })
+        for (let i = 0; i < 100 && !exited; i++) await sleep(100)
+        if (!exited) {
+          pty.kill('SIGKILL')
+          for (let i = 0; i < 50 && !exited; i++) await sleep(100)
+        }
+      }
       const residue = live.cleanup()
+      if (pty && !exited) residue.push('Claude did not exit; a late transcript write may recreate its project directory')
       if (residue.length > 0) console.warn(`[live] could not remove: ${residue.join(', ')}`)
     }
   }, 150_000)
