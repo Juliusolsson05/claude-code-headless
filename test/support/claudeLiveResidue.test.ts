@@ -89,4 +89,30 @@ describe('live Claude cwd (#1329)', () => {
     expect(existsSync(join(sentinel, 'keep.txt'))).toBe(true)
     expect(existsSync(live.cwd)).toBe(false)
   })
+
+  // Review of #68, round 2 (a, b): a symlinked TARGET had no test (removing
+  // its guard passed the suite), and a symlinked config HOME was not checked.
+  it.each(['target', 'config home'] as const)('never deletes through a symlinked %s', which => {
+    const packageRoot = temp('cch-pkg-')
+    const elsewhere = temp('cch-elsewhere-')
+    const root = temp('cch-config-parent-')
+    const configHome = join(root, 'claude-home')
+    if (which === 'config home') {
+      mkdirSync(join(elsewhere, 'projects'), { recursive: true })
+      symlinkSync(elsewhere, configHome)
+    } else {
+      mkdirSync(join(configHome, 'projects'), { recursive: true })
+    }
+    const live = createLiveClaudeCwd({ packageRoot, configHome })
+    const name = sanitizeClaudeProjectPath(live.cwd)
+    const sentinel = which === 'config home' ? join(elsewhere, 'projects', name) : join(elsewhere, name)
+    mkdirSync(sentinel, { recursive: true })
+    writeFileSync(join(sentinel, 'keep.txt'), 'not ours to delete')
+    if (which === 'target') symlinkSync(sentinel, join(configHome, 'projects', name))
+
+    const residue = live.cleanup()
+    expect(residue).toHaveLength(1)
+    expect(residue[0]).toMatch(/symlink/)
+    expect(existsSync(join(sentinel, 'keep.txt'))).toBe(true)
+  })
 })

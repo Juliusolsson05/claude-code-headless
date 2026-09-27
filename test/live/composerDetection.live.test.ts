@@ -36,8 +36,9 @@ describe('live composer detection', () => {
   it('classifies real placeholders as empty and real typing as drafted', async () => {
     // Not a bare mkdtemp (#1329): that left a trust entry, a transcript and
     // the cwd in the developer's real Claude home on every run. See
-    // test/support/claudeLiveResidue.ts for why this placement avoids the
-    // trust entry and how the transcript is removed.
+    // test/support/claudeLiveResidue.ts for why this placement adds no NEW
+    // trust entry after the first run in a checkout family, and how the
+    // transcript is removed.
     const live = createLiveClaudeCwd({ packageRoot })
     const cwd = live.cwd
     const term = new HeadlessTerminal({
@@ -141,20 +142,27 @@ describe('live composer detection', () => {
       }
     } finally {
       // Wait for Claude to exit before removing its transcript directory, or
-      // a late write recreates it after cleanup. SIGTERM, then SIGKILL; if it
-      // still has not exited the cleanup runs anyway and SAYS so, because a
-      // late write can then leave residue (review of #68, a).
-      if (pty) {
-        pty.kill()
-        for (let i = 0; i < 100 && !exited; i++) await sleep(100)
-        if (!exited) {
-          pty.kill('SIGKILL')
-          for (let i = 0; i < 50 && !exited; i++) await sleep(100)
+      // a late write recreates it after cleanup. node-pty's plain kill() sends
+      // SIGHUP on Unix; if Claude has not exited, SIGKILL follows. Windows
+      // rejects an explicit signal (node-pty's windowsTerminal), so there the
+      // plain kill is repeated instead. The cleanup sits in its own `finally`
+      // so an escalation that throws can never skip it (review of #68,
+      // round 2, b), and it SAYS when Claude outlived the wait.
+      try {
+        if (pty) {
+          pty.kill()
+          for (let i = 0; i < 100 && !exited; i++) await sleep(100)
+          if (!exited) {
+            if (process.platform === 'win32') pty.kill()
+            else pty.kill('SIGKILL')
+            for (let i = 0; i < 50 && !exited; i++) await sleep(100)
+          }
         }
+      } finally {
+        const residue = live.cleanup()
+        if (pty && !exited) residue.push('Claude did not exit; a late transcript write may recreate its project directory')
+        if (residue.length > 0) console.warn(`[live] could not remove: ${residue.join(', ')}`)
       }
-      const residue = live.cleanup()
-      if (pty && !exited) residue.push('Claude did not exit; a late transcript write may recreate its project directory')
-      if (residue.length > 0) console.warn(`[live] could not remove: ${residue.join(', ')}`)
     }
   }, 150_000)
 })

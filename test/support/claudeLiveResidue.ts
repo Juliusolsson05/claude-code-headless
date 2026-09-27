@@ -4,9 +4,10 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 /**
- * A working directory for a live Claude run that leaves nothing behind in the
- * user's real Claude home except what they already have (#1329, split from
- * agent-code#1295).
+ * A working directory for a live Claude run that leaves no transcript and no
+ * cwd behind in the user's real Claude home, and adds no NEW trust entry after
+ * the first run in a checkout family (#1329, split from agent-code#1295; the
+ * one trust entry is explained below).
  *
  * WHY inside the package checkout and not `os.tmpdir()`: Claude saves an
  * accepted folder trust under the cwd's GIT ROOT
@@ -71,7 +72,8 @@ export function createLiveClaudeCwd(options: { packageRoot: string; configHome?:
   // test runner's cwd aimed the delete at a directory Claude never used). An
   // empty value is the same relative case; Claude's `??` keeps it.
   const configHome = options.configHome ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
-  const projects = resolve(cwd, configHome, 'projects')
+  const home = resolve(cwd, configHome)
+  const projects = join(home, 'projects')
   return {
     cwd,
     cleanup() {
@@ -80,10 +82,14 @@ export function createLiveClaudeCwd(options: { packageRoot: string; configHome?:
       const transcripts = join(projects, sanitized)
       if (sanitized.length > CLAUDE_SANITIZED_PATH_LIMIT) {
         residue.push(`${projects}/${sanitized.slice(0, 40)}… (name is hashed past ${CLAUDE_SANITIZED_PATH_LIMIT} characters; not removed)`)
-      } else if (isSymlink(projects) || isSymlink(transcripts)) {
+      } else if (isSymlink(home) || isSymlink(projects) || isSymlink(transcripts)) {
         // Never follow a symlink into a recursive delete (review of #68, a):
-        // a lexical containment check cannot see where a linked `projects`
-        // points, so a linked parent or target is left alone and reported.
+        // a lexical containment check cannot see where a link points, so a
+        // linked config home, `projects` or target is left alone and
+        // reported. Round 2 found the config home itself one level above the
+        // first check. Components ABOVE the config home (macOS /var ->
+        // /private/var, a symlinked $HOME) are the system's, not this run's,
+        // and Claude writes through them too.
         residue.push(`${transcripts} (a symlink is on the path; not removed)`)
       } else {
         rmSync(transcripts, { recursive: true, force: true })
