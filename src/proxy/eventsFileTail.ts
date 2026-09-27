@@ -20,6 +20,22 @@ export type EventsFilePoll = {
    * class comment for when it is not.
    */
   lostGenerations: number
+  /**
+   * WHERE each lost span sat in `lines` (agent-code#1381): `index` is how many
+   * of this poll's lines were written BEFORE the loss, so a consumer can act
+   * on the gap at its true place instead of ahead of the whole batch. One
+   * entry per settle that lost anything — a single poll can settle twice (its
+   * first adoption, then a rotation) — and their `lostGenerations` sum to the
+   * total above. Empty in every normal run.
+   *
+   * WHY the position and not only the count: the held generation's unread
+   * tail is always written before the lost generations and `.1`/live after
+   * them. A consumer told "gap" first and the lines second would apply a
+   * pre-gap request after reacting to the gap — the Claude adapter seals the
+   * flows it tracks on a gap, so it would then open a fresh flow whose chunks
+   * were lost and stream a corrupted answer with nothing saying so.
+   */
+  gaps: Array<{ index: number; lostGenerations: number }>
 }
 
 /**
@@ -92,7 +108,7 @@ export class EventsFileTail {
   constructor(private readonly eventsFile: string) {}
 
   async poll(): Promise<EventsFilePoll> {
-    const out: EventsFilePoll = { lines: [], lostGenerations: 0 }
+    const out: EventsFilePoll = { lines: [], lostGenerations: 0, gaps: [] }
     if (!this.held && !(await this.openLive())) return out
     await this.readLive(out)
 
@@ -142,6 +158,10 @@ export class EventsFileTail {
   }
 
   private async settleBelow(generation: number, liveIno: number, out: EventsFilePoll): Promise<void> {
+    // Every line already in `out` was written before anything this settle can
+    // lose: the older generations' tails were finished first, and `.1` and the
+    // live file (both newer than the lost span) are pushed below.
+    const gapIndex = out.lines.length
     const settledBefore = this.settledGeneration
     let readRotated = 0
     if (generation - 1 > settledBefore) {
@@ -177,7 +197,9 @@ export class EventsFileTail {
     }
     // Everything between what we had settled and the live generation that was
     // neither read nor still readable is gone: count it, exactly.
-    out.lostGenerations += Math.max(0, generation - 1 - settledBefore - readRotated)
+    const lost = Math.max(0, generation - 1 - settledBefore - readRotated)
+    out.lostGenerations += lost
+    if (lost > 0) out.gaps.push({ index: gapIndex, lostGenerations: lost })
     this.settledGeneration = Math.max(settledBefore, generation - 1)
   }
 

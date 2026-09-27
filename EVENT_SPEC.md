@@ -209,7 +209,10 @@ this package must emit:
    the turn should be treated as an error surface. A turn the adapter
    sealed because the machine slept (`sealFlowsSilentSince`, called by the
    host after a suspension) carries `interruption: 'system-suspended'` and
-   `stopReason: null`; `stopReason` itself stays upstream's vocabulary.
+   `stopReason: null`; `stopReason` itself stays upstream's vocabulary. The
+   same shape carries `'transport-error'` (the stream's socket died before
+   the message ended) and `'transport-gap'` (the events transport lost a span
+   of it; `sealFlowsForTransportGap`).
 8. Usage: `usage_updated` with the merged usage shape.
 9. Error: `stream_error` (soft — streaming defensive errors),
    `api_error` (hard — `APIError` surfaced to caller).
