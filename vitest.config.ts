@@ -11,7 +11,10 @@ export default defineConfig({
         test: {
           name: 'core',
           environment: 'node',
-          include: ['src/**/*.test.ts'],
+          // test/support holds helpers for the opt-in live tier; their own
+          // tests run here so the helpers are checked in CI even though the
+          // live tests that use them are not (#1329).
+          include: ['src/**/*.test.ts', 'test/support/**/*.test.ts'],
           exclude: ['src/**/*.system.test.ts', 'src/**/*.live.test.ts'],
         },
       },
