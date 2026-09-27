@@ -295,6 +295,7 @@ export {
   ProxyServer,
   createProxyServer,
   buildMitmdumpArgs,
+  buildMitmdumpEnv,
   type ProxyServerInfo,
   type ProxyServerEvents,
   type ProxyCapturedEvent,

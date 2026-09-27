@@ -29,6 +29,18 @@ export type ProxyServerInfo = {
    *  Optional so existing callers that build a `ProxyServerInfo` by hand
    *  keep compiling; absent means DEFAULT_ALLOWED_HOSTS. */
   allowedHosts?: string[]
+  /** Write mitmproxy's TLS key log (`sslkeylog.log`) into the run
+   *  directory. Default false.
+   *
+   *  WHY opt-in (agent-code#1380): mitmproxy appends the session secrets of
+   *  EVERY TLS handshake to this file (~0.9 KB per handshake), nothing
+   *  rotates it, and debug retention skips a live run directory, so it grew
+   *  for the life of every session. It is also those secrets in plaintext on
+   *  disk: anyone who can read the run directory can decrypt captured
+   *  traffic. Its only use is decrypting a packet capture, which nothing in
+   *  this package or Agent Code does. Turn it on deliberately when you are
+   *  doing exactly that. */
+  sslKeyLog?: boolean
 }
 
 export type ProxyServerEvents = {
@@ -85,6 +97,18 @@ export type CreateProxyServerOptions = {
    *  attribution policy (see `ClaudeCodeHeadlessOptions.proxy.allowedHosts`)
    *  or the flows arrive and are then classified `'ignore'`. */
   allowedHosts?: string[]
+  /** Write mitmproxy's TLS key log (`sslkeylog.log`) into the run
+   *  directory. Default false.
+   *
+   *  WHY opt-in (agent-code#1380): mitmproxy appends the session secrets of
+   *  EVERY TLS handshake to this file (~0.9 KB per handshake), nothing
+   *  rotates it, and debug retention skips a live run directory, so it grew
+   *  for the life of every session. It is also those secrets in plaintext on
+   *  disk: anyone who can read the run directory can decrypt captured
+   *  traffic. Its only use is decrypting a packet capture, which nothing in
+   *  this package or Agent Code does. Turn it on deliberately when you are
+   *  doing exactly that. */
+  sslKeyLog?: boolean
 }
 
 const caBootstrapLocks = new Map<string, Promise<void>>()
@@ -225,8 +249,7 @@ export class ProxyServer extends EventEmitter {
   private async startUnlocked(): Promise<void> {
     const allowedHosts = this.info.allowedHosts ?? [...DEFAULT_ALLOWED_HOSTS]
     const env = {
-      ...process.env,
-      MITMPROXY_SSLKEYLOGFILE: join(this.info.workDir, 'sslkeylog.log'),
+      ...buildMitmdumpEnv(process.env, { workDir: this.info.workDir, sslKeyLog: this.info.sslKeyLog === true }),
       PROXY_EVENTS_FILE: this.info.eventsFile,
       // The addon runs its OWN per-request host checks (which requests to
       // body-parse, which responses to stream-tap, where to force
@@ -435,6 +458,27 @@ export class ProxyServer extends EventEmitter {
  * exercised (and reasoned about) as "the addon + host gate", which is
  * the part that carries the policy; `startUnlocked` passes all of them.
  */
+/**
+ * The environment mitmdump inherits, minus or plus the TLS key log
+ * (agent-code#1380; see `ProxyServerInfo.sslKeyLog`).
+ *
+ * WHY an inherited `MITMPROXY_SSLKEYLOGFILE` is REMOVED rather than passed
+ * through: the variable is mitmproxy's own, so a value exported in the
+ * user's shell (or set by any parent process) would silently re-enable the
+ * unbounded secret-bearing file this option exists to keep off. The only way
+ * to get a key log is the explicit option, and it always lands in this
+ * run's directory, where debug retention can find and remove it.
+ */
+export function buildMitmdumpEnv(
+  inherited: NodeJS.ProcessEnv,
+  options: { workDir: string; sslKeyLog: boolean },
+): NodeJS.ProcessEnv {
+  const { MITMPROXY_SSLKEYLOGFILE: _inheritedKeyLog, ...env } = inherited
+  return options.sslKeyLog
+    ? { ...env, MITMPROXY_SSLKEYLOGFILE: join(options.workDir, 'sslkeylog.log') }
+    : env
+}
+
 export function buildMitmdumpArgs(options: {
   addonPath: string
   allowedHosts?: string[]
@@ -483,6 +527,7 @@ export async function createProxyServer(
       eventsFile,
       caCertPath,
       allowedHosts: opts.allowedHosts,
+      ...(opts.sslKeyLog ? { sslKeyLog: true } : {}),
     })
   } catch (error) {
     // Same durability rationale as ProxyServer.writeStartupError: failures in
