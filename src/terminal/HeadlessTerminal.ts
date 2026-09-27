@@ -79,15 +79,24 @@ export type HeadlessTerminalOptions = {
   snapshotIntervalMs?: number
   /**
    * An extra, owner-supplied term for the text-only change gate
-   * (agent-code#1253). Called on every flush that the text gate would
-   * otherwise drop; a different value from the last emitted frame's lets the
-   * frame through. The owner keeps it CHEAP and returns a constant ('') in the
-   * common case. ClaudeCodeHeadless returns the slash picker's selected row,
-   * and only while a picker is visible, because selection there is
-   * colour-only. See the gate's KNOWN TRADEOFF comment for why the gate itself
-   * stays attribute-blind.
+   * (agent-code#1253). ClaudeCodeHeadless returns the slash picker's selected
+   * row while a picker is visible, because selection there is colour-only.
+   * See the gate's KNOWN TRADEOFF comment for why the gate itself stays
+   * attribute-blind.
+   *
+   * Two readings, so that the grid is parsed only when it has to be:
+   *   - 'live': read from the current grid, and ONLY on a flush whose text is
+   *     unchanged (the one case the text gate would drop). A changed-text
+   *     frame is emitted anyway, so reading it there was a wasted parse
+   *     (#1253 review a).
+   *   - 'emitted': recorded right AFTER a frame is emitted, from the state the
+   *     owner's 'screen' handler has just parsed. Recording it before
+   *     emission stored the pre-parse value ('' for a picker that was just
+   *     opening), so the next no-op write emitted a duplicate frame (#1253
+   *     review a).
+   * The owner keeps both cheap and returns '' in the common (no-picker) case.
    */
-  gateSignature?: () => string
+  gateSignature?: (source: 'live' | 'emitted') => string
 }
 
 export type ScreenSnapshot = {
@@ -261,7 +270,7 @@ export class HeadlessTerminal extends EventEmitter {
   private lastEmittedPlain: string | null = null
   private lastEmittedRecent: string | null = null
   private lastEmittedSignature = ''
-  private readonly gateSignature: (() => string) | undefined
+  private readonly gateSignature: ((source: 'live' | 'emitted') => string) | undefined
   // Chrome-blind keys of the last emitted frame plus the markdown strings
   // emitted with it (agent-code#765). WHY the markdown is retained: a frame
   // whose normalized keys equal the last emit's differs only in spinner
@@ -649,11 +658,13 @@ export class HeadlessTerminal extends EventEmitter {
       // repaint the text gate drops. The owner's signature names the one
       // attribute-driven fact it needs, cheaply, instead of making every
       // frame attribute-aware (see KNOWN TRADEOFF above).
-      const signature = this.gateSignature?.() ?? ''
-      if (plain === this.lastEmittedPlain && recent === this.lastEmittedRecent && signature === this.lastEmittedSignature) {
+      if (
+        plain === this.lastEmittedPlain &&
+        recent === this.lastEmittedRecent &&
+        (this.gateSignature?.('live') ?? '') === this.lastEmittedSignature
+      ) {
         return
       }
-      this.lastEmittedSignature = signature
       // Second gate, one level softer (agent-code#765): the text DID change,
       // but did anything other than spinner chrome change? Normalize both
       // strings (glyph at line start → fixed token, timers → `Ns`, token
@@ -705,6 +716,9 @@ export class HeadlessTerminal extends EventEmitter {
         recentMarkdown: derived.recentMarkdown,
         spinnerOnly: reusable !== null,
       })
+      // After the handlers ran (emit is synchronous): the signature of what
+      // was actually emitted and parsed. See gateSignature.
+      this.lastEmittedSignature = this.gateSignature?.('emitted') ?? ''
     }, this.snapshotIntervalMs)
   }
 

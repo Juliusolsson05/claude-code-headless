@@ -41,3 +41,36 @@ it('does not parse the picker on dropped flushes while no picker is visible', as
   // The screen handler parses once per emitted frame; nothing else may.
   expect(calls.detect).toBe(screens)
 })
+
+// #1253 review a, on the real 2.1.283 recording: (1) the signature recorded
+// for an emitted frame must be the POST-parse one, or a picker that just
+// opened emits a duplicate frame on the next no-op write; (2) a frame whose
+// text changed is emitted anyway, so the live signature must not re-parse the
+// grid for it (the screen handler's parse is the only one).
+it('neither duplicates a frame after the picker opens nor parses a changed frame twice', async () => {
+  const { readFileSync } = await import('node:fs')
+  const recording = JSON.parse(readFileSync(new URL('../test/fixtures/slash-picker/colour-only-selection-2.1.283.json', import.meta.url), 'utf8')) as { cols: number; rows: number; steps: Array<{ step: string; chunks: string[] }> }
+  const headless = new ClaudeCodeHeadless({ pty: fakePty(), cwd: '/tmp', cols: recording.cols, rows: recording.rows, snapshotIntervalMs: 1 })
+  const terminal = (headless as unknown as { terminal: EventEmitter & { writeForTest(data: string): Promise<void> } }).terminal
+  let screens = 0
+  terminal.on('screen', () => { screens += 1 })
+  const settle = () => new Promise(resolve => setTimeout(resolve, 20))
+  const play = async (step: string) => {
+    for (const chunk of recording.steps.find(entry => entry.step === step)!.chunks) await terminal.writeForTest(chunk)
+    await settle()
+  }
+  await play('open-filtered')
+  expect(headless.getSlashPickerState().visible).toBe(true)
+
+  // (1) No-op writes (cursor home: no text, no colour change).
+  const afterOpen = screens
+  await terminal.writeForTest('\x1b[H'); await settle()
+  await terminal.writeForTest('\x1b[H'); await settle()
+  expect(screens).toBe(afterOpen)
+
+  // (2) A scroll changes the text: one parse per emitted frame, no more.
+  const [screensBefore, detectBefore] = [screens, calls.detect]
+  await play('arrow-down-2')
+  expect(screens).toBeGreaterThan(screensBefore)
+  expect(calls.detect - detectBefore).toBe(screens - screensBefore)
+})

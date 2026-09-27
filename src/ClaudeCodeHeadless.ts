@@ -487,10 +487,14 @@ export class ClaudeCodeHeadless extends EventEmitter {
       // visible (the last parsed state), the selected row joins the gate. With
       // no picker this is a constant '' and costs one property read: the
       // common frame stays attribute-blind (agent-code#390).
-      gateSignature: () => {
+      gateSignature: source => {
         if (!this.pickerState.visible) return ''
-        const selected = detectSlashPicker(this.terminal.getTerminal()).items.find(item => item.selected)
-        return `picker:${selected?.id ?? ''}`
+        // 'emitted' runs right after the screen handler stored this frame's
+        // parse, so it costs nothing; only 'live' (unchanged text, picker
+        // open) reads the grid.
+        const picker = source === 'emitted' ? this.pickerState : detectSlashPicker(this.terminal.getTerminal())
+        if (!picker.visible) return ''
+        return `picker:${picker.items.find(item => item.selected)?.id ?? ''}`
       },
     })
 
