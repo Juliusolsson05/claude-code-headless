@@ -14,4 +14,4 @@ permissions:
 
 jobs:
   release:
-    uses: Juliusolsson05/agent-code/.github/workflows/reusable-package-release.yml@04071925e234eb9ec76f0b9c3a4daec58710e551
+    uses: Juliusolsson05/agent-code/.github/workflows/reusable-package-release.yml@f921e8d749ff798b889880bd5978a45c195b560d
