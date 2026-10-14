@@ -1,35 +1,49 @@
 // Slash command picker detection.
 //
-// Reverse-engineered from CC's render pipeline by reading
-// claude-code-src/components/PromptInput/PromptInputFooterSuggestions.tsx:
-// each picker row is a <Text color={textColor} dimColor={dimColor}> where
-// `dimColor = !isSelected` and `textColor = isSelected ? "suggestion" : undefined`.
-// That means the SELECTED row gets a bright "suggestion" palette color
-// while the non-selected rows get a muted gray color. Both colors show
-// up as SGR palette indices in the @xterm/headless buffer — in the dark
-// theme we see fg=153 (selected) and fg=246 (dim) on rows that start
-// with `/`.
+// WHERE THE PICKER IS (agent-code#1477, recorded, not read from source): the
+// picker is the block of rows sitting DIRECTLY ON TOP of the composer's top
+// rule:
 //
-// What we do NOT see in the buffer:
-//   - `cell.isDim()` is always 0, even though chalk.dim emits SGR 2.
-//     Ink or node-pty is collapsing dim-plus-color into a single
-//     palette index before the cell gets stored.
-//   - `cell.isBold()` / `cell.isItalic()` / `cell.isInverse()` are all 0.
+//       ⏺ …transcript…                         ← anything, including `/…` rows
+//       ✢ Composing… (13s)                      ← spinner / status / blank row
+//       ❯ /clear        Start a new session…   ← picker item (selected)
+//                       disk (resumable…)       ← its wrapped description
+//         /claude-api   Reference for the…      ← picker item
+//       ────────────────────────────────────    ← composer top rule
+//       ❯ /cl                                   ← composer
+//       ────────────────────────────────────
 //
-// So the signal we rely on is: "row starts with `/`, first cell has a
-// non-default fg color." Every picker row matches. The SELECTED row is
-// the one whose fg color is DIFFERENT from the others in the picker
-// block. We identify the dim color as the most common one and flip
-// `selected` on any row whose color doesn't match. Robust to theme
-// changes because the rule uses relative distinction rather than
-// hardcoded color values.
+// That held in every screen recorded across Claude Code 2.1.283 and 2.1.296,
+// at 120 and 60 columns, idle and mid-turn (docs/decomposition/claude-slash-
+// picker.md in agent-code, fixtures in test/fixtures/slash-picker).
 //
-// This parser takes a Terminal instance directly for cell-level
-// attribute access — it must run in a Node context where the headless
-// xterm Terminal is available. Downstream applications typically call
-// it on each screen snapshot and forward the result to their UI layer.
+// WHY anchoring and not the old "any coloured `/`-led row in the viewport":
+// that rule matched transcript content. Claude hard-wraps a running Bash
+// command's `$ …` line, so a path can put `/` first on the continuation row
+// (`     /scratchpad/shots && cd $S …`). That row is painted #999999, the SAME
+// colour as an unselected picker row, so no colour test can reject it. The
+// composer saw a one-item "picker" for as long as the command stayed on
+// screen. Its position can reject it: a spinner, status or blank row always
+// separates the transcript from the composer, while the picker touches it.
+//
+// WHY the old header was wrong: it was written from the vendored
+// `PromptInputFooter.tsx`, where suggestions replace the footer BELOW the
+// input. The installed binaries draw the picker above the input, and the
+// vendored source is older than either. Don't re-derive layout from
+// vendor/ — record the binary.
+//
+// SELECTION: 2.1.296 prefixes the selected row with a literal `❯ `
+// (`  ❯ /clear …`). The old parser required `/` as the first glyph, so it
+// silently DROPPED the selected command on 2.1.296. 2.1.283 has no glyph and
+// marks selection by colour only (agent-code#1253), so the colour rule stays
+// as the fallback when no row carries `❯`.
+//
+// This parser takes a Terminal instance directly for cell-level access (fg
+// colour) and must run where the headless xterm Terminal is available.
 
 import xtermHeadless from '@xterm/headless'
+
+import { isDividerLine } from './ScreenParser.js'
 const { Terminal } = xtermHeadless
 
 type TerminalInstance = InstanceType<typeof Terminal>
@@ -41,7 +55,8 @@ export type PickerItem = {
    *  types (file / agent / mcp resource) can have different display
    *  labels vs. stable ids. */
   label: string
-  /** Short one-line description CC renders after the padding. */
+  /** The description CC renders after the padding, joined across the rows
+   *  it wraps onto (it used to stop at the first row). */
   description: string
   /** True if this is the row CC is rendering as the current selection. */
   selected: boolean
@@ -54,126 +69,138 @@ export type SlashPickerState = {
 
 const HIDDEN: SlashPickerState = { visible: false, items: [] }
 
+// A picker item row: optional `❯ ` (2.1.296's selection glyph), optional `* `
+// (seen once on a user-installed skill; meaning unknown, see Unknown 1 in the
+// decomposition), then the `/command` token, then the description. The
+// description is usually separated by column padding, but an over-long name is
+// joined with ` – ` instead (`❯ * /agent-code-conventions – Personal…`).
+const ITEM_RE = /^(\s*)(❯\s+)?(?:\*\s+)?(\/\S+)(.*)$/u
+
+// The composer's first row. Same marker set parseClaudeComposerState accepts:
+// `❯` today, `>` on older/alternate builds.
+const COMPOSER_MARKER_RE = /^\s*[❯>](?:\s|$)/u
+
+type LineInstance = NonNullable<ReturnType<TerminalInstance['buffer']['active']['getLine']>>
+
+function firstInkCell(line: LineInstance): { x: number; fg: number } | null {
+  for (let x = 0; x < line.length; x++) {
+    const cell = line.getCell(x)
+    const chars = cell?.getChars()
+    if (!cell || !chars || chars === ' ') continue
+    return { x, fg: cell.getFgColor() }
+  }
+  return null
+}
+
 /**
- * Detect CC's slash command picker from the terminal buffer.
+ * Detect Claude Code's slash command picker from the live terminal grid.
  *
- * Algorithm:
- *   1. Walk every row in the active buffer.
- *   2. A row is a candidate picker row if its first non-space cell
- *      contains `/` AND that cell has a non-default fg color
- *      (fgColorMode !== 0).
- *   3. Parse the row text into `{ id, description }` by splitting on
- *      two-or-more spaces — CC left-pads command names to a fixed
- *      column then puts the description after the padding gap.
- *   4. Collect a tuple `{ id, label, description, fgColor }` for each
- *      candidate row. Track the fg color so we can identify the
- *      selected row later.
- *   5. If we found zero rows the picker isn't visible.
- *   6. Otherwise, find the most common fg color (the "dim" color) and
- *      flip `selected: true` on any row whose color differs. In
- *      practice only one row will differ — the one CC has selected.
+ * 1. Find the composer's top rule: the LOWEST viewport divider directly
+ *    followed by a composer marker row. Lowest, because transcript content can
+ *    contain rules too; the live composer is always at the bottom. No composer
+ *    means no picker (a permission dialog or the trust screen replaces it).
+ * 2. Walk UP from the row above that rule, collecting picker rows: item rows,
+ *    and continuation rows that carry an item's wrapped description. Stop at
+ *    the first row that is neither, which is the blank, spinner or status row
+ *    that separates the picker from the transcript. Nothing above that point
+ *    can join the picker, which is the whole #1477 fix.
+ * 3. Selected = the row carrying `❯`; otherwise the row whose colour differs
+ *    from the majority (2.1.283).
  *
- * Contiguity is NOT enforced: even if CC ever adds whitespace or a
- * separator between picker rows, we still pick them up as long as
- * each row follows the "slash + non-default fg" rule.
+ * Viewport only: scrollback can hold a stale picker from an earlier turn.
  */
 export function detectSlashPicker(term: TerminalInstance): SlashPickerState {
   const buf = term.buffer.active
-  type Candidate = {
-    id: string
-    label: string
-    description: string
-    fgColor: number
-  }
-  const candidates: Candidate[] = []
-
-  // Scan the visible viewport only — scrollback can contain leftover
-  // picker rows from earlier turns whose colors are still preserved
-  // in the buffer, which would yield a phantom-visible picker. See
-  // HeadlessTerminal file header for the broader viewport-vs-buffer
-  // discussion.
   const viewportStart = buf.viewportY
   const viewportEnd = Math.min(buf.length, buf.viewportY + term.rows)
-  for (let y = viewportStart; y < viewportEnd; y++) {
-    const line = buf.getLine(y)
-    if (!line) continue
+  const text = (y: number): string => buf.getLine(y)?.translateToString(true) ?? ''
 
-    // Find the first non-space cell in this row. Most rows start at
-    // column 0 with content, but we don't assume that — picker rows
-    // might be indented for nested pickers in the future.
-    let firstCell: ReturnType<typeof line.getCell> | null = null
-    for (let x = 0; x < line.length; x++) {
-      const c = line.getCell(x)
-      if (!c) continue
-      const chars = c.getChars()
-      if (!chars || chars === ' ') continue
-      firstCell = c
+  let rule = -1
+  for (let y = viewportEnd - 2; y >= viewportStart; y--) {
+    if (isDividerLine(text(y)) && COMPOSER_MARKER_RE.test(text(y + 1))) {
+      rule = y
       break
     }
-    if (!firstCell) continue
-
-    // Must be a forward slash. Other picker types (files, agents,
-    // MCP resources) use different leading glyphs — we'll add those
-    // in a follow-up when we need them. For now, slash-only.
-    if (firstCell.getChars() !== '/') continue
-
-    // Must have a non-default fg color. CC colorizes every picker row
-    // (selected = bright suggestion color, non-selected = dim gray),
-    // so any picker row will satisfy this. Non-picker rows that
-    // happen to start with `/` — like the `❯ /` input prompt row —
-    // use the default fg color and get filtered out here.
-    if (firstCell.getFgColorMode() === 0) continue
-
-    // Split the row into (name, description). CC renders commands
-    // with a run of 2+ spaces between the name column and the
-    // description column.
-    // WHY trim BOTH ends (agent-code#1253): Claude Code 2.1.283 indents every
-    // picker row by two spaces ("  /copy   Copy Claude's…"). Splitting the
-    // untrimmed row on 2+ spaces made parts[0] the empty indent, the id check
-    // below rejected every row, and the picker was never detected at all on
-    // current Claude (recorded: test/fixtures/slash-picker). The first-cell
-    // scan above already skips leading spaces; the text split must too.
-    const raw = line.translateToString(true).trim()
-    const parts = raw.split(/\s{2,}/)
-    const id = (parts[0] ?? '').trim()
-    const description = parts.slice(1).join(' ').trim()
-    if (!id || !id.startsWith('/')) continue
-
-    candidates.push({
-      id,
-      label: id,
-      description,
-      fgColor: firstCell.getFgColor(),
-    })
   }
+  if (rule < 0) return HIDDEN
 
-  if (candidates.length === 0) return HIDDEN
+  type Candidate = PickerItem & { fgColor: number; marked: boolean }
+  const items: Candidate[] = []
+  // Continuation rows are met BEFORE their item when walking upward, so they
+  // wait here, bottom-up, until the item row above claims them.
+  let pending: string[] = []
 
-  // Identify the dim color as the most common fg across candidates.
-  // In normal operation there's exactly one selected row (different
-  // color) and N-1 non-selected rows (dim color). If all rows happen
-  // to share a color — unlikely but possible at startup before CC has
-  // rendered the selection — we fall through and nothing is marked
-  // selected, which is a safe default.
-  const counts = new Map<number, number>()
-  for (const c of candidates) {
-    counts.set(c.fgColor, (counts.get(c.fgColor) ?? 0) + 1)
-  }
-  let dimColor = candidates[0].fgColor
-  let dimCount = 0
-  for (const [color, n] of counts) {
-    if (n > dimCount) {
-      dimCount = n
-      dimColor = color
+  for (let y = rule - 1; y >= viewportStart; y--) {
+    const line = buf.getLine(y)
+    const ink = line ? firstInkCell(line) : null
+    const raw = line?.translateToString(true) ?? ''
+    const match = ink ? ITEM_RE.exec(raw) : null
+
+    // No colour requirement: position already decides, and the old "coloured
+    // `/`" test is exactly what transcript rows passed. Colour is only used
+    // below, for 2.1.283's selection.
+    if (ink && match) {
+      const id = match[3]!
+      const description = [match[4]!, ...pending.reverse()]
+        .map(part => part.trim())
+        .filter(Boolean)
+        .join(' ')
+        .replace(/^–\s+/u, '')
+      items.push({ id, label: id, description, selected: false, fgColor: ink.fg, marked: Boolean(match[2]) })
+      pending = []
+      continue
     }
+
+    // A wrapped description row: indented to the description column, never
+    // `/`-led.
+    if (ink && ink.x > 0 && !raw.trimStart().startsWith('/')) {
+      pending.push(raw)
+      continue
+    }
+
+    // THE #1477 RULE: the first row that is neither ends the picker. That is
+    // the blank, spinner or status row Claude always draws between the
+    // transcript and the composer; the picker never contains one. Nothing
+    // above it can become a command, however it is coloured. Recorded `/`-led
+    // rows above it: a wrapped Bash `$ …` line (#999999, the unselected picker
+    // colour), and inline code in replies and prompt echoes (#B1B9F9, the
+    // SELECTED picker colour).
+    break
   }
 
-  const items: PickerItem[] = candidates.map(c => ({
-    id: c.id,
-    label: c.label,
-    description: c.description,
-    selected: c.fgColor !== dimColor,
-  }))
+  // Leftover continuation rows with no item above them are transcript text
+  // that happened to sit on top of the picker's first item. Dropped.
+  if (items.length === 0) return HIDDEN
+  items.reverse()
 
-  return { visible: true, items }
+  const explicit = items.findIndex(item => item.marked)
+  let isSelected: (item: Candidate, index: number) => boolean
+  if (explicit >= 0) {
+    isSelected = (_item, index) => index === explicit
+  } else {
+    // 2.1.283: no glyph. The majority colour is "dim"; the odd one out is
+    // selected. When every row shares a colour (before Claude paints the
+    // highlight), nothing is selected, which is the safe default.
+    const counts = new Map<number, number>()
+    for (const item of items) counts.set(item.fgColor, (counts.get(item.fgColor) ?? 0) + 1)
+    let dimColor = items[0]!.fgColor
+    let dimCount = 0
+    for (const [color, n] of counts) {
+      if (n > dimCount) {
+        dimCount = n
+        dimColor = color
+      }
+    }
+    isSelected = item => item.fgColor !== dimColor
+  }
+
+  return {
+    visible: true,
+    items: items.map((item, index) => ({
+      id: item.id,
+      label: item.label,
+      description: item.description,
+      selected: isSelected(item, index),
+    })),
+  }
 }
