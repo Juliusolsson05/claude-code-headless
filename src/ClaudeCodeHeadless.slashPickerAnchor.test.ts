@@ -98,4 +98,83 @@ describe('slash picker is anchored to the composer (#1477)', () => {
     await play('escape', f => !f.includes('/claude-api'))
     expect(published()).toBeNull()
   })
+
+  // Review round 1 (H3 disproven). A wrapped description can START with `/`:
+  // `/loop 5m /foo). Omit…` sits at the description column, x=48. The old
+  // continuation rule ("indented and not `/`-led") read it as a second `/loop`,
+  // with a duplicate React key in the app. The arrow steps also put the
+  // selection somewhere other than the first row, and `open-star` pins the
+  // `* ` prefix and the ` – ` separator of skill rows.
+  it('folds a slash-led wrapped description by column and follows the selection', async () => {
+    const { published, play } = harness(load('lo-wrap-arrows-2.1.296.json'))
+    const LOOP = { id: '/loop', description: 'Run a prompt or slash command on a recurring interval (e.g. /loop 5m /foo). Omit the interval to let the model self-pace.' }
+    const LOGIN = { id: '/login', description: 'Sign in with your Anthropic account' }
+    const LOGOUT = { id: '/logout', description: 'Sign out from your Anthropic account' }
+
+    await play('startup', f => f.includes('Claude Code v2.1.296'))
+    await play('open-filtered', f => f.includes('/logout'))
+    expect(published()).toEqual([{ ...LOOP, selected: true }, { ...LOGIN, selected: false }, { ...LOGOUT, selected: false }])
+
+    await play('arrow-down-1', f => f.includes('❯ /login'))
+    expect(published()).toEqual([{ ...LOOP, selected: false }, { ...LOGIN, selected: true }, { ...LOGOUT, selected: false }])
+
+    await play('arrow-down-2', f => f.includes('❯ /logout'))
+    expect(published()).toEqual([
+      { ...LOGIN, selected: false },
+      { ...LOGOUT, selected: true },
+      { id: '/workflow-authoring', description: 'Reference for writing a Workflow tool script (script API and gotchas, resume, quality patterns, worked examples). Load be…', selected: false },
+    ])
+
+    await play('arrow-up-1', f => f.includes('❯ /login') && f.includes('/loop 5m'))
+    expect(published()).toEqual([{ ...LOOP, selected: false }, { ...LOGIN, selected: true }, { ...LOGOUT, selected: false }])
+
+    await play('escape', f => !f.includes('/logout'))
+    expect(published()).toBeNull()
+
+    await play('clear', f => f.includes('Ctrl+Y to paste deleted text'))
+    expect(published()).toBeNull()
+
+    await play('open-star', f => f.includes('/agent-code-tldr'))
+    expect(published()).toEqual([
+      { id: '/agent-code-conventions', description: 'Personal development conventions configured in Agent Code. Use at the beginn…', selected: true },
+      { id: '/agent-code-goal', description: 'Record this agent’s goal — what its work is for — when Agent Code Goal MCP is avail…', selected: false },
+      { id: '/agent-code-tldr', description: 'Maintain this agent’s concise status after substantial work or discussion when Agen…', selected: false },
+    ])
+
+    await play('escape-2', f => !f.includes('/agent-code-tldr'))
+    expect(published()).toBeNull()
+  })
+
+  // Review round 1 (H7). With the transcript reaching the composer, a
+  // right-aligned hint (`Ctrl+Y to paste deleted text`) sits directly on the
+  // rule. It is indented, so the old rule took it as a description row and
+  // walked on into `⎿ Compacted` and the transcript's `❯ /compact`, which it
+  // published as a SELECTED command. The Codex reviewer found the same shape
+  // in two of the user's own bundles (`◉ xhigh · /effort`, `✘ Auto-update failed`).
+  it('does not walk through a hint row into the transcript', async () => {
+    const { published, play } = harness(load('compact-hint-2.1.296.json'))
+
+    await play('startup', f => f.includes('Claude Code v2.1.296'))
+    // No assertion on draft-only steps, and no predicate either: the emitted
+    // plain frame leaves the composer's draft row out, and the next step's
+    // predicate re-syncs anyway.
+    await play('prompt', () => true)
+    await play('submit', f => /^⏺ ok/m.test(f) && f.includes('run /login to renew'))
+    expect(published()).toBeNull()
+
+    // The real picker in a 12-row pane.
+    await play('compact-typed', f => f.includes('/autocompact'))
+    expect(published()?.map(item => [item.id, item.selected])).toEqual([['/compact', true], ['/autocompact', false], ['/computer-use', false]])
+
+    await play('compact-run', f => f.includes('Compacted (ctrl+o'))
+    await play('draft', () => true)
+    await play('delete-draft', f => f.includes('Ctrl+Y to paste deleted text'))
+    expect(published()).toBeNull()
+
+    await play('open-filtered', f => f.includes('/claude-api'))
+    expect(published()).toEqual(CL_PICKER)
+
+    await play('escape', f => !f.includes('/claude-api'))
+    expect(published()).toBeNull()
+  })
 })
