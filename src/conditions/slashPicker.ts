@@ -9,7 +9,9 @@
 //   unified conditions snapshot. That split is exactly the maintenance debt the
 //   conditions framework is meant to remove: every overlay should be one parser
 //   + one module + one snapshot relay. This module makes slash picker presence a
-//   normal deduped condition while preserving the parser's cell-color logic.
+//   normal deduped condition and leaves all screen reading to the parser
+//   (SlashPickerParser: position-anchored since agent-code#1477, with colour
+//   used only for 2.1.283's selection).
 
 import { defineModule } from './core/contract.js'
 import type {

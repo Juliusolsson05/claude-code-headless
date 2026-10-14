@@ -1,0 +1,74 @@
+{
+ "recordedAt": "2026-10-14",
+ "claudeCodeVersion": "2.1.296",
+ "cols": 111,
+ "rows": 40,
+ "note": "Real Claude Code PTY output: a picker whose wrapped description row starts with a slash, arrow-key selection, and star/dash skill rows. See README.md.",
+ "steps": [
+  {
+   "step": "startup",
+   "chunks": [
+    "\u001b7\u001b[r\u001b8\u001b[?25h",
+    "\u001b[?25l",
+    "\u001b[?2004h\u001b[?2031h\u001b[?1004h",
+    "\u001b[>0q\u001b[?u\u001b]7501;?\u0007",
+    "\u001b[c",
+    "\u001b[>4m\u001b[<u\u001b[?1004l\u001b[?2031l\u001b[?2004l",
+    "\u001b[?2004h\u001b[?2031h\u001b[?1004h",
+    "\u001b]0;✳ Claude Code\u0007",
+    "\u001b[?1049h\u001b[2J\u001b[H\u001b[?1000h\u001b[?1002h\u001b[?1003h\u001b[?1006h\u001b[?25l\u001b[H\r\u001b[1B\u001b[38;2;215;119;87m ▐\u001b[48;2;0;0;0m▛███▛█\u001b[12G\u001b[39m\u001b[49m\u001b[1mClaude Code\u001b[24G\u001b[22m\u001b[38;2;153;153;153mv2.1.296\r\u001b[1B\u001b[38;2;215;119;87m▝▜\u001b[48;2;0;0;0m█████\u001b[49m█▀\u001b[12G\u001b[38;2;153;153;153mOpus 5.5 · Claude XXX\r\u001b[1B\u001b[38;2;215;119;87m ▝▝   ▝▝ \u001b[12G\u001b[38;2;153;153;153m/private/tmp/picker-fixture\r\u001b[2B\u001b[38;2;255;193;7m⚠\u001b[3GYour login expires in 1 day\u001b[38;2;153;153;153m · run /login to renew\r\u001b[91C\u001b[30B◐ medium · /effort\r\u001b[1B\u001b[38;2;136;136;136m───────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\u001b[1B\u001b[39m❯ \u001b[2mTry \"create a util logging.py that...\"\r\u001b[1B\u001b[22m\u001b[38;2;136;136;136m─────────────────────",
+    "──────────────────────────────────────────────────────────────────────────────────────────\r\u001b[2C\u001b[1B\u001b[38;2;255;107;128m⏵⏵ bypass permissions on\u001b[38;2;153;153;153m (shift+tab to cycle) · ← for agents\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h\u001b[>0q\u001b[?u\u001b]7501;?\u0007\u001b[c"
+   ]
+  },
+  {
+   "step": "open-filtered",
+   "chunks": [
+    "\u001b(B\u000f\u001b[?2004h\u001b[?1000h\u001b[?1002h\u001b[?1003h\u001b[?1006h",
+    "\u001b[?25l\u001b[H\r\u001b[2C\u001b[32B\u001b[38;2;177;185;249m❯ /\u001b[1mlo\u001b[22mop                                       Run a prompt or slash command on a recurring interval (e.g.\r\u001b[48C\u001b[1B/\u001b[1mlo\u001b[22mop 5m /foo). Omit the interval to let the model self-pace.\r\u001b[2C\u001b[1B\u001b[38;2;153;153;153m  /\u001b[39m\u001b[1mlo\u001b[22m\u001b[38;2;153;153;153mgin                                      Sign in with your Anthropic account\r\u001b[2C\u001b[1B  /\u001b[39m\u001b[1mlo\u001b[22m\u001b[38;2;153;153;153mgout                                     Sign out from your Anthropic account\u001b[92G\u001b[39m\u001b[K\r\u001b[2C\u001b[2B/lo\u001b[K\r\u001b[47C\u001b[2B\u001b[K\u001b[40;1H\u001b[38;6H\u001b[?25h"
+   ]
+  },
+  {
+   "step": "arrow-down-1",
+   "chunks": [
+    "\u001b[?25l\u001b[H\r\u001b[2C\u001b[32B\u001b[38;2;153;153;153m  /\u001b[39m\u001b[1mlo\u001b[22m\u001b[38;2;153;153;153mop                                       Run a prompt or slash command on a recurring interval (e.g.\r\u001b[48C\u001b[1B/\u001b[39m\u001b[1mlo\u001b[22m\u001b[38;2;153;153;153mop 5m /foo). Omit the interval to let the model self-pace.\r\u001b[2C\u001b[1B\u001b[38;2;177;185;249m❯ /\u001b[1mlo\u001b[22mgin                                      Sign in with your Anthropic account\u001b[39m\u001b[40;1H\u001b[38;6H\u001b[?25h"
+   ]
+  },
+  {
+   "step": "arrow-down-2",
+   "chunks": [
+    "\u001b[?25l\u001b[H\r\u001b[7C\u001b[32B\u001b[38;2;153;153;153mgin\u001b[49GSign in with\u001b[62Gyour Anthr\u001b[73Gpic account\u001b[39m\u001b[K\r\u001b[2C\u001b[1B\u001b[38;2;177;185;249m❯ /\u001b[1mlo\u001b[22mgout                                     Sign out from your Anthropic account\u001b[39m\u001b[K\r\u001b[2C\u001b[1B\u001b[38;2;153;153;153m  /workf\u001b[39m\u001b[1mlo\u001b[22m\u001b[38;2;153;153;153mw-authoring                         Reference for writing a Workf\u001b[39m\u001b[1mlo\u001b[22m\u001b[38;2;153;153;153mw tool script (script API and\r\u001b[2C\u001b[1B\u001b[39m                                              \u001b[38;2;153;153;153mgotchas,\u001b[58Gresume, quality \u001b[75Gatterns, worked examples). \u001b[39m\u001b[1mLo\u001b[22m\u001b[38;2;153;153;153mad be…\u001b[39m\u001b[40;1H\u001b[38;6H\u001b[?25h"
+   ]
+  },
+  {
+   "step": "arrow-up-1",
+   "chunks": [
+    "\u001b[?25l\u001b[H\r\u001b[7C\u001b[32B\u001b[38;2;153;153;153mop \u001b[49GRun a prompt\u001b[62Gor slash c\u001b[73Gmmand on a recurring interval (e.g.\r\u001b[2C\u001b[1B\u001b[39m                                              \u001b[38;2;153;153;153m/\u001b[39m\u001b[1mlo\u001b[22m\u001b[38;2;153;153;153mop 5m /foo). Omit the interval to let the model self-pace.\r\u001b[2C\u001b[1B\u001b[38;2;177;185;249m❯ /\u001b[1mlo\u001b[22mgin                                      Sign in with your Anthropic account\u001b[39m\u001b[K\r\u001b[2C\u001b[1B\u001b[38;2;153;153;153m  /\u001b[39m\u001b[1mlo\u001b[22m\u001b[38;2;153;153;153mgout                                     Sign out\u001b[58Gfrom your Anthro\u001b[75Gic account\u001b[39m\u001b[K\u001b[40;1H\u001b[38;6H\u001b[?25h"
+   ]
+  },
+  {
+   "step": "escape",
+   "chunks": [
+    "\u001b[?25l\u001b[H\r\u001b[2C\u001b[32B\u001b[K\r\u001b[48C\u001b[1B\u001b[K\r\u001b[2C\u001b[1B\u001b[K\r\u001b[2C\u001b[1B                                                          \u001b[38;2;255;193;7mYour login expires in 1 day\u001b[38;2;153;153;153m · run /login to renew\u001b[39m\u001b[40;1H\u001b[38;6H\u001b[?25h"
+   ]
+  },
+  {
+   "step": "clear",
+   "chunks": [
+    "\u001b[?25l\u001b[H\r\u001b[60C\u001b[35B                     \u001b[38;2;153;153;153mCtrl+Y\u001b[89Gto paste dele\u001b[103Ged text\r\u001b[2C\u001b[2B\u001b[39m\u001b[2mTry \"create a util logging.py that...\"\r\u001b[47C\u001b[2B\u001b[22m\u001b[38;2;153;153;153m · ← for agents\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h"
+   ]
+  },
+  {
+   "step": "open-star",
+   "chunks": [
+    "\u001b[?25l\u001b[H\r\u001b[2C\u001b[33B\u001b[38;2;177;185;249m❯ * /agent-code-conventions – Personal development conventions configured in Agent Code. Use at the beginn…\r\u001b[2C\u001b[1B\u001b[38;2;153;153;153m  * /agent-code-goal – Record this agent’s goal — what its work is for — when Agent Code Goal MCP is avail…\r\u001b[2C\u001b[1B  * /agent-code-tldr – Maintain this agent’s concise status after substantial work or\u001b[89Gdiscu\u001b[95Gsion when Ag\u001b[108Gn…\r\u001b[2C\u001b[2B\u001b[39m/agent-code-co\u001b[K\r\u001b[47C\u001b[2B\u001b[K\u001b[40;1H\u001b[38;17H\u001b[?25h"
+   ]
+  },
+  {
+   "step": "escape-2",
+   "chunks": [
+    "\u001b[?25l\u001b[H\r\u001b[2C\u001b[33B\u001b[K\r\u001b[2C\u001b[1B\u001b[K\r\u001b[2C\u001b[1B                                                                               \u001b[38;2;153;153;153mCtrl+Y\u001b[89Gto pa\u001b[95Gte deleted t\u001b[108Gxt\u001b[39m\u001b[40;1H\u001b[38;17H\u001b[?25h",
+    "\u001b[?25l\u001b[H\r\u001b[60C\u001b[35B\u001b[38;2;255;193;7mYour login expires in 1 day\u001b[89G\u001b[38;2;153;153;153m· run /login \u001b[103Go renew\u001b[39m\u001b[40;1H\u001b[38;17H\u001b[?25h"
+   ]
+  }
+ ]
+}
