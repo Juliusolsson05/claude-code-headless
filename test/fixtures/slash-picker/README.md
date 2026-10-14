@@ -55,3 +55,41 @@ Real Claude Code 2.1.296 PTY output, 120x40, recorded on 2026-10-14 for agent-co
 This fixture pins the "first non-picker row ends the picker" rule on its own. Unlike the Bash fixture, no indented row follows the `/` row, so nothing else in the parser rejects it.
 
 **Redactions:** the same as above (`Claude XXX`, diffed before and after). Everything else was read in full: the prompt, the reply, the status row, the picker rows, the login notice and the terminal title (`Compact and clear commands`).
+
+## `lo-wrap-arrows-2.1.296.json`
+
+Real Claude Code 2.1.296 PTY output, 111x40, recorded on 2026-10-14 during review round 1 of agent-code#1477, the same way as above. No prompt was submitted.
+
+| step | keys | what the screen shows after it |
+|---|---|---|
+| `startup` | none | banner, empty composer |
+| `open-filtered` | `/lo` | `❯ /loop` (selected), `/login`, `/logout`. `/loop`'s description wraps onto `/loop 5m /foo). Omit the interval…`, a continuation row **starting with `/`** at x=48. That is the description column every padded row shares. |
+| `arrow-down-1` | Down | the same rows, `❯` on `/login` (selection not on the first row) |
+| `arrow-down-2` | Down | scrolled: `/login`, `❯ /logout`, `/workflow-authoring` (two-row description) |
+| `arrow-up-1` | Up | back to the `open-filtered` rows, `❯` on `/login` |
+| `escape` | Esc | picker closed |
+| `clear` | Ctrl+U | empty composer, right-aligned `Ctrl+Y to paste deleted text` hint on the rule |
+| `open-star` | `/agent-code-co` | three Agent Code skills drawn as `❯ * /agent-code-conventions – Personal …`, then `* /agent-code-goal – …` and `* /agent-code-tldr – …`. These are `*`-marked rows joined with ` – `, not padded, and truncated with `…` instead of wrapped. |
+| `escape-2` | Esc | picker closed |
+
+**Why 111 columns:** at that width `/loop`'s description breaks right before `/loop 5m`. Both reviewers found this family of wraps (`/foo)` at 108–114, `/resume)` at 156–160).
+
+**Content:** the `/agent-code-*` rows are the skills Agent Code itself installs, with Agent Code's own descriptions. `/workflow-authoring` is a bundled skill. **Redactions:** `Claude XXX`, diffed as above. Everything else was read in full: the composer placeholder, the login notice and the terminal title (`Claude Code`).
+
+## `compact-hint-2.1.296.json`
+
+Real Claude Code 2.1.296 PTY output, **120x12**, recorded on 2026-10-14 during review round 1 of agent-code#1477. One prompt (`Reply with exactly: ok`) and one real `/compact` were submitted. The short pane makes the transcript reach the composer, which is the layout the Codex reviewer found in two of the user's own bundles.
+
+| step | keys | what the screen shows after it |
+|---|---|---|
+| `startup` | none | banner, empty composer |
+| `prompt` | the prompt, no Enter | draft |
+| `submit` | Enter | reply `ok`, and the right-aligned login notice directly on the rule |
+| `compact-typed` | `/compact` | the real picker in a 12-row pane: `❯ /compact`, `/autocompact`, `/computer-use` (two rows) |
+| `compact-run` | Enter | `❯ /compact` / `  ⎿  Compacted (ctrl+o to see full summary)` in the transcript |
+| `draft` | `abc` | draft |
+| `delete-draft` | Ctrl+U | **the false positive:** the right-aligned `Ctrl+Y to paste deleted text` hint is directly on the rule, `⎿ Compacted` is above it, and the transcript's `❯ /compact` is above that. No picker is open. |
+| `open-filtered` | `/cl` | the `/cl` picker drawn over the transcript |
+| `escape` | Esc | picker closed |
+
+**Redactions:** `Claude XXX`, diffed as above. Everything else was read in full: the prompt and reply, the compaction summary line, the spinner words, a tip line, the picker rows and the terminal title (`Exact reply request`).
