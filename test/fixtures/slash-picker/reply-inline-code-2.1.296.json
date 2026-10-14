@@ -1,0 +1,67 @@
+{
+ "recordedAt": "2026-10-14",
+ "claudeCodeVersion": "2.1.296",
+ "cols": 120,
+ "rows": 40,
+ "note": "Real Claude Code PTY output: slash-led inline code in a reply and in the prompt echo, then the real picker. See README.md for how it was recorded, sliced and redacted.",
+ "steps": [
+  {
+   "step": "startup",
+   "chunks": [
+    "\u001b7\u001b[r\u001b8\u001b[?25h",
+    "\u001b[?25l",
+    "\u001b[?2004h\u001b[?2031h\u001b[?1004h",
+    "\u001b[>0q\u001b[?u\u001b]7501;?\u0007",
+    "\u001b[c",
+    "\u001b[>4m\u001b[<u\u001b[?1004l\u001b[?2031l\u001b[?2004l",
+    "\u001b[?2004h\u001b[?2031h\u001b[?1004h",
+    "\u001b]0;✳ Claude Code\u0007",
+    "\u001b[?1049h\u001b[2J\u001b[H\u001b[?1000h\u001b[?1002h\u001b[?1003h\u001b[?1006h\u001b[?25l\u001b[H\r\u001b[1B\u001b[38;2;215;119;87m ▐\u001b[48;2;0;0;0m▛███▛█\u001b[12G\u001b[39m\u001b[49m\u001b[1mClaude Code\u001b[24G\u001b[22m\u001b[38;2;153;153;153mv2.1.296\r\u001b[1B\u001b[38;2;215;119;87m▝▜\u001b[48;2;0;0;0m█████\u001b[49m█▀\u001b[12G\u001b[38;2;153;153;153mOpus 5.5 · Claude XXX\r\u001b[1B\u001b[38;2;215;119;87m ▝▝   ▝▝ \u001b[12G\u001b[38;2;153;153;153m/private/tmp/picker-fixture\r\u001b[2B\u001b[38;2;255;193;7m⚠\u001b[3GYour login expires in 1 day\u001b[38;2;153;153;153m · run /login to renew\r\u001b[100C\u001b[30B◐ medium · /effort\r\u001b[1B\u001b[38;2;136;136;136m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\u001b[1B\u001b[39m❯ \u001b[2mTry \"fix typecheck errors\"\r\u001b[1B\u001b[22m\u001b[38;2;136;136;136m────────────────",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────────\r\u001b[2C\u001b[1B\u001b[38;2;255;107;128m⏵⏵ bypass permissions on\u001b[38;2;153;153;153m (shift+tab to cycle) · ← for agents\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b[>0q\u001b[?u\u001b]7501;?\u0007\u001b[c"
+   ]
+  },
+  {
+   "step": "prompt",
+   "chunks": [
+    "\u001b(B\u000f\u001b[?2004h\u001b[?1000h\u001b[?1002h\u001b[?1003h\u001b[?1006h",
+    "\u001b[?25l\u001b[H\r\u001b[97C\u001b[32B\u001b[38;2;153;153;153mctrl+g to edit in Vim\r\u001b[1B\u001b[38;2;136;136;136m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\u001b[1B\u001b[39m❯ Reply\u001b[9Gwith\u001b[14Gexactly\u001b[22Gthese\u001b[28Gthree\u001b[34Glines,\u001b[41Gverbatim,\u001b[51Gno\u001b[54Gtools,\u001b[61Gnothing\u001b[69Gelse:\r\u001b[2C\u001b[1BDone.\u001b[101G\u001b[K\r\u001b[1B  `/compact` frees context.\u001b[K\r\u001b[1B  `/clear` starts over.\u001b[K\r\u001b[47C\u001b[2B\u001b[K\u001b[40;1H\u001b[38;24H\u001b[?25h"
+   ]
+  },
+  {
+   "step": "submit",
+   "chunks": [
+    "\u001b]0;◐ Claude Code\u0007",
+    "\u001b[?25l\u001b[H\r\u001b[7B\u001b[48;2;55;55;55m\u001b[38;2;153;153;153m❯ \u001b[38;2;255;255;255mReply with exactly these three lines, verbatim, no tools, nothing else:\u001b[39m                                               \r\u001b[1B  \u001b[38;2;255;255;255mDone.\u001b[39m                                                                                                                 \r\u001b[1B  \u001b[38;2;177;185;249m/compact\u001b[38;2;255;255;255m frees context.\u001b[39m                                                                                               \r\u001b[1B  \u001b[38;2;177;185;249m/clear\u001b[38;2;255;255;255m starts over.\u001b[39m                                                                                                   \r\u001b[97C\u001b[22B\u001b[49m\u001b[K\r\u001b[1B\u001b[K\r\u001b[1B\u001b[38;2;215;119;87m✢\u001b[39m \u001b[38;2;215;119;87mUndulating\u001b[38;2;235;159;127m…\u001b[38;2;215;119;87m \u001b[39m\u001b[K\r\u001b[2C\u001b[1B     \u001b[101G\u001b[38;2;153;153;153m◐ medium · /effort\r\u001b[1B\u001b[38;2;136;136;136m─────────────────────────────────────────",
+    "───────────────────────────────────────────────────────────────────────────────\r\u001b[1B\u001b[38;2;153;153;153m❯ \u001b[39m\u001b[K\r\u001b[47C\u001b[2B\u001b[38;2;153;153;153m · esc to interrupt · ← for agents\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b[?25l\u001b[H\r\u001b[34B\u001b[38;2;215;119;87m✳\u001b[12G\u001b[38;2;235;159;127mg\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b[?25l\u001b[H\r\u001b[34B\u001b[38;2;215;119;87m✶\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b[?25l\u001b[H\r\u001b[10C\u001b[34B\u001b[38;2;235;159;127mn\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b[?25l\u001b[H\r\u001b[34B\u001b[38;2;215;119;87m✻\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b]0;◐ Compact and clear commands\u0007",
+    "\u001b[?25l\u001b[H\r\u001b[34B\u001b[38;2;215;119;87m✽\u001b[10G\u001b[38;2;235;159;127mi\u001b[13G\u001b[38;2;215;119;87m…\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b[?25l\u001b[H\r\u001b[2C\u001b[34B\u001b[38;2;215;119;87mTransmogrifying… \u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b[?25l\u001b[H\r\u001b[19C\u001b[34B\u001b[38;2;153;153;153m(0s · ↓\u001b[28G2 tokens)\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b[?25l\u001b[H\r\u001b[12B\u001b[38;2;255;255;255m⏺\u001b[3G\u001b[39mDone.\r\u001b[22B\u001b[K\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b]0;◑ Compact and clear commands\u0007",
+    "\u001b[?25l\u001b[H\r\u001b[2C\u001b[13B\u001b[38;2;177;185;249m/compact\u001b[12G\u001b[39mfrees\u001b[18Gcontext.\r\u001b[2C\u001b[1B\u001b[38;2;177;185;249m/clear\u001b[10G\u001b[39mstarts\u001b[17Gover.\r\u001b[20B\u001b[38;2;215;119;87m✢\u001b[3GTransmogrifyi\u001b[38;2;235;159;127mng…\u001b[38;2;215;119;87m \u001b[38;2;153;153;153m(1s · ↓\u001b[28G13 tokens)\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b]0;✳ Compact and clear commands\u0007",
+    "\u001b[?25l\u001b[H\r\u001b[16B\u001b[38;2;153;153;153m✻\u001b[3GBaked for 1s · done 6:06 PM\r\u001b[18B\u001b[39m\u001b[K\r\u001b[3B❯ \r\u001b[50C\u001b[2B\u001b[38;2;153;153;153m← for agents\u001b[39m\u001b[K\u001b[40;1H\u001b[38;3H\u001b[?25h",
+    "\u001b[?25l\u001b[H\r\u001b[69C\u001b[35B\u001b[38;2;255;193;7mYour login expires in 1 day\u001b[38;2;153;153;153m · run /login to renew\u001b[39m\u001b[40;1H\u001b[38;3H\u001b[?25h"
+   ]
+  },
+  {
+   "step": "open-filtered",
+   "chunks": [
+    "\u001b(B\u000f\u001b[?2004h\u001b[?1000h\u001b[?1002h\u001b[?1003h\u001b[?1006h",
+    "\u001b[?25l\u001b[H\r\u001b[2C\u001b[32B\u001b[38;2;177;185;249m❯ /\u001b[1mcl\u001b[22mear                                          Start a new session with empty context; previous session stays on\r\u001b[52C\u001b[1Bdisk (resumable with /resume)\r\u001b[2C\u001b[1B\u001b[38;2;153;153;153m  /\u001b[39m\u001b[1mcl\u001b[22m\u001b[38;2;153;153;153maude-api                                     Reference for the \u001b[39m\u001b[1mCl\u001b[22m\u001b[38;2;153;153;153maude API / Anthropic SDK — model ids, pricing,\r\u001b[52C\u001b[1Bparams, streaming, tool use, MCP, agents, caching,\u001b[104Gtoken counti\u001b[117Gg…\r\u001b[2C\u001b[2B\u001b[39m/cl\r\u001b[47C\u001b[2B\u001b[K\u001b[40;1H\u001b[38;6H\u001b[?25h"
+   ]
+  },
+  {
+   "step": "escape",
+   "chunks": [
+    "\u001b[?25l\u001b[H\r\u001b[2C\u001b[32B\u001b[K\r\u001b[52C\u001b[1B\u001b[K\r\u001b[2C\u001b[1B\u001b[K\r\u001b[52C\u001b[1B                 \u001b[38;2;255;193;7mYour login expires in 1 day\u001b[38;2;153;153;153m · run\u001b[104G/login to re\u001b[117Gew\u001b[39m\u001b[40;1H\u001b[38;6H\u001b[?25h"
+   ]
+  }
+ ]
+}
